@@ -355,27 +355,77 @@ impl Canonical for Level {
     }
 
     fn read_body(r: &mut CanonReader<'_>) -> Result<Level, CanonError> {
-        Ok(match r.u8()? {
-            LEVEL_ZERO => Level::zero(),
-            LEVEL_SUCC => Level::read_body(r)?
-                .succ()
-                .map_err(|_| r.err_public("level depth exceeds the 24-bit covenant"))?,
-            LEVEL_MAX => {
-                let a = Level::read_body(r)?;
-                let b = Level::read_body(r)?;
-                Level::max(a, b)
-                    .map_err(|_| r.err_public("level depth exceeds the 24-bit covenant"))?
+        // Iterative, not recursive: decode depth is bounded by the heap work-stack
+        // (input size), never by the call stack. A recursive descent here would
+        // overflow the stack — an uncatchable SIGABRT, worse than a panic — on a
+        // deeply nested but tiny hostile encoding (franken_lean-fnj, D8/FL-INV-07).
+        read_level_iter(r)
+    }
+}
+
+/// One pending step of the iterative [`Level`] decoder.
+enum LevelTask {
+    /// Read one node (tag + any leaf fields); recursive nodes push their build
+    /// step plus a `Read` per child.
+    Read,
+    BuildSucc,
+    BuildMax,
+    BuildIMax,
+}
+
+/// Decode one `Level` with an explicit heap work-stack (see [`Level::read_body`]).
+/// The byte grammar is identical to the recursive form; only the control stack
+/// moved off the call stack.
+fn read_level_iter(r: &mut CanonReader<'_>) -> Result<Level, CanonError> {
+    let underflow = |r: &CanonReader<'_>| r.err_public("level value-stack underflow");
+    let too_deep = |r: &CanonReader<'_>| r.err_public("level depth exceeds the 24-bit covenant");
+    let mut tasks = vec![LevelTask::Read];
+    let mut values: Vec<Level> = Vec::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            LevelTask::Read => match r.u8()? {
+                LEVEL_ZERO => values.push(Level::zero()),
+                LEVEL_SUCC => {
+                    tasks.push(LevelTask::BuildSucc);
+                    tasks.push(LevelTask::Read);
+                }
+                LEVEL_MAX => {
+                    // Push the builder first (runs last), then the two child reads;
+                    // the LIFO order reads child `a` before child `b`, matching the
+                    // encoder's left-to-right emission.
+                    tasks.push(LevelTask::BuildMax);
+                    tasks.push(LevelTask::Read);
+                    tasks.push(LevelTask::Read);
+                }
+                LEVEL_IMAX => {
+                    tasks.push(LevelTask::BuildIMax);
+                    tasks.push(LevelTask::Read);
+                    tasks.push(LevelTask::Read);
+                }
+                LEVEL_PARAM => values.push(Level::param(Name::read_body(r)?)),
+                LEVEL_MVAR => values.push(Level::mvar(LMVarId(Name::read_body(r)?))),
+                _ => return Err(r.err_public("unknown level tag")),
+            },
+            LevelTask::BuildSucc => {
+                let u = values.pop().ok_or_else(|| underflow(r))?;
+                values.push(u.succ().map_err(|_| too_deep(r))?);
             }
-            LEVEL_IMAX => {
-                let a = Level::read_body(r)?;
-                let b = Level::read_body(r)?;
-                Level::imax(a, b)
-                    .map_err(|_| r.err_public("level depth exceeds the 24-bit covenant"))?
+            LevelTask::BuildMax => {
+                let b = values.pop().ok_or_else(|| underflow(r))?;
+                let a = values.pop().ok_or_else(|| underflow(r))?;
+                values.push(Level::max(a, b).map_err(|_| too_deep(r))?);
             }
-            LEVEL_PARAM => Level::param(Name::read_body(r)?),
-            LEVEL_MVAR => Level::mvar(LMVarId(Name::read_body(r)?)),
-            _ => return Err(r.err_public("unknown level tag")),
-        })
+            LevelTask::BuildIMax => {
+                let b = values.pop().ok_or_else(|| underflow(r))?;
+                let a = values.pop().ok_or_else(|| underflow(r))?;
+                values.push(Level::imax(a, b).map_err(|_| too_deep(r))?);
+            }
+        }
+    }
+    // A well-formed single-value stream reduces to exactly one root.
+    match values.len() {
+        1 => Ok(values.pop().expect("length checked")),
+        _ => Err(r.err_public("level value-stack did not reduce to a single root")),
     }
 }
 
@@ -580,77 +630,148 @@ impl Canonical for Expr {
     }
 
     fn read_body(r: &mut CanonReader<'_>) -> Result<Expr, CanonError> {
-        Ok(match r.u8()? {
-            EXPR_BVAR => Expr::bvar(r.u32()?)
-                .map_err(|_| r.err_public("bvar exceeds the 20-bit range covenant"))?,
-            EXPR_FVAR => Expr::fvar(FVarId(Name::read_body(r)?)),
-            EXPR_MVAR => Expr::mvar(MVarId(Name::read_body(r)?)),
-            EXPR_SORT => Expr::sort(Level::read_body(r)?),
-            EXPR_CONST => {
-                let name = Name::read_body(r)?;
-                let count = r.u64()?;
-                let mut levels = Vec::new();
-                for _ in 0..count {
-                    levels.push(Level::read_body(r)?);
+        // Iterative, not recursive: see [`Level::read_body`]. A recursive descent
+        // here overflows the call stack (SIGABRT, not a typed error) on a deeply
+        // nested but tiny hostile encoding — e.g. a chain of `App` tags
+        // (franken_lean-fnj, D8/FL-INV-07).
+        read_expr_iter(r)
+    }
+}
+
+/// One pending step of the iterative [`Expr`] decoder. Post-order scalar fields
+/// (a binder's `BinderInfo`, a `let`'s `nonDep` flag) are read when the builder
+/// runs — by then the child reads have advanced the cursor to exactly that field.
+enum ExprTask {
+    /// Read one node (tag + leaf fields); recursive nodes push their builder plus
+    /// a `Read` per `Expr` child.
+    Read,
+    BuildApp,
+    BuildLam(Name),
+    BuildForall(Name),
+    BuildLet(Name),
+    BuildMData(KVMap),
+    BuildProj(Name, u64),
+}
+
+/// Decode one `Expr` with an explicit heap work-stack (see [`Expr::read_body`]).
+/// Byte-for-byte the same grammar as the recursive form; `Level`, `Name`, and
+/// `KVMap` children decode through their own bounded readers, so total call-stack
+/// depth is a small constant regardless of the term's nesting.
+fn read_expr_iter(r: &mut CanonReader<'_>) -> Result<Expr, CanonError> {
+    let underflow = |r: &CanonReader<'_>| r.err_public("expr value-stack underflow");
+    let mut tasks = vec![ExprTask::Read];
+    let mut values: Vec<Expr> = Vec::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            ExprTask::Read => match r.u8()? {
+                EXPR_BVAR => values.push(
+                    Expr::bvar(r.u32()?)
+                        .map_err(|_| r.err_public("bvar exceeds the 20-bit range covenant"))?,
+                ),
+                EXPR_FVAR => values.push(Expr::fvar(FVarId(Name::read_body(r)?))),
+                EXPR_MVAR => values.push(Expr::mvar(MVarId(Name::read_body(r)?))),
+                EXPR_SORT => values.push(Expr::sort(read_level_iter(r)?)),
+                EXPR_CONST => {
+                    let name = Name::read_body(r)?;
+                    let count = r.u64()?;
+                    let mut levels = Vec::new();
+                    for _ in 0..count {
+                        levels.push(read_level_iter(r)?);
+                    }
+                    values.push(Expr::const_(name, levels));
                 }
-                Expr::const_(name, levels)
+                EXPR_APP => {
+                    // Builder first (runs last); the two child reads follow so LIFO
+                    // reads `f` before `a`, matching the encoder.
+                    tasks.push(ExprTask::BuildApp);
+                    tasks.push(ExprTask::Read);
+                    tasks.push(ExprTask::Read);
+                }
+                EXPR_LAM => {
+                    let binder_name = Name::read_body(r)?;
+                    tasks.push(ExprTask::BuildLam(binder_name));
+                    tasks.push(ExprTask::Read);
+                    tasks.push(ExprTask::Read);
+                }
+                EXPR_FORALL => {
+                    let binder_name = Name::read_body(r)?;
+                    tasks.push(ExprTask::BuildForall(binder_name));
+                    tasks.push(ExprTask::Read);
+                    tasks.push(ExprTask::Read);
+                }
+                EXPR_LET => {
+                    let decl_name = Name::read_body(r)?;
+                    tasks.push(ExprTask::BuildLet(decl_name));
+                    tasks.push(ExprTask::Read);
+                    tasks.push(ExprTask::Read);
+                    tasks.push(ExprTask::Read);
+                }
+                EXPR_LIT_NAT => {
+                    let count = r.u64()?;
+                    let mut limbs = Vec::new();
+                    for _ in 0..count {
+                        limbs.push(r.u64()?);
+                    }
+                    let lit = NatLit::from_limbs_le(limbs.clone());
+                    if lit.limbs_le() != limbs.as_slice() {
+                        // Trailing zero limbs would give two encodings of one value.
+                        return Err(r.err_public("non-normalized nat literal limbs"));
+                    }
+                    values.push(Expr::lit(Literal::Nat(lit)));
+                }
+                EXPR_LIT_STR => values.push(Expr::lit(Literal::Str(r.str()?.to_string()))),
+                EXPR_MDATA => {
+                    let data = KVMap::read_body(r)?;
+                    tasks.push(ExprTask::BuildMData(data));
+                    tasks.push(ExprTask::Read);
+                }
+                EXPR_PROJ => {
+                    let struct_name = Name::read_body(r)?;
+                    let idx = r.u64()?;
+                    tasks.push(ExprTask::BuildProj(struct_name, idx));
+                    tasks.push(ExprTask::Read);
+                }
+                _ => return Err(r.err_public("unknown expr tag")),
+            },
+            ExprTask::BuildApp => {
+                let a = values.pop().ok_or_else(|| underflow(r))?;
+                let f = values.pop().ok_or_else(|| underflow(r))?;
+                values.push(Expr::app(f, a));
             }
-            EXPR_APP => {
-                let f = Expr::read_body(r)?;
-                let a = Expr::read_body(r)?;
-                Expr::app(f, a)
-            }
-            EXPR_LAM => {
-                let binder_name = Name::read_body(r)?;
-                let binder_type = Expr::read_body(r)?;
-                let body = Expr::read_body(r)?;
+            ExprTask::BuildLam(binder_name) => {
+                let body = values.pop().ok_or_else(|| underflow(r))?;
+                let binder_type = values.pop().ok_or_else(|| underflow(r))?;
                 let bi = binder_info_from_tag(r.u8()?)
                     .ok_or_else(|| r.err_public("unknown binder-info tag"))?;
-                Expr::lam(binder_name, binder_type, body, bi)
+                values.push(Expr::lam(binder_name, binder_type, body, bi));
             }
-            EXPR_FORALL => {
-                let binder_name = Name::read_body(r)?;
-                let binder_type = Expr::read_body(r)?;
-                let body = Expr::read_body(r)?;
+            ExprTask::BuildForall(binder_name) => {
+                let body = values.pop().ok_or_else(|| underflow(r))?;
+                let binder_type = values.pop().ok_or_else(|| underflow(r))?;
                 let bi = binder_info_from_tag(r.u8()?)
                     .ok_or_else(|| r.err_public("unknown binder-info tag"))?;
-                Expr::forall_e(binder_name, binder_type, body, bi)
+                values.push(Expr::forall_e(binder_name, binder_type, body, bi));
             }
-            EXPR_LET => {
-                let decl_name = Name::read_body(r)?;
-                let type_ = Expr::read_body(r)?;
-                let value = Expr::read_body(r)?;
-                let body = Expr::read_body(r)?;
+            ExprTask::BuildLet(decl_name) => {
+                let body = values.pop().ok_or_else(|| underflow(r))?;
+                let value = values.pop().ok_or_else(|| underflow(r))?;
+                let type_ = values.pop().ok_or_else(|| underflow(r))?;
                 let non_dep = r.bool()?;
-                Expr::let_e(decl_name, type_, value, body, non_dep)
+                values.push(Expr::let_e(decl_name, type_, value, body, non_dep));
             }
-            EXPR_LIT_NAT => {
-                let count = r.u64()?;
-                let mut limbs = Vec::new();
-                for _ in 0..count {
-                    limbs.push(r.u64()?);
-                }
-                let lit = NatLit::from_limbs_le(limbs.clone());
-                if lit.limbs_le() != limbs.as_slice() {
-                    // Trailing zero limbs would give two encodings of one value.
-                    return Err(r.err_public("non-normalized nat literal limbs"));
-                }
-                Expr::lit(Literal::Nat(lit))
+            ExprTask::BuildMData(data) => {
+                let expr = values.pop().ok_or_else(|| underflow(r))?;
+                values.push(Expr::mdata(data, expr));
             }
-            EXPR_LIT_STR => Expr::lit(Literal::Str(r.str()?.to_string())),
-            EXPR_MDATA => {
-                let data = KVMap::read_body(r)?;
-                let expr = Expr::read_body(r)?;
-                Expr::mdata(data, expr)
+            ExprTask::BuildProj(struct_name, idx) => {
+                let expr = values.pop().ok_or_else(|| underflow(r))?;
+                values.push(Expr::proj(struct_name, idx, expr));
             }
-            EXPR_PROJ => {
-                let struct_name = Name::read_body(r)?;
-                let idx = r.u64()?;
-                let expr = Expr::read_body(r)?;
-                Expr::proj(struct_name, idx, expr)
-            }
-            _ => return Err(r.err_public("unknown expr tag")),
-        })
+        }
+    }
+    match values.len() {
+        1 => Ok(values.pop().expect("length checked")),
+        _ => Err(r.err_public("expr value-stack did not reduce to a single root")),
     }
 }
 
@@ -1136,5 +1257,43 @@ mod tests {
     fn schema_headers_are_checked() {
         let name_bytes = Name::anonymous().to_canonical_bytes();
         assert!(Level::from_canonical_bytes(&name_bytes).is_err());
+    }
+
+    /// franken_lean-fnj: a deeply nested hostile encoding must decode to a TYPED
+    /// error, never a stack-overflow abort. Run on a deliberately small (1 MiB)
+    /// stack — a recursive decoder would `SIGABRT` here; the iterative one returns
+    /// `Err`. Two properties in one safe check: (a) `.join()` returning `Ok` proves
+    /// no abort occurred; (b) the error is `input truncated`, not a depth cap,
+    /// proving the decoder walked all 2,000,000 tags rather than bailing at some
+    /// artificial limit that would false-reject a legitimately deep olean. The tag
+    /// chains carry no operands, so no deep tree is ever built (that would recurse
+    /// on `Drop` — a separate concern tracked in franken_lean-fnj).
+    #[test]
+    fn deeply_nested_input_is_a_typed_error_not_a_stack_overflow() {
+        let outcome = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let mut expr_bytes = CanonWriter::new();
+                expr_bytes.schema(SCHEMA_EXPR);
+                let mut expr_bytes = expr_bytes.into_bytes();
+                expr_bytes.extend(std::iter::repeat_n(super::EXPR_APP, 2_000_000));
+                let expr_err = Expr::from_canonical_bytes(&expr_bytes)
+                    .expect_err("truncated deep App chain must be a typed error");
+                assert_eq!(expr_err.what, "input truncated", "no artificial depth cap");
+
+                let mut level_bytes = CanonWriter::new();
+                level_bytes.schema(SCHEMA_LEVEL);
+                let mut level_bytes = level_bytes.into_bytes();
+                level_bytes.extend(std::iter::repeat_n(super::LEVEL_MAX, 2_000_000));
+                let level_err = Level::from_canonical_bytes(&level_bytes)
+                    .expect_err("truncated deep Max chain must be a typed error");
+                assert_eq!(level_err.what, "input truncated", "no artificial depth cap");
+            })
+            .expect("spawn decoder thread")
+            .join();
+        assert!(
+            outcome.is_ok(),
+            "decoding deep hostile input aborted the thread (stack overflow) instead of erroring"
+        );
     }
 }
