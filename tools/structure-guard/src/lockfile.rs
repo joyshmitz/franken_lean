@@ -357,25 +357,67 @@ pub fn parse_suite_lock(text: &str) -> Result<SuiteLock, String> {
     Ok(lock)
 }
 
-/// Extract `channel = "..."` from `rust-toolchain.toml`.
+/// Extract the one exact `channel = "..."` from the constrained
+/// `rust-toolchain.toml` shape. A section-insensitive search is not sufficient:
+/// Cargo/rustup could select a path or a later toolchain section while a decoy key
+/// satisfies the lock comparison.
 pub fn parse_toolchain_channel(text: &str) -> Result<String, String> {
-    for raw in text.lines() {
+    let mut in_toolchain = false;
+    let mut saw_toolchain = false;
+    let mut channel: Option<String> = None;
+    for (idx, raw) in text.lines().enumerate() {
+        let lineno = idx + 1;
         let line = match raw.find('#') {
             Some(pos) => &raw[..pos],
             None => raw,
         }
         .trim();
-        if let Some((key, value)) = line.split_once('=')
-            && key.trim() == "channel"
-            && let Some(channel) = value
-                .trim()
-                .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-        {
-            return Ok(channel.to_string());
+        if line.is_empty() {
+            continue;
+        }
+        let err = |message: &str| format!("rust-toolchain.toml:{lineno}: {message}: `{line}`");
+        if line.starts_with('[') {
+            if line != "[toolchain]" {
+                return Err(err("only the `[toolchain]` section is supported"));
+            }
+            if saw_toolchain {
+                return Err(err("duplicate `[toolchain]` section"));
+            }
+            saw_toolchain = true;
+            in_toolchain = true;
+            continue;
+        }
+        if !in_toolchain {
+            return Err(err("content before `[toolchain]`"));
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| err("expected `key = value`"))?;
+        match key.trim() {
+            "channel" => {
+                let value = value.trim();
+                let parsed = value
+                    .strip_prefix('"')
+                    .and_then(|inner| inner.strip_suffix('"'))
+                    .filter(|inner| !inner.is_empty() && !inner.contains(['"', '\\']))
+                    .ok_or_else(|| err("channel must be one non-empty unescaped quoted string"))?;
+                if channel.replace(parsed.to_string()).is_some() {
+                    return Err(err("duplicate channel key"));
+                }
+            }
+            "components" | "profile" | "targets" => {
+                if value.trim().is_empty() {
+                    return Err(err("toolchain option must have a value"));
+                }
+            }
+            "path" => return Err(err("path-based toolchains are forbidden; pin a channel")),
+            _ => return Err(err("unsupported toolchain key")),
         }
     }
-    Err("rust-toolchain.toml: missing channel".to_string())
+    if !saw_toolchain {
+        return Err("rust-toolchain.toml: missing `[toolchain]` section".to_string());
+    }
+    channel.ok_or_else(|| "rust-toolchain.toml: missing channel".to_string())
 }
 
 /// Run the closure audit. Missing/malformed governance files degrade to
@@ -645,5 +687,29 @@ mod tests {
             "nightly-2026-07-13"
         );
         assert!(parse_toolchain_channel("[toolchain]\n").is_err());
+        assert!(
+            parse_toolchain_channel(
+                "[metadata]\nchannel = \"nightly-2026-07-13\"\n[toolchain]\nchannel = \"stable\"\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_toolchain_channel(
+                "[toolchain]\nchannel = \"nightly-2026-07-13\"\npath = \"/tmp/toolchain\"\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_toolchain_channel(
+                "[toolchain]\nchannel = \"nightly-2026-07-13\"\nchannel = \"stable\"\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_toolchain_channel(
+                "[toolchain]\nchannel = \"nightly-2026-07-13\"\nunknown = true\n"
+            )
+            .is_err()
+        );
     }
 }
