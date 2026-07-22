@@ -8,8 +8,8 @@ use fln_core::expr::{BinderInfo, Expr};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_env::constants::{
-    AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
-    TheoremVal,
+    AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal,
+    InductiveVal, ReducibilityHints, TheoremVal,
 };
 use fln_env::environment::Environment;
 use fln_kernel::verdict::{Budget, ExhaustionReason, RejectClass, Verdict};
@@ -469,4 +469,130 @@ fn kr106_application_type_mismatch() {
     // Admitting a definition whose body contains the ill-typed application.
     let verdict = check(&env, &defn("bad", prop(), bad_app), Budget::DEFAULT);
     assert_eq!(reject_class(&verdict), Some(RejectClass::TypeMismatch));
+}
+
+// ---- KR-112 projection inference (previously untested) ------------------------------
+
+/// Add a constant directly (the K1 kernel does not yet admit inductives/constructors;
+/// projection inference reads them from the environment, so tests populate it — the
+/// same door `admit` uses for axioms, minus the kernel check).
+fn add_info(env: &Environment, info: ConstantInfo) -> Environment {
+    env.add_decl(info).expect("adds")
+}
+
+/// A one-constructor structure `name : sort_type` whose constructor `ctor` takes the
+/// given field types (no parameters, no indices).
+fn add_structure(
+    env: &Environment,
+    name: &str,
+    ctor: &str,
+    sort_type: Expr,
+    field_types: &[Expr],
+) -> Environment {
+    let mut ctor_ty = Expr::const_(n(name), vec![]);
+    for field in field_types.iter().rev() {
+        ctor_ty = Expr::forall_e(n("_f"), field.clone(), ctor_ty, BinderInfo::Default);
+    }
+    let ind = ConstantInfo::Induct(InductiveVal {
+        base: ConstantVal {
+            name: n(name),
+            level_params: vec![],
+            type_: sort_type,
+        },
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n(name)],
+        ctors: vec![n(ctor)],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    });
+    let env = add_info(env, ind);
+    let ctor_info = ConstantInfo::Ctor(ConstructorVal {
+        base: ConstantVal {
+            name: n(ctor),
+            level_params: vec![],
+            type_: ctor_ty,
+        },
+        induct: n(name),
+        cidx: 0,
+        num_params: 0,
+        num_fields: field_types.len() as u32,
+        is_unsafe: false,
+    });
+    add_info(&env, ctor_info)
+}
+
+#[test]
+fn kr112_projection_infers_the_field_type() {
+    // D : Sort 1 (data); structure S : Sort 1 with mk : D → D → S; s : S.
+    // `proj S 0 s` and `proj S 1 s` both have type D.
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let d = Expr::const_(n("D"), vec![]);
+    let env = add_structure(&env, "S", "mk", sort1(), &[d.clone(), d.clone()]);
+    let env = admit(&env, &axiom("s", Expr::const_(n("S"), vec![])));
+    let s = Expr::const_(n("s"), vec![]);
+
+    for idx in [0u64, 1] {
+        let proj = Expr::proj(n("S"), idx, s.clone());
+        let verdict = check(
+            &env,
+            &defn(&format!("px{idx}"), d.clone(), proj),
+            Budget::DEFAULT,
+        );
+        assert!(verdict.is_accepted(), "proj S {idx} s : D — {verdict:?}");
+    }
+
+    // A projection asserted at the WRONG field type is a real mismatch.
+    let env2 = admit(&env, &axiom("E", sort1()));
+    let e = Expr::const_(n("E"), vec![]);
+    let wrong = check(
+        &env2,
+        &defn("bad_ty", e, Expr::proj(n("S"), 0, s.clone())),
+        Budget::DEFAULT,
+    );
+    assert_eq!(
+        reject_class(&wrong),
+        Some(RejectClass::DefinitionTypeMismatch),
+        "proj S 0 s has type D, not E — {wrong:?}"
+    );
+}
+
+#[test]
+fn kr901_projection_cannot_leak_data_out_of_prop() {
+    // THE soundness guard (KR-901): a Prop-valued structure whose field is a genuine
+    // datum (D : Sort 1) must NOT let a projection extract that datum — otherwise the
+    // kernel would pull data out of a proof, defeating proof irrelevance.
+    // Pstruct : Prop, pmk : D → Pstruct, hp : Pstruct; `proj Pstruct 0 hp` is illegal.
+    let env = admit(&Environment::new(), &axiom("D", sort1()));
+    let d = Expr::const_(n("D"), vec![]);
+    let env = add_structure(&env, "Pstruct", "pmk", prop(), std::slice::from_ref(&d));
+    let env = admit(&env, &axiom("hp", Expr::const_(n("Pstruct"), vec![])));
+    let hp = Expr::const_(n("hp"), vec![]);
+
+    let leak = Expr::proj(n("Pstruct"), 0, hp);
+    let verdict = check(&env, &defn("leak", d, leak), Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::InvalidProjection),
+        "a non-Prop field was projected out of a Prop structure — UNSOUND: {verdict:?}"
+    );
+
+    // Control: an all-Prop structure projects its (Prop) field fine — the guard is
+    // discriminating, not a blanket ban on projecting from Prop structures.
+    let env = admit(&Environment::new(), &axiom("Q", prop()));
+    let q = Expr::const_(n("Q"), vec![]);
+    let env = add_structure(&env, "QBox", "qmk", prop(), std::slice::from_ref(&q));
+    let env = admit(&env, &axiom("hq", Expr::const_(n("QBox"), vec![])));
+    let hq = Expr::const_(n("hq"), vec![]);
+    let ok = check(
+        &env,
+        &defn("unbox", q, Expr::proj(n("QBox"), 0, hq)),
+        Budget::DEFAULT,
+    );
+    assert!(
+        ok.is_accepted(),
+        "projecting a Prop field from a Prop box is fine: {ok:?}"
+    );
 }
