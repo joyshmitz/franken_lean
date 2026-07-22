@@ -634,3 +634,55 @@ fn kr310_same_constant_defeq_iff_levels_are_equivalent() {
         "F.<max u u> and F.<u> should be defeq (max u u normalizes to u)"
     );
 }
+
+#[test]
+fn kr109_let_inference_zeta_substitutes_the_value_into_the_body_type() {
+    // A : Sort 1; a : A. `def g : A := let x := a; x` — the let's body has type
+    // `x`'s declared type A, and the returned declaration type must be that (with
+    // the let-local zeta-substituted out), so g admits at type A.
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a_ty = Expr::const_(n("A"), vec![]);
+    let env = admit(&env, &axiom("a", a_ty.clone()));
+    let a = Expr::const_(n("a"), vec![]);
+
+    let body = Expr::let_e(
+        n("x"),
+        a_ty.clone(),
+        a.clone(),
+        Expr::bvar(0).expect("packs"), // the let-bound x
+        false,
+    );
+    let ok = check(
+        &env,
+        &defn("g", a_ty.clone(), body.clone()),
+        Budget::DEFAULT,
+    );
+    assert!(ok.is_accepted(), "let body infers to A: {ok:?}");
+
+    // The declared type must actually be checked: asserting the WRONG type rejects.
+    let env2 = admit(&env, &axiom("B", sort1()));
+    let b_ty = Expr::const_(n("B"), vec![]);
+    let wrong = check(&env2, &defn("g_bad", b_ty, body), Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&wrong),
+        Some(RejectClass::DefinitionTypeMismatch),
+        "let body has type A, not B: {wrong:?}"
+    );
+
+    // KR-109 also checks the let VALUE against its ascribed type: `let x : A := b`
+    // where b : B (≠ A) must reject at the let, not silently accept.
+    let env3 = admit(&env2, &axiom("b", Expr::const_(n("B"), vec![])));
+    let mistyped_let = Expr::let_e(
+        n("x"),
+        a_ty.clone(),                 // ascribed type A
+        Expr::const_(n("b"), vec![]), // value b : B
+        Expr::bvar(0).expect("packs"),
+        false,
+    );
+    let bad_val = check(&env3, &defn("g_val", a_ty, mistyped_let), Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&bad_val),
+        Some(RejectClass::TypeMismatch),
+        "let value b : B does not match ascribed type A: {bad_val:?}"
+    );
+}
