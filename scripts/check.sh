@@ -84,6 +84,7 @@ FINALIZER_PID=""
 FINALIZER_START_TICKS=""
 FINALIZER_CLEANUP_UNPROVEN=0
 FINALIZER_WAIT_UNSAFE=0
+PROCESS_TREE_CLEANUP_UNPROVEN=0
 FINALIZATION_SIGNAL=""
 FINALIZATION_SIGNAL_EXIT=0
 FINALIZATION_SIGNAL_GENERATION=0
@@ -187,6 +188,12 @@ set_final() {
   FINAL_EXIT="$3"
 }
 
+mark_process_tree_cleanup_unproven() {
+  PROCESS_TREE_CLEANUP_UNPROVEN=1
+  trap '' HUP INT TERM
+  set_final internal_fault process_tree_cleanup_unproven 2
+}
+
 # Called from the EXIT-trap finalizer.
 # shellcheck disable=SC2317
 build_terminal_command() {
@@ -227,14 +234,11 @@ bounded_readiness_wait() {
 
 # The launch gate guarantees that this direct child has not forked yet.
 terminate_unreleased_runner() {
-  local pid="$1" state
-  kill -KILL "$pid" 2>/dev/null || true
-  for _ in $(seq 1 500); do
-    if [ ! -r "/proc/$pid/stat" ]; then break; fi
-    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf X)"
-    [ "$state" = Z ] && break
-    sleep 0.01
-  done
+  local pid="$1"
+  if ! setsid -- python3 "$EVIDENCE" kill-direct-child --pid "$pid" \
+      --expected-parent-pid "$$" --wait-ms 5000; then
+    return 1
+  fi
   wait "$pid" 2>/dev/null || true
 }
 
@@ -347,7 +351,7 @@ on_signal() {
   fi
   if [ -n "$ACTIVE_RUNNER_PID" ]; then
     if ! stop_active_runner "$name"; then
-      set_final internal_fault process_tree_cleanup_unproven 2
+      mark_process_tree_cleanup_unproven
       exit 2
     fi
   fi
@@ -361,6 +365,7 @@ on_signal() {
 on_finalizer_signal() {
   local name="$1" exit_code="$2" noclobber_was_set=0
   trap '' HUP INT TERM
+  if [ "$PROCESS_TREE_CLEANUP_UNPROVEN" -ne 0 ]; then return 0; fi
   case $- in *C*) noclobber_was_set=1 ;; esac
   set -o noclobber
   : 2>/dev/null > "$FINALIZATION_DECISION" || true
@@ -396,6 +401,7 @@ on_finalizer_signal() {
 # shellcheck disable=SC2317
 run_finalizer_command() {
   local rc=0 generation binding_valid=1 resume_failed=0 wait_safe=1
+  [ "$PROCESS_TREE_CLEANUP_UNPROVEN" -eq 0 ] || return 2
   [ "$FINALIZER_CLEANUP_UNPROVEN" -eq 0 ] || return 2
   [ -z "$FINALIZATION_SIGNAL" ] || return 125
   if [ -s "$FINALIZATION_DECISION" ]; then trap '' HUP INT TERM; fi
@@ -506,6 +512,10 @@ run_finalizer_command() {
 
 # shellcheck disable=SC2317
 abort_if_finalizer_signalled() {
+  if [ "$PROCESS_TREE_CLEANUP_UNPROVEN" -ne 0 ]; then
+    note "INTERNAL FAULT: process-tree cleanup was not proven"
+    exit 2
+  fi
   if [ "$FINALIZER_CLEANUP_UNPROVEN" -ne 0 ]; then
     note "INTERNAL FAULT: finalizer cleanup was not proven"
     exit 2
@@ -705,7 +715,10 @@ run_stage() {
       --expected-parent-pid "$$" --wait-ms 5000 --session-leader \
       2>/dev/null
   )"; then
-    terminate_unreleased_runner "$ACTIVE_RUNNER_PID"
+    if ! terminate_unreleased_runner "$ACTIVE_RUNNER_PID"; then
+      mark_process_tree_cleanup_unproven
+      exit 2
+    fi
     SPAWNING=0
     ACTIVE_RUNNER_PID=""
     if [ -n "$PENDING_SIGNAL" ]; then
@@ -720,7 +733,10 @@ run_stage() {
   if [ -n "$PENDING_SIGNAL" ]; then
     local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
     PENDING_SIGNAL=""
-    terminate_unreleased_runner "$ACTIVE_RUNNER_PID"
+    if ! terminate_unreleased_runner "$ACTIVE_RUNNER_PID"; then
+      mark_process_tree_cleanup_unproven
+      exit 2
+    fi
     SPAWNING=0
     ACTIVE_RUNNER_PID=""
     ACTIVE_RUNNER_START_TICKS=""
@@ -738,10 +754,12 @@ run_stage() {
         release_cleanup_failed=1
       fi
     else
-      terminate_unreleased_runner "$ACTIVE_RUNNER_PID"
+      if ! terminate_unreleased_runner "$ACTIVE_RUNNER_PID"; then
+        release_cleanup_failed=1
+      fi
     fi
     if [ "$release_cleanup_failed" -ne 0 ]; then
-      set_final internal_fault process_tree_cleanup_unproven 2
+      mark_process_tree_cleanup_unproven
       exit 2
     fi
     SPAWNING=0
@@ -761,7 +779,7 @@ run_stage() {
     local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
     PENDING_SIGNAL=""
     if ! stop_active_runner "$pending_name"; then
-      set_final internal_fault process_tree_cleanup_unproven 2
+      mark_process_tree_cleanup_unproven
       exit 2
     fi
     set_final cancelled "signal_$pending_name" "$pending_exit"
@@ -855,7 +873,10 @@ self_test() {
       setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$child_pid" \
         --expected-parent-pid "$$" --wait-ms 5000 --session-leader 2>/dev/null
     )"; then
-      terminate_unreleased_runner "$child_pid"
+      if ! terminate_unreleased_runner "$child_pid"; then
+        mark_process_tree_cleanup_unproven
+        exit 2
+      fi
       SPAWNING=0
       ACTIVE_RUNNER_PID=""
       if [ -n "$PENDING_SIGNAL" ]; then
@@ -870,7 +891,10 @@ self_test() {
     if [ -n "$PENDING_SIGNAL" ]; then
       local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
       PENDING_SIGNAL=""
-      terminate_unreleased_runner "$child_pid"
+      if ! terminate_unreleased_runner "$child_pid"; then
+        mark_process_tree_cleanup_unproven
+        exit 2
+      fi
       SPAWNING=0
       ACTIVE_RUNNER_PID=""
       ACTIVE_RUNNER_START_TICKS=""
@@ -889,10 +913,12 @@ self_test() {
           release_cleanup_failed=1
         fi
       else
-        terminate_unreleased_runner "$child_pid"
+        if ! terminate_unreleased_runner "$child_pid"; then
+          release_cleanup_failed=1
+        fi
       fi
       if [ "$release_cleanup_failed" -ne 0 ]; then
-        set_final internal_fault process_tree_cleanup_unproven 2
+        mark_process_tree_cleanup_unproven
         exit 2
       fi
       SPAWNING=0
@@ -912,7 +938,7 @@ self_test() {
       local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
       PENDING_SIGNAL=""
       if ! stop_active_runner "$pending_name"; then
-        set_final internal_fault process_tree_cleanup_unproven 2
+        mark_process_tree_cleanup_unproven
         exit 2
       fi
       set_final cancelled "signal_$pending_name" "$pending_exit"
@@ -968,7 +994,10 @@ self_test() {
     setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$child_pid" \
       --expected-parent-pid "$$" --wait-ms 5000 --session-leader 2>/dev/null
   )"; then
-    terminate_unreleased_runner "$child_pid"
+    if ! terminate_unreleased_runner "$child_pid"; then
+      mark_process_tree_cleanup_unproven
+      exit 2
+    fi
     SPAWNING=0
     ACTIVE_RUNNER_PID=""
     if [ -n "$PENDING_SIGNAL" ]; then
@@ -983,7 +1012,10 @@ self_test() {
   if [ -n "$PENDING_SIGNAL" ]; then
     local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
     PENDING_SIGNAL=""
-    terminate_unreleased_runner "$child_pid"
+    if ! terminate_unreleased_runner "$child_pid"; then
+      mark_process_tree_cleanup_unproven
+      exit 2
+    fi
     SPAWNING=0
     ACTIVE_RUNNER_PID=""
     ACTIVE_RUNNER_START_TICKS=""
@@ -1002,10 +1034,12 @@ self_test() {
         release_cleanup_failed=1
       fi
     else
-      terminate_unreleased_runner "$child_pid"
+      if ! terminate_unreleased_runner "$child_pid"; then
+        release_cleanup_failed=1
+      fi
     fi
     if [ "$release_cleanup_failed" -ne 0 ]; then
-      set_final internal_fault process_tree_cleanup_unproven 2
+      mark_process_tree_cleanup_unproven
       exit 2
     fi
     SPAWNING=0
@@ -1025,7 +1059,7 @@ self_test() {
     local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
     PENDING_SIGNAL=""
     if ! stop_active_runner "$pending_name"; then
-      set_final internal_fault process_tree_cleanup_unproven 2
+      mark_process_tree_cleanup_unproven
       exit 2
     fi
     set_final cancelled "signal_$pending_name" "$pending_exit"

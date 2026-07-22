@@ -2981,41 +2981,102 @@ def emergency_kill(
         close_process_handles(handles)
 
 
-def kill_bound_process_group(pid: int, expected_start_ticks: int) -> None:
-    """SIGKILL one exact session leader and its current process group."""
-    if pid <= 1 or expected_start_ticks <= 0:
+def kill_bound_process_group(
+    pid: int, expected_start_ticks: int, expected_parent_pid: int
+) -> None:
+    """Freeze and pidfd-kill every member of one exact session process group."""
+    if (
+        pid <= 1
+        or expected_start_ticks <= 0
+        or expected_parent_pid <= 1
+        or pid == expected_parent_pid
+    ):
         raise EvidenceError("bound process-group identity is malformed")
-    opened = open_process_handle(pid)
+    opened = open_process_handle(pid, expected_parent_pid=expected_parent_pid)
     if opened is None:
         return
-    handle = opened
+    facts = proc_stat_facts(pid)
+    if facts is None or facts[2] != expected_start_ticks or opened[0] != expected_start_ticks:
+        os.close(opened[1])
+        return
+    if facts[1] != pid:
+        os.close(opened[1])
+        raise EvidenceError("bound process is not the expected session leader")
+    handles: ProcessHandles = {pid: opened}
+    frozen = False
     try:
-        facts = proc_stat_facts(pid)
-        if facts is None or facts[2] != expected_start_ticks:
-            return
-        if handle[0] != expected_start_ticks or facts[1] != pid:
-            raise EvidenceError("bound process is not the expected session leader")
-        if not signal_process_handle(pid, handle, signal.SIGSTOP):
-            return
-        deadline = time.monotonic() + 0.25
+        deadline = time.monotonic() + 1.0
+        prior_members: set[int] | None = None
         while time.monotonic() < deadline:
-            repeated = proc_stat_facts(pid)
-            if repeated is None or repeated[2] != expected_start_ticks:
-                return
-            if repeated[0] in {"T", "t"}:
-                break
+            observed = live_process_group_members(pid)
+            for member_pid in observed:
+                current = handles.get(member_pid)
+                if current is None:
+                    current = open_process_handle(member_pid)
+                    if current is None:
+                        continue
+                    member_facts = proc_stat_facts(member_pid)
+                    if (
+                        member_facts is None
+                        or member_facts[0] == "Z"
+                        or member_facts[1] != pid
+                        or member_facts[2] != current[0]
+                    ):
+                        os.close(current[1])
+                        continue
+                    handles[member_pid] = current
+                signal_process_handle(member_pid, current, signal.SIGSTOP)
             time.sleep(0.005)
+            repeated = live_process_group_members(pid)
+            bound_live = {
+                member_pid
+                for member_pid, member_handle in handles.items()
+                if process_handle_alive(member_pid, member_handle)
+                and (member_facts := proc_stat_facts(member_pid)) is not None
+                and member_facts[1] == pid
+            }
+            all_stopped = all(
+                (member_facts := proc_stat_facts(member_pid)) is not None
+                and member_facts[0] in {"T", "t"}
+                and member_facts[2] == handles[member_pid][0]
+                for member_pid in bound_live
+            )
+            if repeated == bound_live and repeated == prior_members and all_stopped:
+                frozen = True
+                break
+            prior_members = repeated if repeated == bound_live and all_stopped else None
         else:
-            raise EvidenceError("bound process group could not be frozen")
-        # The exact leader is stopped and unreaped, so its process-group identifier
-        # cannot be recycled between this verification and the group kill.
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        signal_process_handle(pid, handle, signal.SIGKILL)
+            raise EvidenceError("bound process group did not reach a frozen fixed point")
+        for member_pid in sorted(handles, key=lambda value: value == pid):
+            signal_process_handle(
+                member_pid, handles[member_pid], signal.SIGKILL
+            )
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            live = {
+                member_pid
+                for member_pid, member_handle in handles.items()
+                if process_handle_alive(member_pid, member_handle)
+            }
+            if not live and not live_process_group_members(pid):
+                return
+            for member_pid in live:
+                signal_process_handle(
+                    member_pid, handles[member_pid], signal.SIGKILL
+                )
+            time.sleep(0.005)
+        raise EvidenceError("bound process group remained live after pidfd SIGKILL")
+    except BaseException:
+        # Every signal remains tied to a pidfd-bound lifetime. If the fixed-point
+        # proof fails, kill what was proven and report cleanup uncertainty.
+        for member_pid, member_handle in handles.items():
+            signal_process_handle(member_pid, member_handle, signal.SIGKILL)
+        raise
     finally:
-        os.close(handle[1])
+        if not frozen:
+            for member_pid, member_handle in handles.items():
+                signal_process_handle(member_pid, member_handle, signal.SIGKILL)
+        close_process_handles(handles)
 
 
 def signal_bound_process(pid: int, expected_start_ticks: int, signum: int) -> None:
@@ -4255,7 +4316,37 @@ def cmd_release_process_launch(args: argparse.Namespace) -> int:
 
 
 def cmd_kill_bound_group(args: argparse.Namespace) -> int:
-    kill_bound_process_group(args.pid, args.expected_start_ticks)
+    kill_bound_process_group(
+        args.pid, args.expected_start_ticks, args.expected_parent_pid
+    )
+    return PASS
+
+
+def cmd_kill_direct_child(args: argparse.Namespace) -> int:
+    """Kill one currently direct child through a pidfd, never a numeric PID."""
+    if (
+        args.pid <= 1
+        or args.expected_parent_pid <= 1
+        or args.pid in {os.getpid(), args.expected_parent_pid}
+        or args.wait_ms < 0
+        or args.wait_ms > 5000
+    ):
+        raise EvidenceError("direct-child cleanup identity is malformed")
+    handle = open_process_handle(
+        args.pid, expected_parent_pid=args.expected_parent_pid
+    )
+    if handle is None:
+        return PASS
+    try:
+        if not signal_process_handle(args.pid, handle, signal.SIGKILL):
+            return PASS
+        deadline = time.monotonic() + args.wait_ms / 1000
+        while process_handle_alive(args.pid, handle):
+            if time.monotonic() >= deadline:
+                raise EvidenceError("direct child remained live after pidfd SIGKILL")
+            time.sleep(0.005)
+    finally:
+        os.close(handle[1])
     return PASS
 
 
@@ -4306,10 +4397,6 @@ def cmd_assert_process_group_empty(args: argparse.Namespace) -> int:
             raise EvidenceError(
                 f"process group {args.pgid} retained live members {sorted(live)}"
             )
-        try:
-            os.killpg(args.pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
         time.sleep(0.01)
 
 
@@ -5724,7 +5811,20 @@ def build_parser() -> argparse.ArgumentParser:
     bound_group_parser.add_argument(
         "--expected-start-ticks", type=int, required=True
     )
+    bound_group_parser.add_argument(
+        "--expected-parent-pid", type=int, required=True
+    )
     bound_group_parser.set_defaults(func=cmd_kill_bound_group)
+
+    direct_child_parser = subparsers.add_parser(
+        "kill-direct-child", help="pidfd-kill one current direct child"
+    )
+    direct_child_parser.add_argument("--pid", type=int, required=True)
+    direct_child_parser.add_argument(
+        "--expected-parent-pid", type=int, required=True
+    )
+    direct_child_parser.add_argument("--wait-ms", type=int, default=5000)
+    direct_child_parser.set_defaults(func=cmd_kill_direct_child)
 
     bound_process_parser = subparsers.add_parser(
         "signal-bound-process", help="signal one start-time-bound process"
@@ -5753,7 +5853,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     empty_group_parser = subparsers.add_parser(
         "assert-process-group-empty",
-        help="boundedly kill and verify one unreaped session process group",
+        help="boundedly observe that a process group has no live members",
     )
     empty_group_parser.add_argument("--pgid", type=int, required=True)
     empty_group_parser.add_argument("--wait-ms", type=int, default=1000)
