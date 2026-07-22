@@ -70,6 +70,7 @@ edge fln-env -> fln-hash           # logical + operational roots over the identi
 edge fln-bignum -> fln-core        # loss-free NatLit interop, shared limb layout (franken_lean-npl)
 edge fln-kernel -> fln-core        # kernel terms are term-plane values (franken_lean-zht)
 edge fln-kernel -> fln-env         # check consults the environment read-only (franken_lean-zht)
+edge fln-olean -> fln-rt           # region reader consumes the generated ABI object model (franken_lean-y24)
 
 # ---- D3 structural law (a): no inward calls -------------------------------------------
 # No fln-unsafe-* crate may depend, even transitively, on the trust base.

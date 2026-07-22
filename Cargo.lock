@@ -94,6 +94,9 @@ version = "0.0.0"
 [[package]]
 name = "fln-olean"
 version = "0.0.0"
+dependencies = [
+ "fln-rt",
+]
 
 [[package]]
 name = "fln-parse"
