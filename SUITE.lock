@@ -14,7 +14,7 @@
 #   target <triple>                   (certified build targets; repeatable)
 #   suite <repo> commit=<hash> path=<abs-path>
 #   crate <package> repo=<repo>       (maps an allowed suite package to its pinned repo)
-#   reference <org/repo> tag=<tag> commit=<hash>
+#   reference <org/repo> tag=<tag> commit=<hash> tree=<hash>
 #   corpus <org/repo> tag=<tag> commit=<hash>
 
 schema fln-suite-lock/1
@@ -53,5 +53,5 @@ crate atp              repo=atp
 crate frankentorch     repo=frankentorch
 
 # ---- the Reference (Oracle-Only, D8) and the Corpus ------------------------------------
-reference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35
+reference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=ba16913719a2f6a15a826918fbe6ba9dd5413e91
 corpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665ed08f64fea08e997

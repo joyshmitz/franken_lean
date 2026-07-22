@@ -1,7 +1,8 @@
 # vendor/
 
-Home of `lean4-src@<pin>` — the vendored upstream Lean sources at the epoch tag named in
-`SUITE.lock`, held **byte-identical**, Apache-2.0 NOTICE files carried (plan D5).
+Home of `lean4-src` — the vendored upstream Lean sources at the epoch tag named in
+`SUITE.lock`, held **byte-identical**, with upstream Apache-2.0 `LICENSE` and `LICENSES`
+files preserved and project attribution in [`NOTICE`](NOTICE) (plan D5).
 
 Per the Oracle-Only Law (D8), vendored upstream sources serve **exactly three roles**:
 
@@ -15,5 +16,8 @@ They are **never executed as toolchain implementation, never linked, never built
 crate in this workspace may reference `vendor/` at build time; release CI proves shipped
 binaries cannot locate, spawn, or link the Reference.
 
-The actual pinned checkout lands with the SUITE.lock / contract-extraction beads
-(`franken_lean-xwf`, `franken_lean-53v`); this file records the law it will land under.
+The current snapshot is Lean `v4.32.0` at commit
+`8c9756b28d64dab099da31a4c09229a9e6a2ef35`. Its computed Git subtree is
+`ba16913719a2f6a15a826918fbe6ba9dd5413e91`, the exact tree named by that commit. The
+pin remains governed by `SUITE.lock`; future epoch changes replace it only through the
+same reviewed pin ceremony and re-run the tree-identity proof.

@@ -1,0 +1,18 @@
+FrankenLean vendored Reference notice
+
+vendor/lean4-src is an unmodified source-tree snapshot of:
+
+  Lean 4
+  https://github.com/leanprover/lean4
+  tag: v4.32.0
+  commit: 8c9756b28d64dab099da31a4c09229a9e6a2ef35
+  Git tree: ba16913719a2f6a15a826918fbe6ba9dd5413e91
+
+Lean 4 is licensed under Apache License 2.0. The upstream LICENSE and bundled-component
+LICENSES inventory are preserved byte-for-byte inside vendor/lean4-src. The pinned
+upstream tree does not contain a NOTICE file; this project-owned notice records the
+source and pin without modifying the vendored snapshot.
+
+Per FrankenLean's Oracle-Only Law, this source tree is data for Tribunal conformance,
+mechanical contract/census extraction, and native elaboration of Init/Std sources. It is
+never linked or executed as a FrankenLean toolchain implementation.

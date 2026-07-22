@@ -8,7 +8,8 @@
 #   3. clippy           cargo clippy --all-targets -- -D warnings
 #   4. test             cargo test
 #   5. structure-guard  cargo run -q -p structure-guard -- --root <repo> --robot
-#   6. ubs              ubs <changed files>          (skipped+logged if ubs absent
+#   6. vendor-tree      exact staged Reference tree equals the SUITE.lock pin
+#   7. ubs              ubs <changed files>          (skipped+logged if ubs absent
 #                                                     or no changed rust/toml files)
 #
 # This script IS the CI test step — workflows call it and never duplicate the
@@ -80,7 +81,7 @@ skip_stage() { # skip_stage <name> <reason>  — a typed, logged, honest skip
 
 self_test() {
   local failures=0
-  for stage in fmt check clippy test structure-guard; do
+  for stage in fmt check clippy test structure-guard vendor-tree; do
     echo "[check:self-test] planting failure in stage=$stage" >&2
     local st_log="$ART_DIR/selftest-$stage.ndjson"
     FLN_CHECK_PLANT="$stage" FLN_CHECK_LOG="$st_log" \
@@ -120,16 +121,26 @@ run_stage check cargo check --locked --all-targets
 run_stage clippy cargo clippy --locked --all-targets -- -D warnings
 run_stage test cargo test --locked
 run_stage structure-guard cargo run -q --locked -p structure-guard -- --root "$REPO" --robot
+run_stage vendor-tree bash scripts/verify_vendor_tree.sh
 
-# ubs runs on changed + untracked rust/toml files; absence is a logged skip, never silent.
+# UBS scans project-authored changed + untracked Rust/TOML. The byte-identical Reference
+# snapshot is governed by vendor-tree identity instead; its intentionally malformed
+# upstream fixtures are data, not FrankenLean-authored code.
 if command -v ubs >/dev/null 2>&1; then
-  UBS_FILES=$( { git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard; } \
-    | grep -E '\.(rs|toml)$' | sort -u | while read -r f; do [ -f "$f" ] && echo "$f"; done )
-  if [ -n "$UBS_FILES" ]; then
-    # shellcheck disable=SC2086
-    run_stage ubs ubs $UBS_FILES
+  mapfile -d '' -t UBS_FILES < <(
+    { git diff --name-only -z HEAD 2>/dev/null; git ls-files --others --exclude-standard -z; } \
+      | sort -zu \
+      | while IFS= read -r -d '' f; do
+          case "$f" in
+            vendor/*) continue ;;
+            *.rs|*.toml) [ -f "$f" ] && printf '%s\0' "$f" ;;
+          esac
+        done
+  )
+  if [ "${#UBS_FILES[@]}" -gt 0 ]; then
+    run_stage ubs ubs "${UBS_FILES[@]}"
   else
-    skip_stage ubs "no changed .rs/.toml files"
+    skip_stage ubs "no changed project-authored .rs/.toml files (vendor data excluded)"
   fi
 else
   skip_stage ubs "ubs binary not on PATH"

@@ -235,6 +235,7 @@ pub struct SuiteLock {
     /// allowed suite package -> repo
     pub crates: BTreeMap<String, String>,
     pub reference: Option<(String, String, String)>,
+    pub reference_tree: Option<String>,
     pub corpus: Option<(String, String, String)>,
 }
 
@@ -295,7 +296,7 @@ pub fn parse_suite_lock(text: &str) -> Result<SuiteLock, String> {
                     return Err(err("duplicate crate row"));
                 }
             }
-            "reference" | "corpus" if tokens.len() == 4 => {
+            "reference" if tokens.len() == 5 => {
                 let tag = tokens[2]
                     .strip_prefix("tag=")
                     .ok_or_else(|| err("needs tag=<tag>"))?;
@@ -303,14 +304,33 @@ pub fn parse_suite_lock(text: &str) -> Result<SuiteLock, String> {
                     .strip_prefix("commit=")
                     .filter(|c| is_hex40(c))
                     .ok_or_else(|| err("needs commit=<40-hex>"))?;
-                let triple = (tokens[1].to_string(), tag.to_string(), commit.to_string());
-                let slot = if tokens[0] == "reference" {
-                    &mut lock.reference
-                } else {
-                    &mut lock.corpus
-                };
-                if slot.replace(triple).is_some() {
-                    return Err(err("duplicate reference/corpus row"));
+                let tree = tokens[4]
+                    .strip_prefix("tree=")
+                    .filter(|tree| is_hex40(tree))
+                    .ok_or_else(|| err("reference needs tree=<40-hex>"))?;
+                if lock
+                    .reference
+                    .replace((tokens[1].to_string(), tag.to_string(), commit.to_string()))
+                    .is_some()
+                    || lock.reference_tree.replace(tree.to_string()).is_some()
+                {
+                    return Err(err("duplicate reference row"));
+                }
+            }
+            "corpus" if tokens.len() == 4 => {
+                let tag = tokens[2]
+                    .strip_prefix("tag=")
+                    .ok_or_else(|| err("needs tag=<tag>"))?;
+                let commit = tokens[3]
+                    .strip_prefix("commit=")
+                    .filter(|commit| is_hex40(commit))
+                    .ok_or_else(|| err("needs commit=<40-hex>"))?;
+                if lock
+                    .corpus
+                    .replace((tokens[1].to_string(), tag.to_string(), commit.to_string()))
+                    .is_some()
+                {
+                    return Err(err("duplicate corpus row"));
                 }
             }
             _ => return Err(err("unknown or malformed directive")),
@@ -322,8 +342,10 @@ pub fn parse_suite_lock(text: &str) -> Result<SuiteLock, String> {
     if lock.rust_nightly.is_empty() {
         return Err("SUITE.lock: missing rust-nightly row".to_string());
     }
-    if lock.reference.is_none() || lock.corpus.is_none() {
-        return Err("SUITE.lock: reference and corpus rows are both required".to_string());
+    if lock.reference.is_none() || lock.reference_tree.is_none() || lock.corpus.is_none() {
+        return Err(
+            "SUITE.lock: reference with tree and corpus rows are both required".to_string(),
+        );
     }
     for repo in lock.crates.values() {
         if !lock.suites.contains_key(repo) {
@@ -589,7 +611,7 @@ mod tests {
         assert!(parse_allowlist(&dup).is_err());
     }
 
-    const SUITE_OK: &str = "schema fln-suite-lock/1\nrust-nightly nightly-2026-07-13\ntarget x86_64-unknown-linux-gnu\nsuite asupersync commit=e464a484cb65c1a55be0d9c925e6e9c20318edcb path=/dp/asupersync\ncrate asupersync repo=asupersync\nreference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35\ncorpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665ed08f64fea08e997\n";
+    const SUITE_OK: &str = "schema fln-suite-lock/1\nrust-nightly nightly-2026-07-13\ntarget x86_64-unknown-linux-gnu\nsuite asupersync commit=e464a484cb65c1a55be0d9c925e6e9c20318edcb path=/dp/asupersync\ncrate asupersync repo=asupersync\nreference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=ba16913719a2f6a15a826918fbe6ba9dd5413e91\ncorpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665ed08f64fea08e997\n";
 
     #[test]
     fn parses_suite_lock_and_enforces_required_rows() {
@@ -597,8 +619,12 @@ mod tests {
         assert_eq!(lock.rust_nightly, "nightly-2026-07-13");
         assert_eq!(lock.crates["asupersync"], "asupersync");
         assert!(lock.reference.is_some());
+        assert_eq!(
+            lock.reference_tree.as_deref(),
+            Some("ba16913719a2f6a15a826918fbe6ba9dd5413e91")
+        );
 
-        let no_ref = SUITE_OK.replace("reference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35\n", "");
+        let no_ref = SUITE_OK.replace("reference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35 tree=ba16913719a2f6a15a826918fbe6ba9dd5413e91\n", "");
         assert!(parse_suite_lock(&no_ref).is_err());
         let orphan_crate =
             SUITE_OK.replace("crate asupersync repo=asupersync", "crate atp repo=atp");
