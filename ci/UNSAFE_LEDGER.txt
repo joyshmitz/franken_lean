@@ -1,0 +1,20 @@
+# UNSAFE_LEDGER.txt — the unsafe-boundary ledger (plan D3; bead fln-8mj).
+#
+# Every `#[allow(unsafe_code)]` site in the three boundary crates (fln-unsafe-abi,
+# fln-unsafe-region, fln-unsafe-jit) MUST:
+#   1. carry a marker comment `// UNSAFE-LEDGER: FLN-UL-NNNN` on the same line or the
+#      nearest non-empty line above the attribute, and
+#   2. have a matching row here whose <path> is the file containing the site.
+# `tools/structure-guard` rejects unledgered sites AND stale rows; both directions fail CI.
+#
+# Row grammar (one row per line, six '|'-separated fields, all non-empty):
+#   row FLN-UL-NNNN | <path> | <invariant> | <evidence> | <safe fallback> | <no-claim boundary>
+#
+#   invariant         — the safety invariant the site upholds
+#   evidence          — how the invariant is established (test/proof/fixture ids)
+#   safe fallback     — the safe path taken when the invariant cannot be assumed
+#   no-claim boundary — what this site explicitly does NOT claim (laundering guard, D3 law b)
+
+schema fln-unsafe-ledger/1
+
+# (no rows — the boundary crates are stubs with zero unsafe sites)

@@ -1,0 +1,6 @@
+# franken_lean workspace — the cycle-free crate map of plan §21.
+# Crates, ranks, edges, and structural laws are acknowledged in WORKSPACE_GRAPH.txt
+# and enforced by `tools/structure-guard` (bead fln-8mj).
+[workspace]
+resolver = "3"
+members = ["crates/*", "tools/*"]

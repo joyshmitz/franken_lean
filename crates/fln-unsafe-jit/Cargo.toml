@@ -1,0 +1,11 @@
+[package]
+name = "fln-unsafe-jit"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[features]
+iron = []
+
+[dependencies]

@@ -1,0 +1,102 @@
+# WORKSPACE_GRAPH.txt — the reviewed workspace-graph acknowledgment file (bead fln-8mj).
+#
+# This file is the single reviewed source of truth for the crate map of plan §21 and
+# the layering/structural laws of plan §3 (D3) and §5. `tools/structure-guard` compares
+# the actual cargo workspace against this file on every CI run:
+#
+#   * every crate on disk must be declared here, and vice versa           (snapshot law)
+#   * every inter-crate dependency edge must be declared here, and vice versa
+#   * every edge must point strictly downward: rank(from) > rank(to)      (§5 layering)
+#   * declared transitive prohibitions must hold over the real edge set   (D3 laws)
+#   * kernel/checker direct dependencies must stay inside their allowlists (§8 covenant)
+#   * external dependencies must be FrankenSuite members, by path          (D1 closure)
+#
+# Adding a crate or an edge REQUIRES editing this file in the same change — that edit
+# is the review surface. Ranks encode the strictly-downward order of §5/§21; amending
+# a rank is a reviewed architectural decision, not a convenience.
+#
+# Grammar (line-oriented; '#' starts a comment):
+#   schema fln-workspace-graph/1
+#   crate <name> rank=<n> kind=ordinary|unsafe-boundary     (product crates, crates/)
+#   crate <name> kind=tool                                  (dev apparatus, tools/)
+#   edge <from> -> <to>                                     (declared dependency edge)
+#   prohibit <pat> ->* <pat>                                (no transitive path; '*' suffix globs)
+#   allow-direct <crate> = <dep>[, <dep>...]                (exhaustive direct-dep allowlist)
+#   covenant <crate> max-loc=<n>                            (line-count covenant, src/**/*.rs)
+#   suite-dep <package>                                     (closed-universe external allowlist)
+
+schema fln-workspace-graph/1
+
+# ---- the crate map (plan §21), ranked strictly downward -------------------------------
+crate fln-core          rank=0  kind=ordinary
+crate fln-hash          rank=1  kind=ordinary
+crate fln-bignum        rank=1  kind=ordinary
+crate fln-libm          rank=1  kind=ordinary
+crate fln-unsafe-abi    rank=2  kind=unsafe-boundary
+crate fln-unsafe-region rank=2  kind=unsafe-boundary
+crate fln-rt            rank=3  kind=ordinary
+crate fln-env           rank=4  kind=ordinary
+crate fln-olean         rank=5  kind=ordinary
+crate fln-kernel        rank=6  kind=ordinary
+crate fln-checker       rank=6  kind=ordinary
+crate fln-syntax        rank=7  kind=ordinary
+crate fln-parse         rank=8  kind=ordinary
+crate fln-elab          rank=9  kind=ordinary
+crate fln-comp          rank=10 kind=ordinary
+crate fln-vm            rank=11 kind=ordinary
+crate fln-unsafe-jit    rank=12 kind=unsafe-boundary
+crate fln-verdict       rank=13 kind=ordinary
+crate fln-anvil         rank=14 kind=ordinary
+crate fln-ledger        rank=15 kind=ordinary
+crate fln-lake          rank=16 kind=ordinary
+crate fln-server        rank=17 kind=ordinary
+crate fln-trace         rank=18 kind=ordinary
+crate fln              rank=19 kind=ordinary
+crate fln-hound         rank=20 kind=ordinary
+crate fln-doc           rank=20 kind=ordinary
+crate fln-mcp           rank=20 kind=ordinary
+crate fln-tui           rank=20 kind=ordinary
+crate fln-cli           rank=21 kind=ordinary
+crate fln-wasm          rank=21 kind=ordinary
+crate fln-conformance   rank=22 kind=ordinary
+crate structure-guard   kind=tool
+
+# ---- acknowledged dependency edges ----------------------------------------------------
+# (none yet — the workspace is stubs; every future edge lands here in the same change)
+
+# ---- D3 structural law (a): no inward calls -------------------------------------------
+# No fln-unsafe-* crate may depend, even transitively, on the trust base.
+prohibit fln-unsafe-* ->* fln-kernel
+prohibit fln-unsafe-* ->* fln-checker
+
+# ---- §8.3b engine independence: kernel and independent checker share nothing ----------
+prohibit fln-kernel  ->* fln-checker
+prohibit fln-checker ->* fln-kernel
+# The independent checker has its OWN decoder and is WASM-clean:
+prohibit fln-checker ->* fln-olean
+prohibit fln-checker ->* fln-rt
+prohibit fln-checker ->* fln-unsafe-*
+
+# ---- trust-base direct-dependency covenants (dependency-closure-on-one-page, §8) ------
+allow-direct fln-kernel  = fln-core, fln-hash, fln-bignum, fln-env
+allow-direct fln-checker = fln-core, fln-hash, fln-bignum
+
+# ---- the ≤ 12 KLOC kernel covenant (plan §8, D6) --------------------------------------
+covenant fln-kernel max-loc=12000
+
+# ---- the closed dependency universe (D1): FrankenSuite only, always by path -----------
+# Pinning/checksums arrive with SUITE.lock (bead franken_lean-xwf); until then any use
+# must be a path dependency and its name must appear here.
+suite-dep asupersync
+suite-dep frankensqlite
+suite-dep franken_networkx
+suite-dep frankensearch
+suite-dep frankentui
+suite-dep franken_markdown
+suite-dep fmd-font
+suite-dep fmd-math
+suite-dep fastmcp_rust
+suite-dep atp
+# optional tier — feature-gated, never on the critical path (plan §2):
+suite-dep frankentorch
+suite-dep franken_node

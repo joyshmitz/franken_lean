@@ -118,3 +118,7 @@ repro_*.rs
 
 # Python tooling cache (scripts/)
 __pycache__/
+
+# E2E run artifacts (NDJSON logs, captured stdout/stderr, scratch fixtures) — every
+# run is reproducible from the scenario script; artifacts are evidence, not source.
+/scripts/e2e/artifacts/
