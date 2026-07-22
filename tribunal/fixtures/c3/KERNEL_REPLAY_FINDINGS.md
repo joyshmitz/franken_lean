@@ -86,14 +86,32 @@ the default budget suffices for every checkable Prelude declaration (0
 Inconclusive). Per-declaration fuel diffing against the Reference's heartbeat
 counters is a K2-era refinement.
 
+## The foreign-witness differential (`scripts/tribunal/leanchecker_witness.sh`)
+
+The pinned toolchain's `leanchecker` — the Reference's own independent
+kernel-replay binary (the C++ kernel) — is wired as a **foreign witness** under
+the Oracle-Only Law (D8: differential oracle inside the Tribunal, dev/test only,
+never a release component). It re-verifies that the C3 fixture modules
+type-check under the reference kernel *right now*, upgrading the replay's
+soundness premise from "the olean exists" to "an independent binary re-confirms
+acceptance". The lane:
+
+- **commit-binds the oracle** to `SUITE.lock` before trusting a verdict;
+- **cross-references bytes**: each witnessed module's pinned olean is proven
+  byte-identical (`cmp`) to the C3 fixture the FrankenLean decoder consumes, so
+  the oracle and our decoder see the *same input*;
+- witnesses `Init.BinderNameHint` and `Init.SizeOfLemmas` (the declaration-
+  bearing fixtures) — both **Accepted** by the reference kernel;
+- is **not a rubber stamp**: a control run on a nonexistent module is required
+  to come back *rejected*, proving the witness discriminates.
+
+This is the seed of the standing kernel differential rig (§8.7): every module
+the FrankenLean kernel replays can now be cross-checked against an independent
+foreign kernel on byte-identical input. The remaining §8.7 witnesses (lean4lean
+via export, the in-repo fln-checker of bead franken_lean-gii) join the same seam.
+
 ## Typed limitations (honest L-level)
 
-- **Foreign-witness differential deferred.** The pinned toolchain ships
-  `leanchecker`; wiring it as an external witness (running it over the same
-  modules and diffing verdicts) is the natural next lane but is a heavier
-  subprocess integration. This slice's differential is against the Reference
-  kernel's *implicit* acceptance (it produced the olean); that is a real
-  differential, just not yet the independent-binary one §8.7 ultimately wants.
 - **Corpus absent.** mathlib4 is not installed on this host; the replay runs on
   the pinned stdlib (`Init.Prelude`) rather than a defeq-heavy mathlib file. The
   harness reads `FLN_REFERENCE_LIB` and extends to any module set once the
