@@ -811,3 +811,23 @@ fn integration_targets_cannot_bypass_ordinary_unsafe_posture() {
     );
     assert_eq!(codes(&boundary.run()), vec!["FLN-STRUCT-013"]);
 }
+
+#[test]
+fn repository_cargo_config_cannot_bypass_the_reviewed_compilation_contract() {
+    for (tag, rel) in [
+        ("cargo-config-toml", ".cargo/config.toml"),
+        ("cargo-config-legacy", ".cargo/config"),
+    ] {
+        let ws = TempWs::new(tag);
+        base(&ws);
+        ws.write(rel, "[build]\nrustflags = [\"--cap-lints\", \"allow\"]\n");
+        let out = ws.run();
+        assert_eq!(codes(&out), vec!["FLN-STRUCT-016"]);
+        assert_eq!(out.findings[0].path, rel);
+        assert!(
+            out.findings[0]
+                .detail
+                .contains("repository-local Cargo configuration")
+        );
+    }
+}

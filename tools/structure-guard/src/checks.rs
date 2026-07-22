@@ -163,6 +163,28 @@ fn audit_governed_symlinks(root: &Path, findings: &mut Vec<Finding>) -> Result<(
     scan_symlinks(root, &root.join("tools"), findings)
 }
 
+fn audit_repository_cargo_config(root: &Path, findings: &mut Vec<Finding>) -> Result<(), String> {
+    // Package and workspace manifests are intentionally constrained above, but Cargo
+    // also reads repository-local configuration before it compiles anything. Such a
+    // file can inject rustflags (including lint caps), wrappers, linkers, runners, or
+    // source replacement without appearing in the reviewed dependency graph. There is
+    // no approved repository-local Cargo configuration surface yet, so both the current
+    // and legacy filenames fail closed.
+    for rel in [".cargo/config.toml", ".cargo/config"] {
+        match fs::symlink_metadata(root.join(rel)) {
+            Ok(_) => findings.push(Finding {
+                code: "FLN-STRUCT-016",
+                path: rel.to_string(),
+                detail: "repository-local Cargo configuration is forbidden because it can change the compiler, lint, linker, runner, or dependency-source contract outside the reviewed manifests"
+                    .to_string(),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect {rel}: {error}")),
+        }
+    }
+    Ok(())
+}
+
 /// Count covenant-relevant lines: non-blank, not starting with `//` after trim.
 /// Block comments count as code — the covenant is deliberately conservative.
 fn count_loc(dir: &Path) -> Result<usize, String> {
@@ -429,6 +451,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     // following one here could omit authoritative code from a covenant, authorize a
     // boundary site under the wrong path, escape the workspace, or recurse forever.
     audit_governed_symlinks(root, &mut findings)?;
+    audit_repository_cargo_config(root, &mut findings)?;
 
     // ---- load the reviewed files -------------------------------------------------------
     let graph_path = root.join(GRAPH_FILE);
