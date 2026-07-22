@@ -44,6 +44,8 @@ fi
 
 EPOCH_DIR="$ROOT/tribunal/epochs/$PIN_TAG"
 CORPUS_DIR="$ROOT/vendor/lean4-src/tests/elab"
+DIAG_CORPUS_REL="vendor/lean4-src/tests/elab_fail"
+D1_SIZE=6
 
 # The normalization recipe every rig applies before invoking the oracle.
 oracle_env() { # oracle_env <cmd...>
@@ -57,6 +59,14 @@ select_slice() {
   find "$CORPUS_DIR" -maxdepth 1 -name '*.lean' -printf '%s %f\n' \
     | sort -n -k1,1 -k2,2 \
     | awk -v n="$C1_SIZE" 'NR <= n { print $2 }'
+}
+
+# D1: the smallest upstream elab_fail tests — real Reference DIAGNOSTIC transcripts,
+# the golden corpus the faithful renderer (fln-core::diag) is proven against.
+select_diag_slice() {
+  find "$ROOT/$DIAG_CORPUS_REL" -maxdepth 1 -name '*.lean' -printf '%s %f\n' \
+    | sort -n -k1,1 -k2,2 \
+    | awk -v n="$D1_SIZE" 'NR <= n { print $2 }'
 }
 
 emit_manifest() { # emit_manifest <dest-dir>
@@ -106,6 +116,26 @@ emit_manifest() { # emit_manifest <dest-dir>
           "$file" "$sha" "$expect" "$class"
       fi
     done < <(select_slice)
+    printf '\n# ---- D1 diagnostic corpus (%s smallest upstream elab_fail tests) ----\n' "$D1_SIZE"
+    printf '# Invoked with repo-relative paths so transcripts are host-independent;\n'
+    printf '# the faithful renderer goldens (fln-conformance tests/diag_render.rs) replay these.\n'
+    while IFS= read -r file; do
+      path="$DIAG_CORPUS_REL/$file"
+      sha="$(sha256sum "$ROOT/$path" | cut -d' ' -f1)"
+      set +e
+      ( cd "$ROOT" && oracle_env "$LEAN" "$path" ) \
+        > "$dest/transcripts/$file.stdout" 2> "$dest/transcripts/$file.stderr"
+      actual_exit=$?
+      set -e
+      printf 'exit %s\n' "$actual_exit" > "$dest/transcripts/$file.exit"
+      if [ "$actual_exit" -ne 0 ]; then class="reject"; else class="accept"; fi
+      if [ "$class" = "reject" ]; then
+        printf 'd1 %s sha256=%s expect=reject observed=%s\n' "$file" "$sha" "$class"
+      else
+        printf 'd1-quirk %s sha256=%s expect=reject observed=%s note=plain-invocation-differs-from-upstream-harness\n' \
+          "$file" "$sha" "$class"
+      fi
+    done < <(select_diag_slice)
   } > "$dest/MANIFEST.txt"
 }
 

@@ -1,0 +1,1 @@
+vendor/lean4-src/tests/elab_fail/newCatPanic.lean:2:0: error: unexpected end of input; expected identifier

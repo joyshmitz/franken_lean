@@ -94,7 +94,7 @@ INPUT_PATHS=(
   scripts/check.sh scripts/evidence.py scripts/verify_vendor_tree.sh
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh
   scripts/e2e/structural_gate.sh scripts/e2e/core_observables.sh
-  scripts/e2e/hash_identity.sh
+  scripts/e2e/hash_identity.sh scripts/e2e/diag_goldens.sh
   scripts/extract/gen_core_fixtures.sh scripts/extract/gen_core_fixtures.lean
   scripts/extract/convert_blake3_vectors.py
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
@@ -218,6 +218,32 @@ bounded_readiness_wait() {
     state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf X)"
     if [ "$state" = Z ]; then return 1; fi
     sleep 0.02
+  done
+  return 1
+}
+
+# The launch gate guarantees that this direct child has not forked yet.
+terminate_unreleased_runner() {
+  local pid="$1" state
+  kill -KILL "$pid" 2>/dev/null || true
+  for _ in $(seq 1 500); do
+    if [ ! -r "/proc/$pid/stat" ]; then break; fi
+    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || printf X)"
+    [ "$state" = Z ] && break
+    sleep 0.01
+  done
+  wait "$pid" 2>/dev/null || true
+}
+
+release_guardian_launch() {
+  local stage="$1" pid="$2" ticks="$3" ready="$4" output="$5"
+  for _ in 1 2; do
+    if setsid -- python3 "$EVIDENCE" release-process-launch --ready "$ready" \
+      --output "$output" --artifact-root "$ART_DIR" --stage-id "$stage" \
+      --pid "$pid" --expected-start-ticks "$ticks" \
+      --expected-parent-pid "$$" --wait-ms "$READY_WAIT_MS"; then
+      return 0
+    fi
   done
   return 1
 }
@@ -351,18 +377,50 @@ on_finalizer_signal() {
 
 # shellcheck disable=SC2317
 run_finalizer_command() {
-  local rc=0 generation
+  local rc=0 generation bind_rc=0 binding_valid=1
   [ -z "$FINALIZATION_SIGNAL" ] || return 125
   setsid -- "$@" &
   FINALIZER_PID=$!
-  if ! FINALIZER_START_TICKS="$(
-    python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
+  FINALIZER_START_TICKS="$(
+    setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
       --expected-parent-pid "$$" --wait-ms 500 --session-leader \
       2>/dev/null
-  )"; then
-    wait "$FINALIZER_PID" 2>/dev/null || true
+  )"
+  bind_rc=$?
+  case "$FINALIZER_START_TICKS" in ''|*[!0-9]*) binding_valid=0 ;; esac
+  if [ "$binding_valid" -eq 0 ] && [ ! -s "$FINALIZATION_DECISION" ]; then
+    # The still-unwaited numeric PID is our direct setsid child. Its unreaped
+    # lifetime pins the PGID while the whole finalizer group is killed and checked.
+    kill -KILL -- "-$FINALIZER_PID" 2>/dev/null || true
+    kill -KILL "$FINALIZER_PID" 2>/dev/null || true
+    if ! python3 "$EVIDENCE" assert-process-group-empty \
+        --pgid "$FINALIZER_PID" --wait-ms 2000; then
+      note "INTERNAL FAULT: finalizer process-group cleanup remained unproven"
+    fi
+    while true; do
+      generation="$FINALIZATION_SIGNAL_GENERATION"
+      wait "$FINALIZER_PID" 2>/dev/null && rc=0 || rc=$?
+      case "$rc" in
+        129|130|143)
+          if [ "$generation" -ne "$FINALIZATION_SIGNAL_GENERATION" ]; then
+            continue
+          fi
+          ;;
+      esac
+      break
+    done
     FINALIZER_PID=""
+    FINALIZER_START_TICKS=""
     return 2
+  fi
+  # A terminal trap can interrupt Bash's command-substitution wait after the
+  # isolated binder already emitted a valid identity. Trust the canonical value;
+  # after a full decision, an unavailable binding may only be waited, never killed.
+  if [ "$binding_valid" -eq 1 ]; then
+    bind_rc=0
+  fi
+  if [ "$bind_rc" -ne 0 ] && [ -s "$FINALIZATION_DECISION" ]; then
+    FINALIZER_START_TICKS=""
   fi
   if [ -n "$FINALIZATION_SIGNAL" ] && [ -n "$FINALIZER_START_TICKS" ]; then
     python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
@@ -538,6 +596,8 @@ run_stage() {
   local name="$1"; shift
   local meta="$ART_DIR/$name.meta.json" out="$ART_DIR/$name.out" err="$ART_DIR/$name.err"
   local ready="$ART_DIR/$name.ready.json"
+  local launch_ready="$ART_DIR/$name.launch.ready.json"
+  local launch_release="$ART_DIR/$name.launch.release.json"
   local wrapper_rc classification reason recorded_wrapper planted=false
   local -a argv=("$@") semantic_args=()
   ACTIVE_STAGE="$name"
@@ -562,6 +622,8 @@ run_stage() {
     --stdout "$out"
     --stderr "$err"
     --readiness "$ready"
+    --launch-ready "$launch_ready"
+    --launch-release "$launch_release"
     --artifact-root "$ART_DIR"
     --capture-bytes "$CAPTURE_BYTES"
     --output-budget-bytes "$OUTPUT_BUDGET_BYTES"
@@ -574,19 +636,51 @@ run_stage() {
   setsid -- "${runner[@]}" &
   ACTIVE_RUNNER_PID=$!
   if ! ACTIVE_RUNNER_START_TICKS="$(
-    python3 "$EVIDENCE" process-start-ticks --pid "$ACTIVE_RUNNER_PID" \
+    setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$ACTIVE_RUNNER_PID" \
       --expected-parent-pid "$$" --wait-ms 5000 --session-leader \
       2>/dev/null
   )"; then
+    terminate_unreleased_runner "$ACTIVE_RUNNER_PID"
     SPAWNING=0
-    wait "$ACTIVE_RUNNER_PID" 2>/dev/null || true
     ACTIVE_RUNNER_PID=""
+    if [ -n "$PENDING_SIGNAL" ]; then
+      local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+      PENDING_SIGNAL=""
+      set_final cancelled "signal_$pending_name" "$pending_exit"
+      exit "$pending_exit"
+    fi
     set_final internal_fault active_runner_identity_unproven 2
     exit 2
+  fi
+  if [ -n "$PENDING_SIGNAL" ]; then
+    local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+    PENDING_SIGNAL=""
+    terminate_unreleased_runner "$ACTIVE_RUNNER_PID"
+    SPAWNING=0
+    ACTIVE_RUNNER_PID=""
+    ACTIVE_RUNNER_START_TICKS=""
+    set_final cancelled "signal_$pending_name" "$pending_exit"
+    exit "$pending_exit"
   fi
   ACTIVE_READINESS="$ready"
   ACTIVE_RUNNER_PROTOCOL=guardian
   ACTIVE_RUNNER_ART_DIR="$ART_DIR"
+  if ! release_guardian_launch "$name" "$ACTIVE_RUNNER_PID" \
+      "$ACTIVE_RUNNER_START_TICKS" "$launch_ready" "$launch_release"; then
+    if [ -s "$launch_release" ]; then
+      SPAWNING=0
+      if ! stop_active_runner TERM; then
+        set_final internal_fault process_tree_cleanup_unproven 2
+        exit 2
+      fi
+    else
+      terminate_unreleased_runner "$ACTIVE_RUNNER_PID"
+      SPAWNING=0
+    fi
+    ACTIVE_RUNNER_PID=""
+    set_final internal_fault active_runner_launch_unproven 2
+    exit 2
+  fi
   SPAWNING=0
   if [ -n "$PENDING_SIGNAL" ]; then
     local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
@@ -658,17 +752,23 @@ skip_stage() {
 
 self_test() {
   local failures=0 stage rc child="$ART_DIR" child_pid wrapper_ready
+  local wrapper_launch_ready wrapper_launch_release
   for stage in evidence-self-test shellcheck fmt check clippy test structure-guard vendor-tree ubs; do
     echo "[check:self-test] planting failure in stage=$stage" >&2
     child="$ART_DIR/selftest-$stage"
     wrapper_ready="$ART_DIR/selftest-$stage.guardian.ready.json"
+    wrapper_launch_ready="$ART_DIR/selftest-$stage.guardian.launch.ready.json"
+    wrapper_launch_release="$ART_DIR/selftest-$stage.guardian.launch.release.json"
     ACTIVE_STAGE="selftest-$stage"
     SPAWNING=1
     setsid -- python3 "$EVIDENCE" run --cwd "$REPO" \
       --metadata "$ART_DIR/selftest-$stage.guardian.meta.json" \
       --stdout "$ART_DIR/selftest-$stage.console.out" \
       --stderr "$ART_DIR/selftest-$stage.console.err" \
-      --readiness "$wrapper_ready" --artifact-root "$ART_DIR" \
+      --readiness "$wrapper_ready" \
+      --launch-ready "$wrapper_launch_ready" \
+      --launch-release "$wrapper_launch_release" \
+      --artifact-root "$ART_DIR" \
       --capture-bytes "$CAPTURE_BYTES" --output-budget-bytes "$OUTPUT_BUDGET_BYTES" \
       --timeout-ms "$STAGE_TIMEOUT_MS" --grace-ms 60000 \
       --stage-id "selftest-$stage" --semantic-failure-exit 1 -- \
@@ -677,17 +777,51 @@ self_test() {
     child_pid=$!
     ACTIVE_RUNNER_PID="$child_pid"
     if ! ACTIVE_RUNNER_START_TICKS="$(
-      python3 "$EVIDENCE" process-start-ticks --pid "$child_pid" \
+      setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$child_pid" \
         --expected-parent-pid "$$" --wait-ms 5000 --session-leader 2>/dev/null
     )"; then
+      terminate_unreleased_runner "$child_pid"
       SPAWNING=0
-      wait "$child_pid" 2>/dev/null || true
+      ACTIVE_RUNNER_PID=""
+      if [ -n "$PENDING_SIGNAL" ]; then
+        local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+        PENDING_SIGNAL=""
+        set_final cancelled "signal_$pending_name" "$pending_exit"
+        exit "$pending_exit"
+      fi
       set_final internal_fault active_runner_identity_unproven 2
       exit 2
+    fi
+    if [ -n "$PENDING_SIGNAL" ]; then
+      local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+      PENDING_SIGNAL=""
+      terminate_unreleased_runner "$child_pid"
+      SPAWNING=0
+      ACTIVE_RUNNER_PID=""
+      ACTIVE_RUNNER_START_TICKS=""
+      set_final cancelled "signal_$pending_name" "$pending_exit"
+      exit "$pending_exit"
     fi
     ACTIVE_READINESS="$wrapper_ready"
     ACTIVE_RUNNER_PROTOCOL=nested-check
     ACTIVE_RUNNER_ART_DIR="$child"
+    if ! release_guardian_launch "selftest-$stage" "$child_pid" \
+        "$ACTIVE_RUNNER_START_TICKS" "$wrapper_launch_ready" \
+        "$wrapper_launch_release"; then
+      if [ -s "$wrapper_launch_release" ]; then
+        SPAWNING=0
+        if ! stop_active_runner TERM; then
+          set_final internal_fault process_tree_cleanup_unproven 2
+          exit 2
+        fi
+      else
+        terminate_unreleased_runner "$child_pid"
+        SPAWNING=0
+      fi
+      ACTIVE_RUNNER_PID=""
+      set_final internal_fault active_runner_launch_unproven 2
+      exit 2
+    fi
     SPAWNING=0
     if [ -n "$PENDING_SIGNAL" ]; then
       local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
@@ -726,13 +860,18 @@ self_test() {
   echo "[check:self-test] sending TERM during child run initialization" >&2
   child="$ART_DIR/selftest-cancel-term"
   wrapper_ready="$ART_DIR/selftest-cancel-term.guardian.ready.json"
+  wrapper_launch_ready="$ART_DIR/selftest-cancel-term.guardian.launch.ready.json"
+  wrapper_launch_release="$ART_DIR/selftest-cancel-term.guardian.launch.release.json"
   ACTIVE_STAGE=selftest-cancel-term
   SPAWNING=1
   setsid -- python3 "$EVIDENCE" run --cwd "$REPO" \
     --metadata "$ART_DIR/selftest-cancel-term.guardian.meta.json" \
     --stdout "$ART_DIR/selftest-cancel-term.console.out" \
     --stderr "$ART_DIR/selftest-cancel-term.console.err" \
-    --readiness "$wrapper_ready" --artifact-root "$ART_DIR" \
+    --readiness "$wrapper_ready" \
+    --launch-ready "$wrapper_launch_ready" \
+    --launch-release "$wrapper_launch_release" \
+    --artifact-root "$ART_DIR" \
     --capture-bytes "$CAPTURE_BYTES" --output-budget-bytes "$OUTPUT_BUDGET_BYTES" \
     --timeout-ms "$STAGE_TIMEOUT_MS" --grace-ms 60000 \
     --stage-id selftest-cancel-term -- \
@@ -741,17 +880,51 @@ self_test() {
   child_pid=$!
   ACTIVE_RUNNER_PID="$child_pid"
   if ! ACTIVE_RUNNER_START_TICKS="$(
-    python3 "$EVIDENCE" process-start-ticks --pid "$child_pid" \
+    setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$child_pid" \
       --expected-parent-pid "$$" --wait-ms 5000 --session-leader 2>/dev/null
   )"; then
+    terminate_unreleased_runner "$child_pid"
     SPAWNING=0
-    wait "$child_pid" 2>/dev/null || true
+    ACTIVE_RUNNER_PID=""
+    if [ -n "$PENDING_SIGNAL" ]; then
+      local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+      PENDING_SIGNAL=""
+      set_final cancelled "signal_$pending_name" "$pending_exit"
+      exit "$pending_exit"
+    fi
     set_final internal_fault active_runner_identity_unproven 2
     exit 2
+  fi
+  if [ -n "$PENDING_SIGNAL" ]; then
+    local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+    PENDING_SIGNAL=""
+    terminate_unreleased_runner "$child_pid"
+    SPAWNING=0
+    ACTIVE_RUNNER_PID=""
+    ACTIVE_RUNNER_START_TICKS=""
+    set_final cancelled "signal_$pending_name" "$pending_exit"
+    exit "$pending_exit"
   fi
   ACTIVE_READINESS="$wrapper_ready"
   ACTIVE_RUNNER_PROTOCOL=nested-check
   ACTIVE_RUNNER_ART_DIR="$child"
+  if ! release_guardian_launch selftest-cancel-term "$child_pid" \
+      "$ACTIVE_RUNNER_START_TICKS" "$wrapper_launch_ready" \
+      "$wrapper_launch_release"; then
+    if [ -s "$wrapper_launch_release" ]; then
+      SPAWNING=0
+      if ! stop_active_runner TERM; then
+        set_final internal_fault process_tree_cleanup_unproven 2
+        exit 2
+      fi
+    else
+      terminate_unreleased_runner "$child_pid"
+      SPAWNING=0
+    fi
+    ACTIVE_RUNNER_PID=""
+    set_final internal_fault active_runner_launch_unproven 2
+    exit 2
+  fi
   SPAWNING=0
   if [ -n "$PENDING_SIGNAL" ]; then
     local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"

@@ -1,0 +1,2 @@
+vendor/lean4-src/tests/elab_fail/1707.lean:1:9: error(lean.unknownIdentifier): Unknown identifier `c`
+vendor/lean4-src/tests/elab_fail/1707.lean:1:12: error: expected token

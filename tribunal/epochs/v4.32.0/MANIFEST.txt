@@ -39,3 +39,13 @@ c1 univPolyEnum.lean sha256=99624551f78f4d2b51c5bfd9e1ced7aa2f894cffa1e4e4f067a2
 c1 1236.lean sha256=bd181cf3db578a49770a8b5ef694c7cf20eefc3310ebad303eceeb55b3f46498 expect=accept observed=accept
 c1 int_to_nat_bug.lean sha256=f83641d03441f0486965f7a54ca320808efc8d023d33853654405c97d51a9f28 expect=accept observed=accept
 c1 2009.lean sha256=7e66a1251a2ae0701e47c86f16adc0b2a11c5fa259436c6e5e47004c52d8695c expect=accept observed=accept
+
+# ---- D1 diagnostic corpus (6 smallest upstream elab_fail tests) ----
+# Invoked with repo-relative paths so transcripts are host-independent;
+# the faithful renderer goldens (fln-conformance tests/diag_render.rs) replay these.
+d1 2006.lean sha256=51cb088c6a1911cdc764f8315f1bef6ba00eb7f437b481fbadfd76194500341a expect=reject observed=reject
+d1 partialVariable.lean sha256=b5c8d7890b3936a04f379d915475a516356ed9b18365305421357cf97f0150fa expect=reject observed=reject
+d1 1690.lean sha256=3c9369309147f19705b2efb8f7a55d9ba38d5bc10db6c9142d493c0bf56ac83b expect=reject observed=reject
+d1 eoi.lean sha256=34ba4cb13148ae1753995ab27d68070e8b8830475f68f644fd3e514db3d7664a expect=reject observed=reject
+d1 1707.lean sha256=df784a0b2a37b2e42bd2556d4d13a57fa4f3d91928b35ccbceb0c203ae674f01 expect=reject observed=reject
+d1 newCatPanic.lean sha256=bf1df198f150902b74a242fda3a90bf34880f19b2584d70a5534807df425f265 expect=reject observed=reject

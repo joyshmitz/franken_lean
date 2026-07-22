@@ -1,0 +1,1 @@
+vendor/lean4-src/tests/elab_fail/partialVariable.lean:1:8: error: unexpected token ':'; expected '(', '[', '{' or '⦃'

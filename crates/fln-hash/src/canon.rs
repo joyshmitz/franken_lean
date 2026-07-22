@@ -11,10 +11,12 @@
 //! Decoding is total over arbitrary bytes: every failure is a typed [`CanonError`],
 //! never a panic (D8 taxonomy).
 
+use fln_core::diag::{Diagnostic, ErrorValue, ResourceReason, Severity};
 use fln_core::expr::{BinderInfo, Expr, ExprNode, FVarId, Literal, MVarId, NatLit};
 use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
 use fln_core::options::{DataValue, KVMap, SyntaxHandle};
+use fln_core::pos::Position;
 
 /// A frozen schema identity: name + version. Bumping the version is the only legal
 /// way to change an encoding.
@@ -648,6 +650,284 @@ impl Canonical for Expr {
                 Expr::proj(struct_name, idx, expr)
             }
             _ => return Err(r.err_public("unknown expr tag")),
+        })
+    }
+}
+
+// ---- Diagnostic (the D8 typed error taxonomy, versioned on the wire) -------------------
+
+pub const SCHEMA_DIAG: SchemaId = SchemaId {
+    name: "fln.canon.diag",
+    version: 1,
+};
+
+const SEV_INFO: u8 = 0;
+const SEV_WARN: u8 = 1;
+const SEV_ERROR: u8 = 2;
+
+const RES_HEARTBEATS: u8 = 0;
+const RES_REC_DEPTH: u8 = 1;
+const RES_CANCELLED: u8 = 2;
+const RES_MEMORY: u8 = 3;
+
+fn write_resource(w: &mut CanonWriter, resource: &ResourceReason) {
+    match resource {
+        ResourceReason::Heartbeats { consumed, limit } => {
+            w.u8(RES_HEARTBEATS);
+            w.u64(*consumed);
+            w.u64(*limit);
+        }
+        ResourceReason::RecursionDepth { limit } => {
+            w.u8(RES_REC_DEPTH);
+            w.u64(*limit);
+        }
+        ResourceReason::Cancelled => w.u8(RES_CANCELLED),
+        ResourceReason::Memory { limit_bytes } => {
+            w.u8(RES_MEMORY);
+            w.u64(*limit_bytes);
+        }
+    }
+}
+
+fn read_resource(r: &mut CanonReader<'_>) -> Result<ResourceReason, CanonError> {
+    Ok(match r.u8()? {
+        RES_HEARTBEATS => ResourceReason::Heartbeats {
+            consumed: r.u64()?,
+            limit: r.u64()?,
+        },
+        RES_REC_DEPTH => ResourceReason::RecursionDepth { limit: r.u64()? },
+        RES_CANCELLED => ResourceReason::Cancelled,
+        RES_MEMORY => ResourceReason::Memory {
+            limit_bytes: r.u64()?,
+        },
+        _ => return Err(r.err_public("unknown resource-reason tag")),
+    })
+}
+
+// Variant tags in taxonomy declaration order — frozen; a new variant appends.
+const EV_SYNTAX: u8 = 0;
+const EV_MACRO: u8 = 1;
+const EV_ELAB: u8 = 2;
+const EV_KERNEL_REJECT: u8 = 3;
+const EV_KERNEL_INCONCLUSIVE: u8 = 4;
+const EV_ARTIFACT_CORRUPT: u8 = 5;
+const EV_ARTIFACT_EPOCH: u8 = 6;
+const EV_ABI: u8 = 7;
+const EV_CAPABILITY: u8 = 8;
+const EV_PLUGIN: u8 = 9;
+const EV_BUILD: u8 = 10;
+const EV_PROTOCOL: u8 = 11;
+const EV_REPLAY: u8 = 12;
+const EV_INTERNAL: u8 = 13;
+
+fn write_error_value(w: &mut CanonWriter, value: &ErrorValue) {
+    match value {
+        ErrorValue::SyntaxFailure { message } => {
+            w.u8(EV_SYNTAX);
+            w.str(message);
+        }
+        ErrorValue::MacroFailure {
+            macro_name,
+            message,
+        } => {
+            w.u8(EV_MACRO);
+            macro_name.write_body(w);
+            w.str(message);
+        }
+        ErrorValue::ElaborationFailure { message } => {
+            w.u8(EV_ELAB);
+            w.str(message);
+        }
+        ErrorValue::KernelRejection {
+            decl,
+            stable_error_class,
+            message,
+        } => {
+            w.u8(EV_KERNEL_REJECT);
+            decl.write_body(w);
+            w.str(stable_error_class);
+            w.str(message);
+        }
+        ErrorValue::KernelInconclusive { decl, resource } => {
+            w.u8(EV_KERNEL_INCONCLUSIVE);
+            decl.write_body(w);
+            write_resource(w, resource);
+        }
+        ErrorValue::ArtifactCorrupt { path, detail } => {
+            w.u8(EV_ARTIFACT_CORRUPT);
+            w.str(path);
+            w.str(detail);
+        }
+        ErrorValue::ArtifactEpochMismatch {
+            path,
+            expected_epoch,
+            found_epoch,
+        } => {
+            w.u8(EV_ARTIFACT_EPOCH);
+            w.str(path);
+            w.str(expected_epoch);
+            w.str(found_epoch);
+        }
+        ErrorValue::AbiViolation { symbol, detail } => {
+            w.u8(EV_ABI);
+            w.str(symbol);
+            w.str(detail);
+        }
+        ErrorValue::CapabilityDenied { capability, detail } => {
+            w.u8(EV_CAPABILITY);
+            w.str(capability);
+            w.str(detail);
+        }
+        ErrorValue::PluginCrashed { plugin, detail } => {
+            w.u8(EV_PLUGIN);
+            w.str(plugin);
+            w.str(detail);
+        }
+        ErrorValue::BuildFailure { job, detail } => {
+            w.u8(EV_BUILD);
+            w.str(job);
+            w.str(detail);
+        }
+        ErrorValue::ProtocolFailure { detail } => {
+            w.u8(EV_PROTOCOL);
+            w.str(detail);
+        }
+        ErrorValue::ReplayDivergence { detail } => {
+            w.u8(EV_REPLAY);
+            w.str(detail);
+        }
+        ErrorValue::InternalInvariantViolation { invariant, detail } => {
+            w.u8(EV_INTERNAL);
+            w.str(invariant);
+            w.str(detail);
+        }
+    }
+}
+
+fn read_error_value(r: &mut CanonReader<'_>) -> Result<ErrorValue, CanonError> {
+    Ok(match r.u8()? {
+        EV_SYNTAX => ErrorValue::SyntaxFailure {
+            message: r.str()?.to_string(),
+        },
+        EV_MACRO => ErrorValue::MacroFailure {
+            macro_name: Name::read_body(r)?,
+            message: r.str()?.to_string(),
+        },
+        EV_ELAB => ErrorValue::ElaborationFailure {
+            message: r.str()?.to_string(),
+        },
+        EV_KERNEL_REJECT => ErrorValue::KernelRejection {
+            decl: Name::read_body(r)?,
+            stable_error_class: r.str()?.to_string(),
+            message: r.str()?.to_string(),
+        },
+        EV_KERNEL_INCONCLUSIVE => ErrorValue::KernelInconclusive {
+            decl: Name::read_body(r)?,
+            resource: read_resource(r)?,
+        },
+        EV_ARTIFACT_CORRUPT => ErrorValue::ArtifactCorrupt {
+            path: r.str()?.to_string(),
+            detail: r.str()?.to_string(),
+        },
+        EV_ARTIFACT_EPOCH => ErrorValue::ArtifactEpochMismatch {
+            path: r.str()?.to_string(),
+            expected_epoch: r.str()?.to_string(),
+            found_epoch: r.str()?.to_string(),
+        },
+        EV_ABI => ErrorValue::AbiViolation {
+            symbol: r.str()?.to_string(),
+            detail: r.str()?.to_string(),
+        },
+        EV_CAPABILITY => ErrorValue::CapabilityDenied {
+            capability: r.str()?.to_string(),
+            detail: r.str()?.to_string(),
+        },
+        EV_PLUGIN => ErrorValue::PluginCrashed {
+            plugin: r.str()?.to_string(),
+            detail: r.str()?.to_string(),
+        },
+        EV_BUILD => ErrorValue::BuildFailure {
+            job: r.str()?.to_string(),
+            detail: r.str()?.to_string(),
+        },
+        EV_PROTOCOL => ErrorValue::ProtocolFailure {
+            detail: r.str()?.to_string(),
+        },
+        EV_REPLAY => ErrorValue::ReplayDivergence {
+            detail: r.str()?.to_string(),
+        },
+        EV_INTERNAL => ErrorValue::InternalInvariantViolation {
+            invariant: r.str()?.to_string(),
+            detail: r.str()?.to_string(),
+        },
+        _ => return Err(r.err_public("unknown error-value tag (newer taxonomy version?)")),
+    })
+}
+
+impl Canonical for Diagnostic {
+    const SCHEMA: SchemaId = SCHEMA_DIAG;
+
+    fn write_body(&self, w: &mut CanonWriter) {
+        w.str(&self.file_name);
+        w.u64(self.pos.line as u64);
+        w.u64(self.pos.column as u64);
+        match &self.end_pos {
+            Some(end) => {
+                w.u8(1);
+                w.u64(end.line as u64);
+                w.u64(end.column as u64);
+            }
+            None => w.u8(0),
+        }
+        w.u8(match self.severity {
+            Severity::Information => SEV_INFO,
+            Severity::Warning => SEV_WARN,
+            Severity::Error => SEV_ERROR,
+        });
+        match &self.error_name {
+            Some(name) => {
+                w.u8(1);
+                name.write_body(w);
+            }
+            None => w.u8(0),
+        }
+        w.str(&self.caption);
+        write_error_value(w, &self.value);
+    }
+
+    fn read_body(r: &mut CanonReader<'_>) -> Result<Diagnostic, CanonError> {
+        let file_name = r.str()?.to_string();
+        let line = usize::try_from(r.u64()?).map_err(|_| r.err_public("line overflow"))?;
+        let column = usize::try_from(r.u64()?).map_err(|_| r.err_public("column overflow"))?;
+        let end_pos = match r.u8()? {
+            0 => None,
+            1 => Some(Position {
+                line: usize::try_from(r.u64()?).map_err(|_| r.err_public("line overflow"))?,
+                column: usize::try_from(r.u64()?).map_err(|_| r.err_public("column overflow"))?,
+            }),
+            _ => return Err(r.err_public("non-canonical option tag")),
+        };
+        let severity = match r.u8()? {
+            SEV_INFO => Severity::Information,
+            SEV_WARN => Severity::Warning,
+            SEV_ERROR => Severity::Error,
+            _ => return Err(r.err_public("unknown severity tag")),
+        };
+        let error_name = match r.u8()? {
+            0 => None,
+            1 => Some(Name::read_body(r)?),
+            _ => return Err(r.err_public("non-canonical option tag")),
+        };
+        let caption = r.str()?.to_string();
+        let value = read_error_value(r)?;
+        Ok(Diagnostic {
+            file_name,
+            pos: Position { line, column },
+            end_pos,
+            severity,
+            error_name,
+            caption,
+            value,
         })
     }
 }

@@ -3804,6 +3804,38 @@ def cmd_run(args: argparse.Namespace) -> int:
     os.close(preflight_handle[1])
     watched = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+    if bool(args.launch_ready) != bool(args.launch_release):
+        raise EvidenceError("guardian launch gate requires both control paths")
+    if args.launch_ready:
+        artifact_root = lexical_absolute(Path(args.artifact_root))
+        launch_ready = require_within(
+            Path(args.launch_ready), artifact_root, label="guardian launch readiness"
+        )
+        launch_release = require_within(
+            Path(args.launch_release), artifact_root, label="guardian launch release"
+        )
+        launch_identity = {
+            "schema": "fln.guardian-launch/1",
+            "status": "awaiting_release",
+            "stage_id": args.stage_id,
+            "guardian_pid": guardian_identity[0],
+            "guardian_start_ticks": guardian_identity[1],
+        }
+        write_atomic_new(launch_ready, canonical_json(launch_identity))
+        release_deadline = time.monotonic() + 30.0
+        while True:
+            try:
+                release = read_json_object(launch_release)
+            except FileNotFoundError:
+                if time.monotonic() >= release_deadline:
+                    raise EvidenceError("guardian launch release timed out")
+                time.sleep(0.01)
+                continue
+            expected_release = dict(launch_identity)
+            expected_release["status"] = "released"
+            if release != expected_release:
+                raise EvidenceError("guardian launch release identity mismatch")
+            break
     worker_pid = os.fork()
     if worker_pid == 0:
         try:
@@ -3828,7 +3860,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     setup_error: BaseException | None = None
     try:
         if args.test_fail_guardian_pidfd_open:
-            readiness = Path(args.readiness)
+            readiness = (
+                require_within(
+                    Path(args.test_guardian_child_ready),
+                    Path(args.artifact_root),
+                    label="guardian fault child readiness",
+                )
+                if args.test_guardian_child_ready
+                else Path(args.readiness)
+            )
             deadline = time.monotonic() + 15.0
             while not readiness.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
@@ -4040,6 +4080,69 @@ def cmd_process_start_ticks(args: argparse.Namespace) -> int:
         os.close(handle[1])
 
 
+def cmd_release_process_launch(args: argparse.Namespace) -> int:
+    if args.wait_ms < 0 or args.wait_ms > 30_000:
+        raise EvidenceError("guardian launch wait must be between 0 and 30000 ms")
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    ready_path = require_within(
+        Path(args.ready), artifact_root, label="guardian launch readiness"
+    )
+    output_path = require_within(
+        Path(args.output), artifact_root, label="guardian launch release"
+    )
+    deadline = time.monotonic() + args.wait_ms / 1000
+    while True:
+        try:
+            ready = read_json_object(ready_path)
+            break
+        except FileNotFoundError:
+            if time.monotonic() >= deadline:
+                raise EvidenceError("guardian launch readiness timed out")
+            time.sleep(0.005)
+    expected = {
+        "schema": "fln.guardian-launch/1",
+        "status": "awaiting_release",
+        "stage_id": args.stage_id,
+        "guardian_pid": args.pid,
+        "guardian_start_ticks": args.expected_start_ticks,
+    }
+    if ready != expected:
+        raise EvidenceError("guardian launch readiness identity mismatch")
+    released = dict(expected)
+    released["status"] = "released"
+    released_data = canonical_json(released)
+    try:
+        observed, _size, _digest = stable_file_facts(output_path)
+    except FileNotFoundError:
+        pass
+    else:
+        if not hmac.compare_digest(observed, released_data):
+            raise EvidenceError("guardian launch release already has wrong bytes")
+        return PASS
+    if args.pid == os.getpid():
+        raise EvidenceError("guardian launch target cannot be the releaser itself")
+    handle = open_process_handle(
+        args.pid, expected_parent_pid=args.expected_parent_pid
+    )
+    if handle is None or handle[0] != args.expected_start_ticks:
+        if handle is not None:
+            os.close(handle[1])
+        raise EvidenceError("guardian changed before launch release")
+    try:
+        try:
+            write_atomic_new(output_path, released_data)
+        except BaseException:
+            try:
+                observed, _size, _digest = stable_file_facts(output_path)
+            except BaseException:
+                raise
+            if not hmac.compare_digest(observed, released_data):
+                raise
+    finally:
+        os.close(handle[1])
+    return PASS
+
+
 def cmd_kill_bound_group(args: argparse.Namespace) -> int:
     kill_bound_process_group(args.pid, args.expected_start_ticks)
     return PASS
@@ -4053,6 +4156,25 @@ def cmd_signal_bound_process(args: argparse.Namespace) -> int:
     }[args.signal]
     signal_bound_process(args.pid, args.expected_start_ticks, signum)
     return PASS
+
+
+def cmd_assert_process_group_empty(args: argparse.Namespace) -> int:
+    if args.pgid <= 1 or args.wait_ms < 0 or args.wait_ms > 30_000:
+        raise EvidenceError("process-group emptiness arguments are malformed")
+    deadline = time.monotonic() + args.wait_ms / 1000
+    while True:
+        live = live_process_group_members(args.pgid)
+        if not live:
+            return PASS
+        if time.monotonic() >= deadline:
+            raise EvidenceError(
+                f"process group {args.pgid} retained live members {sorted(live)}"
+            )
+        try:
+            os.killpg(args.pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        time.sleep(0.01)
 
 
 def cmd_manifest(args: argparse.Namespace) -> int:
@@ -4777,6 +4899,14 @@ def cmd_self_test(args: argparse.Namespace) -> int:
 
     guardian_fault_root = case_dir("guardian_pidfd_open_failure")
     guardian_fault_ready = guardian_fault_root / "stage.ready.json"
+    guardian_fault_pids = guardian_fault_root / "pids.txt"
+    guardian_fault_program = (
+        "import os,pathlib,signal,subprocess,sys,time;"
+        "code='import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(60)';"
+        "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"
+        f"pathlib.Path({str(guardian_fault_pids)!r}).write_text(str(os.getpid())+'\\n'+str(p.pid)+'\\n');"
+        "time.sleep(60)"
+    )
     guardian_fault_wrapper = subprocess.Popen(
         [
             sys.executable,
@@ -4805,10 +4935,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "--stage-id",
             "guardian_pidfd_open_failure",
             "--test-fail-guardian-pidfd-open",
+            "--test-guardian-child-ready",
+            str(guardian_fault_pids),
             "--",
             sys.executable,
             "-c",
-            "import time;time.sleep(60)",
+            guardian_fault_program,
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -4819,18 +4951,31 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         f"guardian pidfd-fault exit {guardian_fault_wrapper.returncode}: {fault_err!r}",
     )
     guardian_fault_readiness = read_json_object(guardian_fault_ready)
-    guardian_fault_child = guardian_fault_readiness.get("child_pid")
     require(
-        isinstance(guardian_fault_child, int)
-        and not isinstance(guardian_fault_child, bool)
-        and not process_alive(guardian_fault_child),
-        "post-fork guardian setup failure left its stage child alive",
+        guardian_fault_readiness.get("schema") == "fln.supervisor-readiness/1"
+        and guardian_fault_readiness.get("status") == "ready"
+        and guardian_fault_readiness.get("stage_id")
+        == "guardian_pidfd_open_failure",
+        "post-fork guardian setup fault lacked exact readiness",
+    )
+    fault_pids = [
+        int(value)
+        for value in guardian_fault_pids.read_text(encoding="utf-8").splitlines()
+    ]
+    require(len(fault_pids) == 2, "guardian fault PID handshake was malformed")
+    require(
+        guardian_fault_readiness.get("child_pid") == fault_pids[0],
+        "guardian fault readiness did not bind its stage leader",
+    )
+    require(
+        not any(process_alive(pid) for pid in fault_pids),
+        "post-fork guardian setup failure left its detached tree alive",
     )
     cases.append(
         {
             "case": "guardian_pidfd_open_failure",
             "ok": True,
-            "child_pid": guardian_fault_child,
+            "pids": fault_pids,
         }
     )
 
@@ -5189,11 +5334,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--cancel-after-ms", type=int)
     run_parser.add_argument("--test-terminal-delay-ms", type=int, default=0)
     run_parser.add_argument("--test-terminal-ready")
+    run_parser.add_argument("--launch-ready")
+    run_parser.add_argument("--launch-release")
     run_parser.add_argument(
         "--test-fail-guardian-pidfd-open",
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    run_parser.add_argument("--test-guardian-child-ready", help=argparse.SUPPRESS)
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
     run_parser.set_defaults(func=cmd_run)
 
@@ -5288,6 +5436,24 @@ def build_parser() -> argparse.ArgumentParser:
     process_identity_parser.add_argument("--session-leader", action="store_true")
     process_identity_parser.set_defaults(func=cmd_process_start_ticks)
 
+    launch_release_parser = subparsers.add_parser(
+        "release-process-launch",
+        help="release one identity-bound guardian launch gate",
+    )
+    launch_release_parser.add_argument("--ready", required=True)
+    launch_release_parser.add_argument("--output", required=True)
+    launch_release_parser.add_argument("--artifact-root", required=True)
+    launch_release_parser.add_argument("--stage-id", required=True)
+    launch_release_parser.add_argument("--pid", type=int, required=True)
+    launch_release_parser.add_argument(
+        "--expected-start-ticks", type=int, required=True
+    )
+    launch_release_parser.add_argument(
+        "--expected-parent-pid", type=int, required=True
+    )
+    launch_release_parser.add_argument("--wait-ms", type=int, default=5000)
+    launch_release_parser.set_defaults(func=cmd_release_process_launch)
+
     bound_group_parser = subparsers.add_parser(
         "kill-bound-group", help="SIGKILL one start-time-bound process group"
     )
@@ -5308,6 +5474,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--signal", choices=("HUP", "INT", "TERM"), required=True
     )
     bound_process_parser.set_defaults(func=cmd_signal_bound_process)
+
+    empty_group_parser = subparsers.add_parser(
+        "assert-process-group-empty",
+        help="boundedly kill and verify one unreaped session process group",
+    )
+    empty_group_parser.add_argument("--pgid", type=int, required=True)
+    empty_group_parser.add_argument("--wait-ms", type=int, default=1000)
+    empty_group_parser.set_defaults(func=cmd_assert_process_group_empty)
 
     manifest_parser = subparsers.add_parser(
         "manifest", help="publish an evidence manifest"
