@@ -883,16 +883,27 @@ def reap_adopted_children(exclude_pid: int | None = None) -> None:
             continue
 
 
+def graceful_signal_targets(
+    root_pid: int, live: set[int], *, root_only: bool
+) -> list[int]:
+    return sorted(({root_pid} & live) if root_only else live)
+
+
 def terminate_tree(
     proc: subprocess.Popen[bytes],
     first_signal: int,
     grace_s: float,
     known: ProcessHandles,
+    *,
+    graceful_root_only: bool = False,
 ) -> tuple[bool, bool, list[int]]:
     term_sent = False
     kill_sent = False
     live = live_tree_members(proc.pid, known)
-    for pid in live:
+    graceful_targets = graceful_signal_targets(
+        proc.pid, live, root_only=graceful_root_only
+    )
+    for pid in graceful_targets:
         term_sent = signal_process_handle(pid, known[pid], first_signal) or term_sent
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline:
@@ -901,8 +912,10 @@ def terminate_tree(
         live = live_tree_members(proc.pid, known)
         if not live:
             break
-        for pid in live:
-            signal_process_handle(pid, known[pid], first_signal)
+        # The graceful signal is a one-shot snapshot operation. Re-sending it, or
+        # signalling descendants created during cooperative cleanup, can interrupt
+        # a child's cancellation finalizer after that child re-arms its handlers.
+        # Dynamic discovery remains active for the forced-cleanup fixed point below.
         time.sleep(0.02)
     live = live_tree_members(proc.pid, known)
     if live:
@@ -1124,7 +1137,11 @@ def run_supervised(
             if termination_reason is not None:
                 first = cancel_signal if cancel_signal is not None else signal.SIGTERM
                 term_sent, kill_sent, survivors = terminate_tree(
-                    proc, first, grace_ms / 1000, known_descendants
+                    proc,
+                    first,
+                    grace_ms / 1000,
+                    known_descendants,
+                    graceful_root_only=True,
                 )
                 break
             time.sleep(0.02)
@@ -4742,6 +4759,9 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             )
             if point == "post_decision":
                 ack_path = control_root / "signal-ack"
+                expected_ack = signal.Signals(signal_number).name.removeprefix(
+                    "SIG"
+                ).encode("ascii")
                 deadline = time.monotonic() + 60.0
                 while time.monotonic() < deadline:
                     try:
@@ -4751,16 +4771,13 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                     except (EvidenceError, FileNotFoundError):
                         time.sleep(0.005)
                         continue
-                    require(
-                        hmac.compare_digest(
-                            ack.decode("ascii").strip(),
-                            signal.Signals(signal_number).name.removeprefix("SIG"),
-                        ),
-                        "post-decision probe acknowledged the wrong signal",
-                    )
-                    break
+                    if hmac.compare_digest(ack.strip(), expected_ack):
+                        break
+                    time.sleep(0.005)
                 else:
-                    raise EvidenceError("post-decision signal was not acknowledged")
+                    raise EvidenceError(
+                        "post-decision signal was not acknowledged correctly"
+                    )
                 write_new(control_root / "release", b"release\n")
 
             communicate_timeout_s = 180 if point == "post_decision" else 120
@@ -5053,12 +5070,35 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         }
     )
 
+    target_selection = (
+        graceful_signal_targets(41, {41, 42, 43}, root_only=True),
+        graceful_signal_targets(41, {42, 43}, root_only=True),
+        graceful_signal_targets(41, {43, 41, 42}, root_only=False),
+    )
+    match target_selection:
+        case ([41], [], [41, 42, 43]):
+            pass
+        case _:
+            raise EvidenceError(
+                "graceful signal target selection violated cooperative root-only routing"
+            )
+    cases.append({"case": "graceful_signal_target_selection", "ok": True})
+
     cancel_root = case_dir("cancel_term")
     cancel_pid_file = cancel_root / "pids.txt"
+    cancel_child_ready = cancel_root / "child.ready"
     cancel_program = (
-        "import os,pathlib,subprocess,sys,time;"
-        "code='import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(60)';"
+        "import os,pathlib,signal,subprocess,sys,time;"
+        "code=\"import os,pathlib,signal,time;\""
+        "\"signal.signal(signal.SIGTERM,lambda *_:os.write(1,b'CHILD\\\\n'));\""
+        f"\"pathlib.Path({str(cancel_child_ready)!r}).write_text('ready');\""
+        "\"time.sleep(60)\";"
         "p=subprocess.Popen([sys.executable,'-c',code],start_new_session=True);"
+        f"ready=pathlib.Path({str(cancel_child_ready)!r});\n"
+        "deadline=time.monotonic()+15\n"
+        "while not ready.exists() and time.monotonic()<deadline:\n time.sleep(.01)\n"
+        "if not ready.exists(): raise SystemExit(9)\n"
+        "signal.signal(signal.SIGTERM,lambda *_:(os.write(1,b'PARENT\\n'),time.sleep(.1),os.kill(p.pid,signal.SIGTERM)));"
         f"pathlib.Path({str(cancel_pid_file)!r}).write_text(str(os.getpid())+'\\n'+str(p.pid)+'\\n');"
         "time.sleep(60)"
     )
@@ -5120,9 +5160,28 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         cancel_meta["classification"] == "cancelled",
         "TERM was not typed as cancellation",
     )
-    cancel_pids = [
-        int(value) for value in cancel_pid_file.read_text(encoding="utf-8").splitlines()
-    ]
+    cancel_stdout, _cancel_size, _cancel_digest = stable_file_facts(
+        cancel_root / "stage.out"
+    )
+    require(
+        cancel_stdout.count(b"PARENT\n") == 1
+        and cancel_stdout.count(b"CHILD\n") == 1,
+        "cooperative cancellation was not delivered exactly once per layer",
+    )
+    cancel_pid_data, _cancel_pid_size, _cancel_pid_digest = stable_file_facts(
+        cancel_pid_file, max_bytes=128
+    )
+    cancel_pid_lines = cancel_pid_data.splitlines()
+    require(
+        len(cancel_pid_lines) == 2
+        and all(value.isdigit() for value in cancel_pid_lines),
+        "cancellation PID handshake was incomplete or malformed",
+    )
+    cancel_pids = [int(value) for value in cancel_pid_lines]
+    require(
+        len(set(cancel_pids)) == 2 and all(value > 1 for value in cancel_pids),
+        "cancellation PID handshake did not bind two distinct identities",
+    )
     time.sleep(0.1)
     require(
         not any(process_alive(pid) for pid in cancel_pids),
