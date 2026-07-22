@@ -1,0 +1,58 @@
+# CI — the quality gate (bead franken_lean-rur).
+#
+# The test step IS scripts/check.sh (AGENTS.md: never duplicate the gate commands
+# inline in workflow files). Stages inside check.sh: fmt, check, clippy, test,
+# structure-guard, ubs-when-present. The e2e smoke family runs beside it and all
+# NDJSON/console artifacts are archived so failures are diagnosable without rerun.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: quality gate (check.sh + e2e smokes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the exact nightly; rustup honors it automatically.
+      - name: install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+      - name: quality gate (scripts/check.sh)
+        run: ./scripts/check.sh
+
+      - name: gate self-test (planted failures must be caught and named)
+        run: ./scripts/check.sh --self-test
+
+      - name: e2e smoke — structural gate
+        run: ./scripts/e2e/structure_gate.sh
+
+      - name: archive gate + e2e artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-artifacts-${{ github.run_id }}
+          path: |
+            target/check/
+            target/e2e/
+          if-no-files-found: warn
+          retention-days: 14
