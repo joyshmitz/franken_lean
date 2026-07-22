@@ -7,6 +7,9 @@
 
 name: ci
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -15,44 +18,423 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo
+  FLN_REQUIRE_UBS: 1
+  FLN_UBS_SCOPE: all-tracked
 
 jobs:
   gate:
     name: quality gate (check.sh + e2e smokes)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - name: initialize isolated evidence attempt
+        id: evidence_attempt
+        shell: bash
+        run: |
+          evidence_root="$RUNNER_TEMP/fln-evidence/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ -e "$evidence_root" || -L "$evidence_root" ]]; then
+            echo "evidence attempt root already exists: $evidence_root" >&2
+            exit 2
+          fi
+          mkdir -p "$evidence_root/check" "$evidence_root/e2e"
+          python3 - "$evidence_root/attempt-start.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          record = {
+              "github_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "github_run_id": os.environ["GITHUB_RUN_ID"],
+              "schema": "fln.ci-evidence-attempt-start/1",
+              "status": "started",
+          }
+          with open(sys.argv[1], "x", encoding="utf-8") as handle:
+              json.dump(record, handle, sort_keys=True, separators=(",", ":"))
+              handle.write("\n")
+              handle.flush()
+              os.fsync(handle.fileno())
+          PY
+          {
+            echo "FLN_EVIDENCE_ROOT=$evidence_root"
+            echo "FLN_CHECK_ART_ROOT=$evidence_root/check"
+            echo "FLN_E2E_ART_ROOT=$evidence_root/e2e"
+          } >> "$GITHUB_ENV"
+
+      - name: checkout FrankenLean
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      # UBS is Tribunal/engineering apparatus, never a FrankenLean runtime dependency.
+      # Fetch one reviewed tree and verify the exact runner bytes before it reaches PATH.
+      - name: checkout pinned UBS source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Dicklesworthstone/ultimate_bug_scanner
+          ref: 6a2def31c2396ac227c3949a51bab973b273d2d5
+          path: target/ci-tools/ubs
+          persist-credentials: false
+
+      - name: verify and provision pinned UBS
+        shell: bash
+        run: |
+          expected_commit="6a2def31c2396ac227c3949a51bab973b273d2d5"
+          actual_commit="$(git -C target/ci-tools/ubs rev-parse --verify 'HEAD^{commit}')"
+          if [[ "$actual_commit" != "$expected_commit" ]]; then
+            echo "UBS checkout mismatch: $actual_commit != $expected_commit" >&2
+            exit 2
+          fi
+          printf 'UBS source commit: %s\n' "$actual_commit"
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          runner = Path("target/ci-tools/ubs/ubs")
+          expected = "8bdb113e18417fcd1b4acc86e16dfc5ed4fd9f1a405c873b06fa5030bd12da32"
+          if runner.is_symlink() or not runner.is_file():
+              raise SystemExit(f"UBS runner is not a regular file: {runner}")
+          actual = hashlib.sha256(runner.read_bytes()).hexdigest()
+          if actual != expected:
+              raise SystemExit(f"UBS digest mismatch: {actual} != {expected}")
+          print(f"UBS runner SHA-256: {actual}")
+          PY
+          chmod +x target/ci-tools/ubs/ubs
+          echo "$GITHUB_WORKSPACE/target/ci-tools/ubs" >> "$GITHUB_PATH"
 
       # rust-toolchain.toml pins the exact nightly; rustup honors it automatically.
       - name: install pinned toolchain
-        run: rustup show active-toolchain || rustup toolchain install
+        shell: bash
+        run: |
+          channel="$(python3 - <<'PY'
+          import pathlib
+          import re
+
+          text = pathlib.Path("rust-toolchain.toml").read_text()
+          match = re.search(r'^channel = "([^"]+)"$', text, re.MULTILINE)
+          if match is None:
+              raise SystemExit("rust-toolchain.toml has no exact channel")
+          print(match.group(1))
+          PY
+          )"
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy
+          python3 - <<'PY'
+          import pathlib
+          import subprocess
+
+          lock = pathlib.Path("SUITE.lock").read_text().splitlines()
+          expected = next(line.split()[1] for line in lock if line.startswith("rust-commit "))
+          verbose = subprocess.run(
+              ["rustc", "-Vv"], check=True, text=True, capture_output=True
+          ).stdout.splitlines()
+          actual = next(line.split(": ", 1)[1] for line in verbose if line.startswith("commit-hash: "))
+          if actual != expected:
+              raise SystemExit(f"rustc commit mismatch: {actual} != {expected}")
+          PY
 
       - name: cache cargo
-        uses: actions/cache@v4
+        id: cargo_cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+            target/cargo
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
 
       - name: quality gate (scripts/check.sh)
-        run: ./scripts/check.sh
+        id: quality_gate
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          artifact="$FLN_CHECK_ART_ROOT/quality-gate"
+          set +e
+          FLN_CHECK_ART_DIR="$artifact" \
+            FLN_CHECK_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/check.sh
+          command_rc=$?
+          set -e
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          exit "$command_rc"
 
       - name: gate self-test (planted failures must be caught and named)
-        run: ./scripts/check.sh --self-test
+        id: gate_self_test
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          artifact="$FLN_CHECK_ART_ROOT/gate-self-test"
+          set +e
+          FLN_CHECK_ART_DIR="$artifact" \
+            FLN_CHECK_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/check.sh --self-test
+          command_rc=$?
+          set -e
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          exit "$command_rc"
 
       - name: e2e smoke — structural gate
-        run: ./scripts/e2e/structure_gate.sh
+        id: structure_gate
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/structure-gate"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/structure_gate.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "structural gate published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      - name: e2e smoke — dependency closure audit
+        id: closure_audit
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/closure-audit"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/closure_audit.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "closure audit published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
+      - name: verify and index complete evidence attempt
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        env:
+          QUALITY_ARTIFACT: ${{ steps.quality_gate.outputs.artifact_path }}
+          QUALITY_EXIT: ${{ steps.quality_gate.outputs.command_exit }}
+          SELF_TEST_ARTIFACT: ${{ steps.gate_self_test.outputs.artifact_path }}
+          SELF_TEST_EXIT: ${{ steps.gate_self_test.outputs.command_exit }}
+          STRUCTURE_ARTIFACT: ${{ steps.structure_gate.outputs.artifact_path }}
+          STRUCTURE_EXIT: ${{ steps.structure_gate.outputs.command_exit }}
+          CLOSURE_ARTIFACT: ${{ steps.closure_audit.outputs.artifact_path }}
+          CLOSURE_EXIT: ${{ steps.closure_audit.outputs.command_exit }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          attempt_root = Path(os.environ["FLN_EVIDENCE_ROOT"]).resolve(strict=True)
+          check_root = Path(os.environ["FLN_CHECK_ART_ROOT"]).resolve(strict=True)
+          e2e_root = Path(os.environ["FLN_E2E_ART_ROOT"]).resolve(strict=True)
+          attempt_start_path = attempt_root / "attempt-start.json"
+          attempt_start = json.loads(attempt_start_path.read_text(encoding="utf-8"))
+          if (
+              attempt_start.get("schema") != "fln.ci-evidence-attempt-start/1"
+              or attempt_start.get("status") != "started"
+              or attempt_start.get("github_run_id") != os.environ["GITHUB_RUN_ID"]
+              or attempt_start.get("github_run_attempt")
+              != os.environ["GITHUB_RUN_ATTEMPT"]
+          ):
+              raise SystemExit("invalid CI evidence attempt-start record")
+
+          expected_roots = {
+              check_root: {"quality-gate", "gate-self-test"},
+              e2e_root: {"structure-gate", "closure-audit"},
+          }
+          for root, expected_names in expected_roots.items():
+              observed = {entry.name for entry in root.iterdir()}
+              if observed != expected_names:
+                  raise SystemExit(
+                      f"incomplete evidence root {root}: {sorted(observed)} "
+                      f"!= {sorted(expected_names)}"
+                  )
+
+          specs = (
+              (
+                  "quality_gate",
+                  os.environ.get("QUALITY_ARTIFACT", ""),
+                  os.environ.get("QUALITY_EXIT", ""),
+                  check_root / "quality-gate",
+                  False,
+              ),
+              (
+                  "gate_self_test",
+                  os.environ.get("SELF_TEST_ARTIFACT", ""),
+                  os.environ.get("SELF_TEST_EXIT", ""),
+                  check_root / "gate-self-test",
+                  False,
+              ),
+              (
+                  "structure_gate",
+                  os.environ.get("STRUCTURE_ARTIFACT", ""),
+                  os.environ.get("STRUCTURE_EXIT", ""),
+                  e2e_root / "structure-gate",
+                  True,
+              ),
+              (
+                  "closure_audit",
+                  os.environ.get("CLOSURE_ARTIFACT", ""),
+                  os.environ.get("CLOSURE_EXIT", ""),
+                  e2e_root / "closure-audit",
+                  True,
+              ),
+          )
+
+          records = []
+          seen = set()
+          for label, raw_path, raw_exit, expected, is_child in specs:
+              if not raw_path or not raw_exit:
+                  raise SystemExit(f"{label} did not publish artifact_path and command_exit")
+              try:
+                  command_exit = int(raw_exit)
+              except ValueError as error:
+                  raise SystemExit(f"{label} published invalid exit {raw_exit!r}") from error
+              artifact = Path(raw_path)
+              if artifact.is_symlink() or not artifact.is_dir():
+                  raise SystemExit(f"{label} artifact is not a real directory: {artifact}")
+              artifact = artifact.resolve(strict=True)
+              if is_child:
+                  if artifact.parent != expected.resolve(strict=True):
+                      raise SystemExit(f"{label} artifact escaped its isolated root: {artifact}")
+                  children = list(expected.iterdir())
+                  if children != [artifact]:
+                      raise SystemExit(f"{label} root does not contain exactly its named bundle")
+              elif artifact != expected.resolve(strict=True):
+                  raise SystemExit(f"{label} artifact path mismatch: {artifact} != {expected}")
+              if artifact in seen:
+                  raise SystemExit(f"duplicate artifact path: {artifact}")
+              seen.add(artifact)
+              try:
+                  relative = artifact.relative_to(attempt_root)
+              except ValueError as error:
+                  raise SystemExit(f"{label} artifact escaped attempt root") from error
+
+              run_log = artifact / "run.ndjson"
+              manifest_path = artifact / "manifest.json"
+              digest_path = artifact / "manifest.digest"
+              bundle_commit = artifact / "bundle.complete.json"
+              for required in (run_log, manifest_path, digest_path, bundle_commit):
+                  if required.is_symlink() or not required.is_file():
+                      raise SystemExit(f"{label} missing regular evidence file: {required.name}")
+              subprocess.run(
+                  [
+                      "python3",
+                      "scripts/evidence.py",
+                      "validate-bundle",
+                      "--art-dir",
+                      str(artifact),
+                      "--manifest",
+                      str(manifest_path),
+                      "--digest",
+                      str(digest_path),
+                      "--commit",
+                      str(bundle_commit),
+                      "--artifact-root",
+                      str(artifact),
+                  ],
+                  check=True,
+              )
+              terminal_lines = [
+                  line for line in run_log.read_text(encoding="utf-8").splitlines() if line
+              ]
+              if not terminal_lines:
+                  raise SystemExit(f"{label} run log is empty")
+              terminal = json.loads(terminal_lines[-1])
+              if terminal.get("event") != "run_end":
+                  raise SystemExit(f"{label} run log is not terminal")
+              if terminal.get("process_exit") != command_exit:
+                  raise SystemExit(
+                      f"{label} command/terminal exit mismatch: "
+                      f"{command_exit} != {terminal.get('process_exit')}"
+                  )
+              manifest_bytes = manifest_path.read_bytes()
+              records.append(
+                  {
+                      "artifact": relative.as_posix(),
+                      "bundle_commit_sha256": hashlib.sha256(
+                          bundle_commit.read_bytes()
+                      ).hexdigest(),
+                      "command_exit": command_exit,
+                      "label": label,
+                      "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                      "run_id": terminal.get("run_id"),
+                      "verdict": terminal.get("verdict"),
+                  }
+              )
+
+          index = {
+              "all_commands_passed": all(row["command_exit"] == 0 for row in records),
+              "artifacts": records,
+              "attempt_start_sha256": hashlib.sha256(
+                  attempt_start_path.read_bytes()
+              ).hexdigest(),
+              "complete": True,
+              "github_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "github_run_id": os.environ["GITHUB_RUN_ID"],
+              "schema": "fln.ci-evidence-index/1",
+          }
+          encoded = (json.dumps(index, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          index_path = attempt_root / "attempt-index.json"
+          with index_path.open("xb") as handle:
+              handle.write(encoded)
+              handle.flush()
+              os.fsync(handle.fileno())
+          digest = hashlib.sha256(encoded).hexdigest()
+          with (attempt_root / "attempt-index.digest").open("x", encoding="utf-8") as handle:
+              handle.write(f"sha256:{digest}  {index_path.name}\n")
+              handle.flush()
+              os.fsync(handle.fileno())
+          print(f"sealed complete evidence attempt: {index_path} ({digest})")
+          PY
 
       - name: archive gate + e2e artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: gate-artifacts-${{ github.run_id }}
-          path: |
-            target/check/
-            target/e2e/
-          if-no-files-found: warn
+          name: gate-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fln-evidence/${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          include-hidden-files: true
           retention-days: 14
