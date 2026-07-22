@@ -25,6 +25,7 @@
 pub mod checks;
 pub mod graph;
 pub mod ledger;
+pub mod lockfile;
 pub mod manifest;
 pub mod report;
 
@@ -32,5 +33,13 @@ pub mod report;
 pub const GRAPH_FILE: &str = "ci/WORKSPACE_GRAPH.txt";
 /// Workspace-relative path of the unsafe-boundary ledger.
 pub const LEDGER_FILE: &str = "ci/UNSAFE_LEDGER.txt";
+/// Workspace-relative path of the governed dependency-closure allowlist (D1).
+pub const ALLOWLIST_FILE: &str = "ci/CLOSURE_ALLOWLIST.txt";
+/// Workspace-relative path of the one-ceremony pin file.
+pub const SUITE_LOCK_FILE: &str = "SUITE.lock";
+/// Workspace-relative path of the cargo lockfile the closure audit walks.
+pub const LOCK_FILE: &str = "Cargo.lock";
+/// Workspace-relative path of the toolchain pin that must agree with SUITE.lock.
+pub const TOOLCHAIN_FILE: &str = "rust-toolchain.toml";
 /// NDJSON schema identifier for robot output.
 pub const NDJSON_SCHEMA: &str = "structure-guard/1";

@@ -17,6 +17,10 @@
 //! * `FLN-STRUCT-015` line-count covenant exceeded
 //! * `FLN-STRUCT-016` parse/shape error (graph file, ledger, manifest, missing roots)
 //! * `FLN-STRUCT-017` crate location or naming inconsistent with its declared kind
+//! * `FLN-STRUCT-021` root workspace/target graph differs from the constrained contract
+//! * `FLN-STRUCT-022` unsafe-boundary export violates fail-closed D3 law (b)
+//! * `FLN-STRUCT-023` dependency path does not resolve to its acknowledged package
+//! * `FLN-STRUCT-024` reviewed graph weakens a constitutional baseline rule
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -116,12 +120,199 @@ fn count_loc(dir: &Path) -> Result<usize, String> {
 }
 
 /// Root files whose lint posture is checked: whichever of `src/lib.rs`/`src/main.rs` exist.
-fn crate_roots(c: &DiscoveredCrate) -> Vec<PathBuf> {
-    ["lib.rs", "main.rs"]
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn crate_roots(c: &DiscoveredCrate) -> Result<Vec<PathBuf>, String> {
+    let mut roots: Vec<PathBuf> = ["lib.rs", "main.rs"]
         .iter()
-        .map(|f| c.dir.join("src").join(f))
-        .filter(|p| p.is_file())
-        .collect()
+        .map(|file| c.dir.join("src").join(file))
+        .filter(|path| path.is_file())
+        .collect();
+    let build_script = c.dir.join("build.rs");
+    if build_script.is_file() {
+        roots.push(build_script);
+    }
+    for target_dir in ["src/bin", "tests", "examples", "benches"] {
+        collect_rs_files(&c.dir.join(target_dir), &mut roots)?;
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn validate_constitutional_baseline(g: &GraphFile, findings: &mut Vec<Finding>) {
+    let plan_ranks = [
+        ("fln-core", 0),
+        ("fln-hash", 1),
+        ("fln-bignum", 1),
+        ("fln-libm", 1),
+        ("fln-unsafe-abi", 2),
+        ("fln-unsafe-region", 2),
+        ("fln-rt", 3),
+        ("fln-env", 4),
+        ("fln-olean", 5),
+        ("fln-kernel", 6),
+        ("fln-checker", 6),
+        ("fln-syntax", 7),
+        ("fln-parse", 8),
+        ("fln-elab", 9),
+        ("fln-comp", 10),
+        ("fln-vm", 11),
+        ("fln-unsafe-jit", 12),
+        ("fln-verdict", 13),
+        ("fln-anvil", 14),
+        ("fln-ledger", 15),
+        ("fln-lake", 16),
+        ("fln-server", 17),
+        ("fln-trace", 18),
+        ("fln", 19),
+        ("fln-hound", 20),
+        ("fln-doc", 20),
+        ("fln-mcp", 20),
+        ("fln-tui", 20),
+        ("fln-cli", 21),
+        ("fln-wasm", 21),
+        ("fln-conformance", 22),
+    ];
+    for (name, expected_rank) in plan_ranks {
+        if let Some(decl) = g.crates.get(name)
+            && decl.rank != Some(expected_rank)
+        {
+            findings.push(Finding {
+                code: "FLN-STRUCT-024",
+                path: GRAPH_FILE.to_string(),
+                detail: format!(
+                    "plan-defined rank for `{name}` is {expected_rank}, found {:?}; amend the plan before its constitutional rank",
+                    decl.rank
+                ),
+            });
+        }
+    }
+    let expected_boundaries: BTreeSet<&str> =
+        BTreeSet::from(["fln-unsafe-abi", "fln-unsafe-region", "fln-unsafe-jit"]);
+    let actual_boundaries: BTreeSet<&str> = g
+        .crates
+        .values()
+        .filter(|decl| decl.kind == CrateKind::UnsafeBoundary)
+        .map(|decl| decl.name.as_str())
+        .collect();
+    if actual_boundaries != expected_boundaries {
+        findings.push(Finding {
+            code: "FLN-STRUCT-024",
+            path: GRAPH_FILE.to_string(),
+            detail: format!(
+                "D3 permits exactly {:?} as unsafe boundaries; graph declares {:?}",
+                expected_boundaries, actual_boundaries
+            ),
+        });
+    }
+
+    for (source, destination) in [
+        ("fln-unsafe-*", "fln-kernel"),
+        ("fln-unsafe-*", "fln-checker"),
+        ("fln-kernel", "fln-checker"),
+        ("fln-checker", "fln-kernel"),
+        ("fln-checker", "fln-olean"),
+        ("fln-checker", "fln-rt"),
+        ("fln-checker", "fln-unsafe-*"),
+    ] {
+        if !g
+            .prohibits
+            .iter()
+            .any(|(from, to)| from.as_str() == source && to.as_str() == destination)
+        {
+            findings.push(Finding {
+                code: "FLN-STRUCT-024",
+                path: GRAPH_FILE.to_string(),
+                detail: format!(
+                    "constitutional prohibition `{source} ->* {destination}` is missing"
+                ),
+            });
+        }
+    }
+    for (name, expected) in [
+        (
+            "fln-kernel",
+            ["fln-core", "fln-hash", "fln-bignum", "fln-env"].as_slice(),
+        ),
+        (
+            "fln-checker",
+            ["fln-core", "fln-hash", "fln-bignum"].as_slice(),
+        ),
+    ] {
+        let actual: BTreeSet<&str> = g
+            .allow_direct
+            .get(name)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let expected: BTreeSet<&str> = expected.iter().copied().collect();
+        if actual != expected {
+            findings.push(Finding {
+                code: "FLN-STRUCT-024",
+                path: GRAPH_FILE.to_string(),
+                detail: format!(
+                    "constitutional allow-direct covenant for `{name}` must be {:?}, found {:?}",
+                    expected, actual
+                ),
+            });
+        }
+    }
+    if !g
+        .covenants
+        .get("fln-kernel")
+        .is_some_and(|limit| *limit <= 12_000)
+    {
+        findings.push(Finding {
+            code: "FLN-STRUCT-024",
+            path: GRAPH_FILE.to_string(),
+            detail: "fln-kernel max-loc covenant is missing or exceeds 12000".to_string(),
+        });
+    }
+    let allowed_suite: BTreeSet<&str> = BTreeSet::from([
+        "asupersync",
+        "frankensqlite",
+        "franken_networkx",
+        "frankensearch",
+        "frankentui",
+        "franken_markdown",
+        "fmd-font",
+        "fmd-math",
+        "fastmcp_rust",
+        "atp",
+        "frankentorch",
+        "franken_node",
+    ]);
+    for dependency in &g.suite_deps {
+        if !allowed_suite.contains(dependency.as_str()) {
+            findings.push(Finding {
+                code: "FLN-STRUCT-024",
+                path: GRAPH_FILE.to_string(),
+                detail: format!(
+                    "suite-dep `{dependency}` is not in the constitutional FrankenSuite universe"
+                ),
+            });
+        }
+    }
 }
 
 pub fn run(root: &Path) -> Result<RunOutcome, String> {
@@ -137,6 +328,32 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     let ledger_text = fs::read_to_string(root.join(LEDGER_FILE))
         .map_err(|e| format!("cannot read {LEDGER_FILE}: {e}"))?;
     let unsafe_ledger = ledger::parse(&ledger_text)?;
+    validate_constitutional_baseline(&g, &mut findings);
+
+    let root_manifest_path = root.join("Cargo.toml");
+    let root_manifest_text = fs::read_to_string(&root_manifest_path)
+        .map_err(|error| format!("cannot read root Cargo.toml: {error}"))?;
+    match manifest::parse_workspace_members(&root_manifest_text, "Cargo.toml") {
+        Ok(members) => {
+            let actual: BTreeSet<&str> = members.iter().map(String::as_str).collect();
+            let expected = BTreeSet::from(["crates/*", "tools/*"]);
+            if actual != expected {
+                findings.push(Finding {
+                    code: "FLN-STRUCT-021",
+                    path: "Cargo.toml".to_string(),
+                    detail: format!(
+                        "workspace.members must be exactly {:?}; found {:?}",
+                        expected, actual
+                    ),
+                });
+            }
+        }
+        Err(detail) => findings.push(Finding {
+            code: "FLN-STRUCT-021",
+            path: "Cargo.toml".to_string(),
+            detail,
+        }),
+    }
 
     // ---- discover the actual workspace -------------------------------------------------
     let mut discovered: Vec<DiscoveredCrate> = Vec::new();
@@ -237,7 +454,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         let Some(m) = &c.manifest else { continue };
         for dep in &m.deps {
             if on_disk.contains_key(dep.name.as_str()) || g.crates.contains_key(&dep.name) {
-                if !dep.has_path {
+                if dep.path.is_none() {
                     findings.push(Finding {
                         code: "FLN-STRUCT-010",
                         path: format!("{}/Cargo.toml", c.rel),
@@ -247,9 +464,44 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                         ),
                     });
                 }
+                if let Some(path) = &dep.path
+                    && let Some(target) = on_disk.get(dep.name.as_str())
+                {
+                    let declared = fs::canonicalize(c.dir.join(path));
+                    let expected = fs::canonicalize(&target.dir);
+                    match (declared, expected) {
+                        (Ok(declared), Ok(expected)) if declared == expected => {}
+                        (Ok(declared), Ok(expected)) => findings.push(Finding {
+                            code: "FLN-STRUCT-023",
+                            path: format!("{}/Cargo.toml", c.rel),
+                            detail: format!(
+                                "dependency `{}` path resolves to `{}`, expected `{}`",
+                                dep.name,
+                                declared.display(),
+                                expected.display()
+                            ),
+                        }),
+                        (Err(error), _) => findings.push(Finding {
+                            code: "FLN-STRUCT-023",
+                            path: format!("{}/Cargo.toml", c.rel),
+                            detail: format!(
+                                "dependency `{}` path `{path}` cannot be resolved: {error}",
+                                dep.name
+                            ),
+                        }),
+                        (_, Err(error)) => findings.push(Finding {
+                            code: "FLN-STRUCT-023",
+                            path: format!("{}/Cargo.toml", c.rel),
+                            detail: format!(
+                                "acknowledged dependency `{}` directory cannot be resolved: {error}",
+                                dep.name
+                            ),
+                        }),
+                    }
+                }
                 actual_edges.insert((c.name.clone(), dep.name.clone()));
             } else if suite.contains(dep.name.as_str()) {
-                if !dep.has_path {
+                if dep.path.is_none() {
                     findings.push(Finding {
                         code: "FLN-STRUCT-010",
                         path: format!("{}/Cargo.toml", c.rel),
@@ -400,7 +652,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         let Some(decl) = g.crates.get(&c.name) else {
             continue;
         };
-        let roots = crate_roots(c);
+        let roots = crate_roots(c)?;
         if roots.is_empty() {
             findings.push(Finding {
                 code: "FLN-STRUCT-016",
@@ -410,18 +662,18 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             continue;
         }
         for root_file in roots {
-            let rel = format!(
-                "{}/src/{}",
-                c.rel,
-                root_file.file_name().unwrap_or_default().to_string_lossy()
-            );
+            let relative_root = root_file
+                .strip_prefix(&c.dir)
+                .unwrap_or(&root_file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let rel = format!("{}/{}", c.rel, relative_root);
             let text =
                 fs::read_to_string(&root_file).map_err(|e| format!("cannot read {rel}: {e}"))?;
-            let has_forbid = text.lines().any(|l| l.trim() == "#![forbid(unsafe_code)]");
-            let has_deny = text.lines().any(|l| l.trim() == "#![deny(unsafe_code)]");
+            let posture = ledger::lint_posture(&text);
             match decl.kind {
                 CrateKind::UnsafeBoundary => {
-                    if has_forbid {
+                    if posture.forbid_unsafe {
                         findings.push(Finding {
                             code: "FLN-STRUCT-012",
                             path: rel.clone(),
@@ -429,7 +681,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                                 .to_string(),
                         });
                     }
-                    if !has_deny {
+                    if !posture.deny_unsafe {
                         findings.push(Finding {
                             code: "FLN-STRUCT-012",
                             path: rel,
@@ -439,7 +691,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                     }
                 }
                 _ => {
-                    if !has_forbid {
+                    if !posture.forbid_unsafe {
                         findings.push(Finding {
                             code: "FLN-STRUCT-011",
                             path: rel,
@@ -471,6 +723,15 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     }
     let mut used_ids: BTreeMap<&str, usize> = BTreeMap::new();
     for site in &sites {
+        if site.inner {
+            findings.push(Finding {
+                code: "FLN-STRUCT-013",
+                path: format!("{}:{}", site.path, site.line),
+                detail: "inner allow(unsafe_code) applies too broadly; only narrow outer attributes are ledgerable"
+                    .to_string(),
+            });
+            continue;
+        }
         match &site.id {
             None => findings.push(Finding {
                 code: "FLN-STRUCT-013",
@@ -522,12 +783,63 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         }
     }
 
+    // D3 law (b), fail-closed scaffold form. A type-aware public-API reachability
+    // classifier will eventually admit only membrane-safe outputs; until it exists, an
+    // unsafe crate exports nothing externally, which soundly prevents laundering.
+    for c in &discovered {
+        let is_boundary = g
+            .crates
+            .get(&c.name)
+            .is_some_and(|decl| decl.kind == CrateKind::UnsafeBoundary);
+        if !is_boundary {
+            continue;
+        }
+        let src = c.dir.join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        let mut exports = Vec::new();
+        ledger::scan_external_exports(&src, &format!("{}/src", c.rel), &mut exports)?;
+        for site in exports {
+            findings.push(Finding {
+                code: "FLN-STRUCT-022",
+                path: format!("{}:{}", site.path, site.line),
+                detail: format!(
+                    "{} in unsafe boundary `{}` is forbidden until a type-aware no-admission export covenant exists (D3 law b)",
+                    site.detail, c.name
+                ),
+            });
+        }
+    }
+
     // ---- line-count covenants ----------------------------------------------------------
     for (crate_name, limit) in &g.covenants {
         let Some(c) = on_disk.get(crate_name.as_str()) else {
             continue;
         };
-        let loc = count_loc(&c.dir.join("src"))?;
+        let src = c.dir.join("src");
+        let mut covenant_sources = Vec::new();
+        collect_rs_files(&src, &mut covenant_sources)?;
+        for source in covenant_sources {
+            let text = fs::read_to_string(&source)
+                .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+            for escape in ledger::source_escape_sites(&text) {
+                let rel = source
+                    .strip_prefix(root)
+                    .unwrap_or(&source)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                findings.push(Finding {
+                    code: "FLN-STRUCT-015",
+                    path: format!("{rel}:{}", escape.line),
+                    detail: format!(
+                        "`{crate_name}` {} outside the counted source closure",
+                        escape.detail
+                    ),
+                });
+            }
+        }
+        let loc = count_loc(&src)?;
         if loc > *limit {
             findings.push(Finding {
                 code: "FLN-STRUCT-015",
@@ -538,6 +850,11 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             });
         }
     }
+
+    // ---- dependency-closure audit (D1; bead franken_lean-xwf) --------------------------
+    // Cargo.lock ⇄ ci/CLOSURE_ALLOWLIST.txt ⇄ SUITE.lock ⇄ rust-toolchain.toml. Missing
+    // or malformed governance files degrade to findings, never to a silent skip.
+    findings.extend(crate::lockfile::audit(root, &g));
 
     findings.sort_by(|a, b| (a.code, &a.path, &a.detail).cmp(&(b.code, &b.path, &b.detail)));
     Ok(RunOutcome {

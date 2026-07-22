@@ -113,11 +113,13 @@ case "${1:-}" in
   *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
 esac
 
+# --locked: CI builds ONLY from the committed lock (SUITE.lock ceremony, D1, G0-10);
+# a drifted Cargo.lock fails the stage instead of being silently rewritten.
 run_stage fmt cargo fmt --check
-run_stage check cargo check --all-targets
-run_stage clippy cargo clippy --all-targets -- -D warnings
-run_stage test cargo test
-run_stage structure-guard cargo run -q -p structure-guard -- --root "$REPO" --robot
+run_stage check cargo check --locked --all-targets
+run_stage clippy cargo clippy --locked --all-targets -- -D warnings
+run_stage test cargo test --locked
+run_stage structure-guard cargo run -q --locked -p structure-guard -- --root "$REPO" --robot
 
 # ubs runs on changed + untracked rust/toml files; absence is a logged skip, never silent.
 if command -v ubs >/dev/null 2>&1; then

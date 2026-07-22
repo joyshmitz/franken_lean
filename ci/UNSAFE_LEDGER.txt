@@ -2,8 +2,8 @@
 #
 # Every `#[allow(unsafe_code)]` site in the three boundary crates (fln-unsafe-abi,
 # fln-unsafe-region, fln-unsafe-jit) MUST:
-#   1. carry a marker comment `// UNSAFE-LEDGER: FLN-UL-NNNN` on the same line or the
-#      nearest non-empty line above the attribute, and
+#   1. carry a marker-only comment `// UNSAFE-LEDGER: FLN-UL-NNNN` on the nearest
+#      non-empty line above the attribute, and
 #   2. have a matching row here whose <path> is the file containing the site.
 # `tools/structure-guard` rejects unledgered sites AND stale rows; both directions fail CI.
 #

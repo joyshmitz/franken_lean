@@ -85,8 +85,8 @@ allow-direct fln-checker = fln-core, fln-hash, fln-bignum
 covenant fln-kernel max-loc=12000
 
 # ---- the closed dependency universe (D1): FrankenSuite only, always by path -----------
-# Pinning/checksums arrive with SUITE.lock (bead franken_lean-xwf); until then any use
-# must be a path dependency and its name must appear here.
+# Every name here must have a matching `crate` row in SUITE.lock (bidirectional check);
+# any use must be a path dependency at the SUITE.lock-pinned repo.
 suite-dep asupersync
 suite-dep frankensqlite
 suite-dep franken_networkx
@@ -99,4 +99,5 @@ suite-dep fastmcp_rust
 suite-dep atp
 # optional tier — feature-gated, never on the critical path (plan §2):
 suite-dep frankentorch
-suite-dep franken_node
+# franken_node is deliberately ABSENT: unpinned in SUITE.lock (repo not present at pin
+# time). It joins both files together via its own pin ceremony on first use.

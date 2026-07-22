@@ -32,6 +32,16 @@ emit() { # emit <step_id> <status> <detail-json-fragment>
 
 note() { echo "[structure_gate] $*" >&2; }
 
+copy_fixture() { # copy_fixture <fresh-destination>
+  local destination="$1"
+  mkdir -p "$destination"
+  cp -r "$ROOT/ci" "$destination/ci"
+  cp -r "$ROOT/crates" "$destination/crates"
+  cp -r "$ROOT/tools" "$destination/tools"
+  cp "$ROOT/Cargo.toml" "$ROOT/Cargo.lock" "$ROOT/SUITE.lock" \
+    "$ROOT/rust-toolchain.toml" "$destination/"
+}
+
 emit run_start started "\"cwd\":\"$ROOT\",\"argv\":\"$0\""
 
 # ---- step 1: build the real binary ----------------------------------------------------
@@ -59,13 +69,10 @@ emit real_workspace passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\
 # Copy the checkable surface (governance files + crate manifests + roots) into a scratch
 # root, then seed an UPWARD dependency fln-core -> fln-kernel without acknowledgment:
 # both the snapshot law (005) and — once acknowledged — layering (007) must catch it.
-SCRATCH_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/structure-gate-XXXXXX")"
+SCRATCH_ROOT="$ART_DIR/fixtures"
 UNACKNOWLEDGED="$SCRATCH_ROOT/unacknowledged"
 note "seeding illegal edge in retained scratch copy: $UNACKNOWLEDGED"
-mkdir -p "$UNACKNOWLEDGED"
-cp -r "$ROOT/ci" "$UNACKNOWLEDGED/ci"
-cp -r "$ROOT/crates" "$UNACKNOWLEDGED/crates"
-cp -r "$ROOT/tools" "$UNACKNOWLEDGED/tools"
+copy_fixture "$UNACKNOWLEDGED"
 
 printf 'fln-kernel = { path = "../fln-kernel" }\n' >> "$UNACKNOWLEDGED/crates/fln-core/Cargo.toml"
 
@@ -83,10 +90,7 @@ emit seeded_unacknowledged passed "\"expected_exit\":1,\"actual_exit\":$rc,\"det
 # Build a second immutable fixture with the edge acknowledged — layering must still
 # refuse it. The failed fixture above is retained byte-for-byte for diagnosis.
 ACKNOWLEDGED="$SCRATCH_ROOT/acknowledged"
-mkdir -p "$ACKNOWLEDGED"
-cp -r "$ROOT/ci" "$ACKNOWLEDGED/ci"
-cp -r "$ROOT/crates" "$ACKNOWLEDGED/crates"
-cp -r "$ROOT/tools" "$ACKNOWLEDGED/tools"
+copy_fixture "$ACKNOWLEDGED"
 printf 'fln-kernel = { path = "../fln-kernel" }\n' >> "$ACKNOWLEDGED/crates/fln-core/Cargo.toml"
 printf 'edge fln-core -> fln-kernel\n' >> "$ACKNOWLEDGED/ci/WORKSPACE_GRAPH.txt"
 set +e
@@ -103,10 +107,7 @@ emit seeded_acknowledged passed "\"expected_exit\":1,\"actual_exit\":$rc,\"detec
 # ---- step 4: recovery — reconstruct clean state without mutating failed evidence -------
 RECOVERED="$SCRATCH_ROOT/recovered"
 note "recovery: reconstructing an independent clean fixture at $RECOVERED"
-mkdir -p "$RECOVERED"
-cp -r "$ROOT/ci" "$RECOVERED/ci"
-cp -r "$ROOT/crates" "$RECOVERED/crates"
-cp -r "$ROOT/tools" "$RECOVERED/tools"
+copy_fixture "$RECOVERED"
 
 set +e
 "$GUARD" --root "$RECOVERED" --robot > "$ART_DIR/recovered.ndjson"
@@ -122,11 +123,8 @@ emit recovery passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"recov
 # ---- step 5: unledgered allow(unsafe_code) site must fail (D3 ledger law) --------------
 UNLEDGERED="$SCRATCH_ROOT/unledgered"
 note "seeding unledgered allow(unsafe_code) site in retained scratch copy: $UNLEDGERED"
-mkdir -p "$UNLEDGERED"
-cp -r "$ROOT/ci" "$UNLEDGERED/ci"
-cp -r "$ROOT/crates" "$UNLEDGERED/crates"
-cp -r "$ROOT/tools" "$UNLEDGERED/tools"
-printf '\n#[allow(unsafe_code)]\npub fn seeded_unledgered_site() {}\n' >> "$UNLEDGERED/crates/fln-unsafe-abi/src/lib.rs"
+copy_fixture "$UNLEDGERED"
+printf '\n#[allow(unsafe_code)]\nfn seeded_unledgered_site() {}\n' >> "$UNLEDGERED/crates/fln-unsafe-abi/src/lib.rs"
 
 set +e
 "$GUARD" --root "$UNLEDGERED" --robot > "$ART_DIR/seeded-unledgered.ndjson"
@@ -142,11 +140,8 @@ emit seeded_unledgered passed "\"expected_exit\":1,\"actual_exit\":$rc,\"detecte
 # ---- step 6: recovery — the same site with marker + matching ledger row passes ----------
 LEDGERED="$SCRATCH_ROOT/ledgered"
 note "recovery: same site with ledger marker + row at $LEDGERED"
-mkdir -p "$LEDGERED"
-cp -r "$ROOT/ci" "$LEDGERED/ci"
-cp -r "$ROOT/crates" "$LEDGERED/crates"
-cp -r "$ROOT/tools" "$LEDGERED/tools"
-printf '\n// UNSAFE-LEDGER: FLN-UL-9001\n#[allow(unsafe_code)]\npub fn seeded_ledgered_site() {}\n' >> "$LEDGERED/crates/fln-unsafe-abi/src/lib.rs"
+copy_fixture "$LEDGERED"
+printf '\n// UNSAFE-LEDGER: FLN-UL-9001\n#[allow(unsafe_code)]\nfn seeded_ledgered_site() {}\n' >> "$LEDGERED/crates/fln-unsafe-abi/src/lib.rs"
 printf 'row FLN-UL-9001 | crates/fln-unsafe-abi/src/lib.rs | e2e fixture invariant | this scenario | safe fallback path | result never enters a checked declaration\n' >> "$LEDGERED/ci/UNSAFE_LEDGER.txt"
 
 set +e
@@ -159,6 +154,40 @@ if [ "$rc" -ne 0 ]; then
   exit 1
 fi
 emit ledger_recovery passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"ledgered.ndjson\""
+
+# ---- step 7: unsafe-boundary public export must fail closed (D3 law b) -----------------
+EXPORTED="$SCRATCH_ROOT/exported"
+note "seeding an unsafe-boundary public export in retained scratch copy: $EXPORTED"
+copy_fixture "$EXPORTED"
+printf '\npub fn seeded_public_export<T>() -> T { panic!("not executed") }\n' >> "$EXPORTED/crates/fln-unsafe-abi/src/lib.rs"
+
+set +e
+"$GUARD" --root "$EXPORTED" --robot > "$ART_DIR/seeded-export.ndjson"
+rc=$?
+set -e
+if [ "$rc" -ne 1 ] || ! grep -q 'FLN-STRUCT-022' "$ART_DIR/seeded-export.ndjson"; then
+  emit seeded_export failed "\"expected_exit\":1,\"actual_exit\":$rc,\"expected_code\":\"FLN-STRUCT-022\",\"artifact\":\"seeded-export.ndjson\""
+  note "FAIL: unsafe-boundary public export was not refused"
+  exit 1
+fi
+emit seeded_export passed "\"expected_exit\":1,\"actual_exit\":$rc,\"detected\":\"FLN-STRUCT-022\",\"artifact\":\"seeded-export.ndjson\""
+
+# ---- step 8: recovery — crate-restricted visibility does not cross the boundary --------
+RESTRICTED="$SCRATCH_ROOT/restricted"
+note "recovery: reconstructing a crate-restricted boundary API at $RESTRICTED"
+copy_fixture "$RESTRICTED"
+printf '\npub(crate) fn seeded_crate_local_api() {}\n' >> "$RESTRICTED/crates/fln-unsafe-abi/src/lib.rs"
+
+set +e
+"$GUARD" --root "$RESTRICTED" --robot > "$ART_DIR/restricted.ndjson"
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  emit export_recovery failed "\"expected_exit\":0,\"actual_exit\":$rc,\"artifact\":\"restricted.ndjson\""
+  note "FAIL: crate-restricted recovery fixture still has findings"
+  exit 1
+fi
+emit export_recovery passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"restricted.ndjson\""
 
 emit run_end passed "\"verdict\":\"pass\",\"artifacts_dir\":\"target/e2e/$RUN_ID\",\"fixture_root\":\"$SCRATCH_ROOT\",\"cleanup_status\":\"retained_by_policy\""
 note "PASS — artifacts in $ART_DIR; retained fixtures in $SCRATCH_ROOT"

@@ -80,16 +80,355 @@ pub struct AllowSite {
     /// Ledger id from the `// UNSAFE-LEDGER: FLN-UL-NNNN` marker, if present on the
     /// same line or the nearest non-empty line above.
     pub id: Option<String>,
+    /// Inner attributes apply to an entire crate/module and are never a narrowly scoped
+    /// unsafe allowance.
+    pub inner: bool,
 }
 
 fn marker_id(line: &str) -> Option<String> {
-    let pos = line.find("UNSAFE-LEDGER:")?;
-    let rest = line[pos + "UNSAFE-LEDGER:".len()..].trim();
+    // Markers are deliberately comment-only. This prevents a string literal containing
+    // `UNSAFE-LEDGER:` from authorizing a real allow attribute below it.
+    let comment = line.trim_start().strip_prefix("//")?.trim_start();
+    let rest = comment.strip_prefix("UNSAFE-LEDGER:")?.trim();
     let id: String = rest
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
         .collect();
     if id.is_empty() { None } else { Some(id) }
+}
+
+#[derive(Debug, Clone)]
+struct Token {
+    text: String,
+    line: usize,
+}
+
+#[derive(Debug)]
+struct Attribute {
+    line: usize,
+    inner: bool,
+    tokens: Vec<Token>,
+}
+
+fn raw_string_end(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut cursor = start;
+    if bytes.get(cursor) == Some(&b'b') || bytes.get(cursor) == Some(&b'c') {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'r') {
+        return None;
+    }
+    cursor += 1;
+    let hashes_start = cursor;
+    while bytes.get(cursor) == Some(&b'#') {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'"') {
+        return None;
+    }
+    Some((cursor + 1, cursor - hashes_start))
+}
+
+fn rust_tokens(text: &str) -> Vec<Token> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    let mut line = 1;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte == b'\n' {
+            line += 1;
+            cursor += 1;
+            continue;
+        }
+        if byte.is_ascii_whitespace() {
+            cursor += 1;
+            continue;
+        }
+        if bytes.get(cursor..cursor + 2) == Some(b"//") {
+            cursor += 2;
+            while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                cursor += 1;
+            }
+            continue;
+        }
+        if bytes.get(cursor..cursor + 2) == Some(b"/*") {
+            cursor += 2;
+            let mut depth = 1_u32;
+            while cursor < bytes.len() && depth != 0 {
+                if bytes[cursor] == b'\n' {
+                    line += 1;
+                    cursor += 1;
+                } else if bytes.get(cursor..cursor + 2) == Some(b"/*") {
+                    depth += 1;
+                    cursor += 2;
+                } else if bytes.get(cursor..cursor + 2) == Some(b"*/") {
+                    depth -= 1;
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+            }
+            continue;
+        }
+        if let Some((mut end, hashes)) = raw_string_end(bytes, cursor) {
+            while end < bytes.len() {
+                if bytes[end] == b'\n' {
+                    line += 1;
+                }
+                if bytes[end] == b'"'
+                    && bytes
+                        .get(end + 1..end + 1 + hashes)
+                        .is_some_and(|tail| tail.iter().all(|value| *value == b'#'))
+                {
+                    end += 1 + hashes;
+                    break;
+                }
+                end += 1;
+            }
+            cursor = end;
+            continue;
+        }
+        if byte == b'"' {
+            cursor += 1;
+            let mut escaped = false;
+            while cursor < bytes.len() {
+                let current = bytes[cursor];
+                if current == b'\n' {
+                    line += 1;
+                }
+                cursor += 1;
+                if escaped {
+                    escaped = false;
+                } else if current == b'\\' {
+                    escaped = true;
+                } else if current == b'"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if byte == b'\'' {
+            // Skip a character literal when a closing quote is nearby. A Rust lifetime
+            // has no closing quote and is tokenized as punctuation + identifier instead.
+            let mut end = cursor + 1;
+            let mut escaped = false;
+            let mut closed = false;
+            while end < bytes.len() && end <= cursor + 8 && bytes[end] != b'\n' {
+                let current = bytes[end];
+                end += 1;
+                if escaped {
+                    escaped = false;
+                } else if current == b'\\' {
+                    escaped = true;
+                } else if current == b'\'' {
+                    closed = true;
+                    break;
+                }
+            }
+            if closed {
+                cursor = end;
+                continue;
+            }
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = cursor;
+            cursor += 1;
+            while cursor < bytes.len()
+                && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+            {
+                cursor += 1;
+            }
+            out.push(Token {
+                text: text[start..cursor].to_string(),
+                line,
+            });
+            continue;
+        }
+        out.push(Token {
+            text: (byte as char).to_string(),
+            line,
+        });
+        cursor += 1;
+    }
+    out
+}
+
+fn attributes(text: &str) -> Vec<Attribute> {
+    let tokens = rust_tokens(text);
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while cursor < tokens.len() {
+        if tokens[cursor].text != "#" {
+            cursor += 1;
+            continue;
+        }
+        let line = tokens[cursor].line;
+        let mut next = cursor + 1;
+        let inner = tokens.get(next).is_some_and(|tk| tk.text == "!");
+        if inner {
+            next += 1;
+        }
+        if !tokens.get(next).is_some_and(|tk| tk.text == "[") {
+            cursor += 1;
+            continue;
+        }
+        next += 1;
+        let body_start = next;
+        let mut depth = 1_u32;
+        while next < tokens.len() && depth != 0 {
+            match tokens[next].text.as_str() {
+                "[" => depth += 1,
+                "]" => depth -= 1,
+                _ => {}
+            }
+            next += 1;
+        }
+        if depth == 0 {
+            out.push(Attribute {
+                line,
+                inner,
+                tokens: tokens[body_start..next - 1].to_vec(),
+            });
+            cursor = next;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn attribute_calls_lint(attribute: &Attribute, level: &str, lint: &str) -> bool {
+    attribute.tokens.windows(2).enumerate().any(|(idx, pair)| {
+        pair[0].text == level
+            && pair[1].text == "("
+            && attribute.tokens[idx + 2..]
+                .iter()
+                .take_while(|tk| tk.text != ")")
+                .any(|tk| tk.text == lint)
+    })
+}
+
+#[derive(Debug, Default)]
+pub struct LintPosture {
+    pub forbid_unsafe: bool,
+    pub deny_unsafe: bool,
+}
+
+pub fn lint_posture(text: &str) -> LintPosture {
+    let mut posture = LintPosture::default();
+    for attribute in attributes(text)
+        .into_iter()
+        .filter(|attribute| attribute.inner)
+    {
+        posture.forbid_unsafe |= attribute_calls_lint(&attribute, "forbid", "unsafe_code");
+        posture.deny_unsafe |= attribute_calls_lint(&attribute, "deny", "unsafe_code");
+    }
+    posture
+}
+
+#[derive(Debug)]
+pub struct ExportSite {
+    pub line: usize,
+    pub detail: &'static str,
+}
+
+#[derive(Debug)]
+pub struct LocatedExportSite {
+    pub path: String,
+    pub line: usize,
+    pub detail: &'static str,
+}
+
+pub fn source_escape_sites(text: &str) -> Vec<ExportSite> {
+    let tokens = rust_tokens(text);
+    let mut sites = Vec::new();
+    for pair in tokens.windows(2) {
+        if pair[0].text == "include" && pair[1].text == "!" {
+            sites.push(ExportSite {
+                line: pair[0].line,
+                detail: "source inclusion can hide authoritative code",
+            });
+        }
+    }
+    for attribute in attributes(text) {
+        if attribute.tokens.first().is_some_and(|tk| tk.text == "path") {
+            sites.push(ExportSite {
+                line: attribute.line,
+                detail: "path-based module can hide authoritative code",
+            });
+        }
+    }
+    sites.sort_by_key(|site| (site.line, site.detail));
+    sites.dedup_by_key(|site| (site.line, site.detail));
+    sites
+}
+
+/// Conservative scaffold rule for D3 law (b): until a type-aware export classifier exists,
+/// a boundary crate has no externally public Rust or symbol export at all. This is a strict
+/// subset of the final membrane and therefore cannot create an unsafe admission path.
+pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
+    let tokens = rust_tokens(text);
+    let mut sites = source_escape_sites(text);
+    for (idx, tk) in tokens.iter().enumerate() {
+        if tk.text == "pub" && !tokens.get(idx + 1).is_some_and(|next| next.text == "(") {
+            sites.push(ExportSite {
+                line: tk.line,
+                detail: "externally public item",
+            });
+        }
+    }
+    for attribute in attributes(text) {
+        for (name, detail) in [
+            ("macro_export", "exported macro"),
+            ("no_mangle", "unmangled symbol export"),
+            ("export_name", "named symbol export"),
+        ] {
+            if attribute.tokens.iter().any(|tk| tk.text == name) {
+                sites.push(ExportSite {
+                    line: attribute.line,
+                    detail,
+                });
+            }
+        }
+    }
+    sites.sort_by_key(|site| (site.line, site.detail));
+    sites.dedup_by_key(|site| (site.line, site.detail));
+    sites
+}
+
+pub fn scan_external_exports(
+    dir: &Path,
+    rel_prefix: &str,
+    out: &mut Vec<LocatedExportSite>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|error| format!("cannot read directory {rel_prefix}: {error}"))?;
+    let mut entries: Vec<_> = entries
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read directory {rel_prefix}: {error}"))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = format!("{rel_prefix}/{name}");
+        let path = entry.path();
+        if path.is_dir() {
+            scan_external_exports(&path, &rel, out)?;
+        } else if name.ends_with(".rs") {
+            let text =
+                fs::read_to_string(&path).map_err(|error| format!("cannot read {rel}: {error}"))?;
+            out.extend(
+                external_export_sites(&text)
+                    .into_iter()
+                    .map(|site| LocatedExportSite {
+                        path: rel.clone(),
+                        line: site.line,
+                        detail: site.detail,
+                    }),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Recursively scan every `.rs` file under `dir` for allow-sites. `rel_prefix` is the
@@ -115,33 +454,25 @@ pub fn scan_allow_sites(
         } else if name.ends_with(".rs") {
             let text = fs::read_to_string(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
             let lines: Vec<&str> = text.lines().collect();
-            for (i, line) in lines.iter().enumerate() {
-                let code = line.trim_start();
-                if code.starts_with("//") {
-                    // Comments (including doc comments) may mention the attribute
-                    // without declaring a site.
-                    continue;
-                }
-                if !(code.contains("#[allow(unsafe_code)]")
-                    || code.contains("#![allow(unsafe_code)]"))
-                {
-                    continue;
-                }
-                let mut id = marker_id(line);
-                if id.is_none() {
-                    // nearest non-empty line above
-                    for above in lines[..i].iter().rev() {
-                        if above.trim().is_empty() {
-                            continue;
-                        }
-                        id = marker_id(above);
-                        break;
+            for attribute in attributes(&text)
+                .into_iter()
+                .filter(|attribute| attribute_calls_lint(attribute, "allow", "unsafe_code"))
+            {
+                let i = attribute.line.saturating_sub(1);
+                let mut id = None;
+                // The marker must be the nearest preceding non-empty, comment-only line.
+                for above in lines[..i].iter().rev() {
+                    if above.trim().is_empty() {
+                        continue;
                     }
+                    id = marker_id(above);
+                    break;
                 }
                 out.push(AllowSite {
                     path: rel.clone(),
-                    line: i + 1,
+                    line: attribute.line,
                     id,
+                    inner: attribute.inner,
                 });
             }
         }
@@ -182,5 +513,47 @@ mod tests {
             Some("FLN-UL-0042".to_string())
         );
         assert_eq!(marker_id("no marker here"), None);
+        assert_eq!(
+            marker_id("let fake = \"// UNSAFE-LEDGER: FLN-UL-1\";"),
+            None
+        );
+    }
+
+    #[test]
+    fn lexer_ignores_comments_and_strings_but_finds_attribute_variants() {
+        let text = r##"
+/* #![forbid(unsafe_code)] */
+const FAKE: &str = r#"#![forbid(unsafe_code)] #[allow(unsafe_code)]"#;
+#![deny(unsafe_code)]
+#[allow ( unsafe_code, dead_code )]
+fn one() {}
+#[cfg_attr(any(), allow(unsafe_code))]
+fn two() {}
+"##;
+        let posture = lint_posture(text);
+        assert!(!posture.forbid_unsafe);
+        assert!(posture.deny_unsafe);
+        let allows: Vec<_> = attributes(text)
+            .into_iter()
+            .filter(|attribute| attribute_calls_lint(attribute, "allow", "unsafe_code"))
+            .collect();
+        assert_eq!(allows.len(), 2);
+    }
+
+    #[test]
+    fn conservative_export_scan_allows_restricted_visibility_only() {
+        assert!(external_export_sites("pub(crate) fn local() {}\n").is_empty());
+        let sites = external_export_sites(
+            "pub fn outward() {}\n#[unsafe(no_mangle)]\nextern \"C\" fn symbol() {}\n",
+        );
+        assert_eq!(sites.len(), 2);
+        assert_eq!(
+            external_export_sites("include!(\"outside.inc\");\n").len(),
+            1
+        );
+        assert_eq!(
+            external_export_sites("#[path = \"outside.rs\"] mod outside;\n").len(),
+            1
+        );
     }
 }

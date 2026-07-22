@@ -3,6 +3,8 @@
 //! catch, and pass once the defect is repaired. These are the permanent, in-tree form
 //! of "add a test-only violation in CI to prove detection, then remove".
 
+#![forbid(unsafe_code)]
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -83,17 +85,76 @@ const BASE_GRAPH: &str = "\
 schema fln-workspace-graph/1
 crate fln-core       rank=0  kind=ordinary
 crate fln-hash       rank=1  kind=ordinary
+crate fln-bignum     rank=1  kind=ordinary
 crate fln-unsafe-abi rank=2  kind=unsafe-boundary
+crate fln-unsafe-region rank=2 kind=unsafe-boundary
+crate fln-env        rank=4  kind=ordinary
 crate fln-kernel     rank=6  kind=ordinary
+crate fln-checker    rank=6  kind=ordinary
 crate fln-mid        rank=8  kind=ordinary
 crate fln-unsafe-jit rank=12 kind=unsafe-boundary
 prohibit fln-unsafe-* ->* fln-kernel
-allow-direct fln-kernel = fln-core
+prohibit fln-unsafe-* ->* fln-checker
+prohibit fln-kernel ->* fln-checker
+prohibit fln-checker ->* fln-kernel
+prohibit fln-checker ->* fln-olean
+prohibit fln-checker ->* fln-rt
+prohibit fln-checker ->* fln-unsafe-*
+allow-direct fln-kernel = fln-core, fln-hash, fln-bignum, fln-env
+allow-direct fln-checker = fln-core, fln-hash, fln-bignum
 covenant fln-kernel max-loc=100
 suite-dep asupersync
 ";
 
 const EMPTY_LEDGER: &str = "schema fln-unsafe-ledger/1\n";
+
+const TOOLCHAIN_PIN: &str = "[toolchain]\nchannel = \"nightly-2026-07-13\"\n";
+
+const SUITE_LOCK_FIXTURE: &str = "\
+schema fln-suite-lock/1
+rust-nightly nightly-2026-07-13
+target x86_64-unknown-linux-gnu
+suite asupersync commit=e464a484cb65c1a55be0d9c925e6e9c20318edcb path=/dp/asupersync
+crate asupersync repo=asupersync
+reference leanprover/lean4 tag=v4.32.0 commit=8c9756b28d64dab099da31a4c09229a9e6a2ef35
+corpus leanprover-community/mathlib4 tag=v4.32.0 commit=81a5d257c8e410db227a6665ed08f64fea08e997
+";
+
+/// The crates every base fixture materializes (name, is-boundary) — must stay in
+/// lockstep with BASE_GRAPH and base().
+const FIXTURE_CRATES: [(&str, bool); 10] = [
+    ("fln-core", false),
+    ("fln-hash", false),
+    ("fln-bignum", false),
+    ("fln-unsafe-abi", true),
+    ("fln-unsafe-region", true),
+    ("fln-env", false),
+    ("fln-kernel", false),
+    ("fln-checker", false),
+    ("fln-mid", false),
+    ("fln-unsafe-jit", true),
+];
+
+fn fixture_cargo_lock() -> String {
+    let mut lock = String::from("version = 4\n");
+    for (name, _) in FIXTURE_CRATES {
+        lock.push_str(&format!(
+            "\n[[package]]\nname = \"{name}\"\nversion = \"0.0.0\"\n"
+        ));
+    }
+    lock
+}
+
+fn fixture_allowlist() -> String {
+    let mut rows = String::from("schema fln-closure-allowlist/1\n");
+    for (name, boundary) in FIXTURE_CRATES {
+        let audit = if boundary { "deny-ledgered" } else { "forbid" };
+        rows.push_str(&format!(
+            "package {name} version=0.0.0 source=workspace checksum=- license=MIT build-script=no proc-macro=no native-link=no unsafe-audit={audit} policy=runtime owner=fl upgrade=workspace reason=fixture\n"
+        ));
+    }
+    rows
+}
 
 fn manifest(name: &str, deps: &[&str]) -> String {
     let mut m = format!(
@@ -113,18 +174,21 @@ fn lib_rs(boundary: bool) -> &'static str {
     }
 }
 
-/// Baseline clean fixture: six crates matching BASE_GRAPH, no edges.
+/// Baseline clean fixture: ten crates matching BASE_GRAPH, no edges, plus the
+/// closure-governance files (Cargo.lock ⇄ allowlist ⇄ SUITE.lock ⇄ toolchain pin)
+/// the D1 audit requires on every root.
 fn base(ws: &TempWs) {
+    ws.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"3\"\nmembers = [\"crates/*\", \"tools/*\"]\n",
+    );
+    ws.write("rust-toolchain.toml", TOOLCHAIN_PIN);
+    ws.write("SUITE.lock", SUITE_LOCK_FIXTURE);
+    ws.write("Cargo.lock", &fixture_cargo_lock());
+    ws.write("ci/CLOSURE_ALLOWLIST.txt", &fixture_allowlist());
     ws.write("ci/WORKSPACE_GRAPH.txt", BASE_GRAPH);
     ws.write("ci/UNSAFE_LEDGER.txt", EMPTY_LEDGER);
-    for (name, boundary) in [
-        ("fln-core", false),
-        ("fln-hash", false),
-        ("fln-unsafe-abi", true),
-        ("fln-kernel", false),
-        ("fln-mid", false),
-        ("fln-unsafe-jit", true),
-    ] {
+    for (name, boundary) in FIXTURE_CRATES {
         ws.write(&format!("crates/{name}/Cargo.toml"), &manifest(name, &[]));
         ws.write(&format!("crates/{name}/src/lib.rs"), lib_rs(boundary));
     }
@@ -148,7 +212,7 @@ fn clean_fixture_passes() {
     base(&ws);
     let out = ws.run();
     assert!(out.findings.is_empty(), "unexpected: {:?}", out.findings);
-    assert_eq!(out.crate_count, 6);
+    assert_eq!(out.crate_count, 10);
 }
 
 #[test]
@@ -208,7 +272,11 @@ fn undeclared_crate_on_disk_is_flagged() {
 fn declared_crate_missing_on_disk_is_flagged() {
     let ws = TempWs::new("ghost");
     base(&ws);
-    let g = BASE_GRAPH.replace("prohibit", "crate fln-ghost rank=3 kind=ordinary\nprohibit");
+    let g = BASE_GRAPH.replacen(
+        "prohibit",
+        "crate fln-ghost rank=3 kind=ordinary\nprohibit",
+        1,
+    );
     ws.write("ci/WORKSPACE_GRAPH.txt", &g);
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-002"]);
 }
@@ -246,15 +314,15 @@ fn prohibited_transitive_path_is_flagged() {
 fn allow_direct_covenant_is_enforced() {
     let ws = TempWs::new("allow-direct");
     base(&ws);
-    // fln-kernel -> fln-hash is downward and acknowledged, but outside the kernel's
-    // exhaustive direct-dependency allowlist (fln-core only).
+    // fln-kernel -> fln-unsafe-abi is downward and acknowledged, but outside the
+    // kernel's exhaustive direct-dependency allowlist.
     ws.write(
         "crates/fln-kernel/Cargo.toml",
-        &manifest("fln-kernel", &["fln-hash"]),
+        &manifest("fln-kernel", &["fln-unsafe-abi"]),
     );
     ws.write(
         "ci/WORKSPACE_GRAPH.txt",
-        &graph_with_edges(&["fln-kernel -> fln-hash"]),
+        &graph_with_edges(&["fln-kernel -> fln-unsafe-abi"]),
     );
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-009"]);
 }
@@ -312,14 +380,14 @@ fn unledgered_allow_site_is_flagged_and_ledgered_site_passes() {
     base(&ws);
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "//! boundary stub\n#![deny(unsafe_code)]\n\n#[allow(unsafe_code)]\npub fn peek() {}\n",
+        "//! boundary stub\n#![deny(unsafe_code)]\n\n#[allow(unsafe_code)]\nfn peek() {}\n",
     );
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-013"]);
 
     // Recovery: marker + matching ledger row make the same site legal.
     ws.write(
         "crates/fln-unsafe-abi/src/lib.rs",
-        "//! boundary stub\n#![deny(unsafe_code)]\n\n// UNSAFE-LEDGER: FLN-UL-0001\n#[allow(unsafe_code)]\npub fn peek() {}\n",
+        "//! boundary stub\n#![deny(unsafe_code)]\n\n// UNSAFE-LEDGER: FLN-UL-0001\n#[allow(unsafe_code)]\nfn peek() {}\n",
     );
     ws.write(
         "ci/UNSAFE_LEDGER.txt",
@@ -411,4 +479,142 @@ fn missing_reviewed_files_are_setup_failures() {
     let ws = TempWs::new("no-files");
     let root = ws.materialize().expect("materialize retained fixture");
     assert!(checks::run(Path::new(&root)).is_err());
+}
+
+#[test]
+fn root_workspace_membership_is_enforced() {
+    let ws = TempWs::new("root-members");
+    base(&ws);
+    ws.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"3\"\nmembers = [\"crates/*\"]\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-021"]);
+}
+
+#[test]
+fn dependency_path_must_resolve_to_acknowledged_crate() {
+    let ws = TempWs::new("wrong-path");
+    base(&ws);
+    ws.write(
+        "crates/fln-hash/Cargo.toml",
+        "[package]\nname = \"fln-hash\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nfln-core = { path = \"../fln-kernel\" }\n",
+    );
+    ws.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &graph_with_edges(&["fln-hash -> fln-core"]),
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-023"]);
+}
+
+#[test]
+fn comments_and_raw_strings_cannot_spoof_root_lint() {
+    let ws = TempWs::new("lint-spoof");
+    base(&ws);
+    ws.write(
+        "crates/fln-hash/src/lib.rs",
+        "/* #![forbid(unsafe_code)] */\nconst FAKE: &str = r#\"#![forbid(unsafe_code)]\"#;\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-011"]);
+}
+
+#[test]
+fn all_structural_allow_variants_are_ledgered() {
+    let ws = TempWs::new("allow-variants");
+    base(&ws);
+    ws.write(
+        "crates/fln-unsafe-abi/src/lib.rs",
+        "#![deny(unsafe_code)]\n#[allow ( unsafe_code, dead_code )]\nfn one() {}\n#[cfg_attr(any(), allow(unsafe_code))]\nfn two() {}\n",
+    );
+    let out = ws.run();
+    assert_eq!(codes(&out), vec!["FLN-STRUCT-013", "FLN-STRUCT-013"]);
+}
+
+#[test]
+fn inner_unsafe_allow_is_never_narrowly_ledgerable() {
+    let ws = TempWs::new("inner-allow");
+    base(&ws);
+    ws.write(
+        "crates/fln-unsafe-abi/src/lib.rs",
+        "#![deny(unsafe_code)]\n#![allow(unsafe_code)]\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-013"]);
+}
+
+#[test]
+fn unsafe_boundary_exports_fail_closed_until_type_aware_classification() {
+    let ws = TempWs::new("unsafe-export");
+    base(&ws);
+    ws.write(
+        "crates/fln-unsafe-abi/src/lib.rs",
+        "#![deny(unsafe_code)]\npub fn forge<T>() -> T { panic!(\"not executed\") }\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-022"]);
+
+    let local = TempWs::new("restricted-export");
+    base(&local);
+    local.write(
+        "crates/fln-unsafe-abi/src/lib.rs",
+        "#![deny(unsafe_code)]\npub(crate) fn local_only() {}\n",
+    );
+    assert!(local.run().findings.is_empty());
+}
+
+#[test]
+fn constitutional_prohibition_cannot_be_removed() {
+    let ws = TempWs::new("missing-prohibition");
+    base(&ws);
+    ws.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &BASE_GRAPH.replace("prohibit fln-unsafe-* ->* fln-checker\n", ""),
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-024"]);
+}
+
+#[test]
+fn kernel_source_inclusion_cannot_escape_the_loc_covenant() {
+    let ws = TempWs::new("kernel-include");
+    base(&ws);
+    ws.write(
+        "crates/fln-kernel/src/lib.rs",
+        "#![forbid(unsafe_code)]\ninclude!(\"../hidden.inc\");\n",
+    );
+    ws.write("crates/fln-kernel/hidden.inc", "fn hidden() {}\n");
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-015"]);
+}
+
+#[test]
+fn plan_rank_and_trust_allowlist_cannot_be_weakened() {
+    let rank = TempWs::new("rank-change");
+    base(&rank);
+    rank.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &BASE_GRAPH.replace(
+            "crate fln-core       rank=0  kind=ordinary",
+            "crate fln-core       rank=99 kind=ordinary",
+        ),
+    );
+    assert_eq!(codes(&rank.run()), vec!["FLN-STRUCT-024"]);
+
+    let allowlist = TempWs::new("trust-allowlist-change");
+    base(&allowlist);
+    allowlist.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &BASE_GRAPH.replace(
+            "allow-direct fln-kernel = fln-core, fln-hash, fln-bignum, fln-env",
+            "allow-direct fln-kernel = fln-core, fln-hash, fln-bignum",
+        ),
+    );
+    assert_eq!(codes(&allowlist.run()), vec!["FLN-STRUCT-024"]);
+}
+
+#[test]
+fn integration_targets_cannot_bypass_ordinary_unsafe_posture() {
+    let ws = TempWs::new("integration-root-lint");
+    base(&ws);
+    ws.write(
+        "crates/fln-hash/tests/bypass.rs",
+        "fn integration_target_without_posture() {}\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-011"]);
 }

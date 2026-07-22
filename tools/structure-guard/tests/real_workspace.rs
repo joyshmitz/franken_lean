@@ -3,6 +3,8 @@
 //! dependency edge fails this test until `ci/WORKSPACE_GRAPH.txt` is edited in the
 //! same change — that edit is the review surface.
 
+#![forbid(unsafe_code)]
+
 use std::path::Path;
 
 #[test]
