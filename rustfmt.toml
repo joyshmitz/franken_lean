@@ -1,0 +1,6 @@
+# Generated contract modules (crates/fln-rt/src/abi.rs, crates/fln-olean/src/format.rs,
+# rendered by scripts/extract/gen_*_contract.py under Rule D5/D9) carry the
+# `@generated` marker in their first line and must stay byte-identical to their
+# renderer output — the extractors' --check lanes diff them against the pin.
+# rustfmt therefore skips files with the marker.
+format_generated_files = false

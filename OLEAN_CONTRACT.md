@@ -1,0 +1,107 @@
+# OLEAN_CONTRACT.md — the `.olean`/`.ilean` format at the pin
+
+> **@generated** by `scripts/extract/gen_olean_contract.py` (Rule D5/D9, plan Appendix B). DO NOT EDIT.
+> Format constants are derived, never remembered; regenerate with the script.
+>
+> pin: `leanprover/lean4` `v4.32.0` commit `8c9756b28d64dab099da31a4c09229a9e6a2ef35` tree `ba16913719a2f6a15a826918fbe6ba9dd5413e91`
+> inventory: `contracts/olean_inventory.json` sha256 `901a2970a31a945a05bbf5e6f3bcb13fe01016a16930bcd654879403076437f8`
+> rust: `crates/fln-olean/src/format.rs` (rendered from the same inventory)
+>
+> sources:
+> - `vendor/lean4-src/src/library/module.cpp` (632 lines, sha256 `7343bfc1691a72d8550e4159e03f22ba528edb1942963f4cf04bb2bfda0b9469`)
+> - `vendor/lean4-src/src/runtime/compact.cpp` (736 lines, sha256 `490928b63b781f43956463bc418e3ab1cd218a4f438b72320a463f8dd12cde2c`)
+> - `vendor/lean4-src/src/runtime/compact.h` (145 lines, sha256 `89c7868a99e9f494313a5ce6286cf41194e60fea0e0c7178947a0f8ad3673ab6`)
+> - `vendor/lean4-src/src/Lean/Environment.lean` (2835 lines, sha256 `100b207523d1005ae87f62f4e1693806854a35c59cd9b3210dfeeaa875d0ff98`)
+> - `vendor/lean4-src/src/Lean/Setup.lean` (204 lines, sha256 `7f085003e696df5c29af1dc1342ef3dfaaca70b6eaa5d357ce832abd49e9554c`)
+> - `vendor/lean4-src/src/Lean/Server/References.lean` (858 lines, sha256 `b7022ed1a659d5181735d9ef0cd2f13cc2e3f96b11f5ece3e6e5defe8363ee88`)
+
+## 1. The fixed header
+
+Magic `"olean"`; fixed size **88 bytes** on LP64
+(`size_t` = 8; offsets computed under that law and verified
+against the pin's packing `static_assert`). Struct at `vendor/lean4-src/src/library/module.cpp:107`.
+
+| offset | size | field | C type | provenance |
+|---|---|---|---|---|
+| 0 | 5 | `marker` | `char[5]` | `vendor/lean4-src/src/library/module.cpp:109` |
+| 5 | 1 | `version` | `uint8_t` | `vendor/lean4-src/src/library/module.cpp:113` |
+| 6 | 1 | `flags` | `uint8_t` | `vendor/lean4-src/src/library/module.cpp:117` |
+| 7 | 33 | `lean_version` | `char[33]` | `vendor/lean4-src/src/library/module.cpp:127` |
+| 40 | 40 | `githash` | `char[40]` | `vendor/lean4-src/src/library/module.cpp:130` |
+| 80 | 8 | `base_addr` | `size_t` | `vendor/lean4-src/src/library/module.cpp:132` |
+| 88 | flexible | `data` | `size_t[]` | `vendor/lean4-src/src/library/module.cpp:141` |
+
+Accepted versions: **2, 3**
+(`vendor/lean4-src/src/library/module.cpp:492`). v2 is the default format:
+compacted data begins immediately at the end of the fixed header. v3
+(`CompactedRegion.save (allowClosures := true)`) appends length-prefixed
+sections after the header: `size_t data_size`, the compacted data, a
+`uint32 num_closure_offsets` + `uint64` array of data-relative closure
+`m_fun` offsets, and a `uint32 num_libs` relocation table of
+`(size_t base_addr, uint32 id_len, char id[id_len])` rows (documented in the
+header comment block itself). `flags` bit 0 records whether persisted bignums
+use the GMP encoding; bits 1–7 are reserved.
+
+Region payload and base address are aligned to **65536**
+bytes (`vendor/lean4-src/src/library/module.cpp:273`). The file is mmapped at
+`base_addr` when possible; every interior pointer was rewritten at save time to
+`buffer_offset + base_addr`, so the mmap fast path needs no fixup at all, and
+the fallback walk relocates pointer-by-pointer.
+
+## 2. The compacted object graph
+
+There is no field-by-field serializer: the Lean object graph **is** the wire
+format. The compactor copies objects into a contiguous buffer (8-byte aligned,
+zero-initialized), dedups by pointer identity and structural sharing, stores
+the root as the first word of the data region, and rejects external objects.
+Mechanically-found anchors into the pinned implementation:
+
+| anchor | role |
+|---|---|
+| `vendor/lean4-src/src/library/module.cpp:273` (`const size_t ALIGN = `) | region payload/base alignment |
+| `vendor/lean4-src/src/runtime/compact.cpp:257` (`void object_compactor::insert_string`) | string layout: header + inline UTF-8, no interior pointers |
+| `vendor/lean4-src/src/runtime/compact.cpp:407` (`void object_compactor::insert_mpz`) | bignum layout: limbs copied after the mpz object; one interior pointer rewritten |
+| `vendor/lean4-src/src/runtime/compact.cpp:368` (`bool object_compactor::insert_closure`) | closure layout (v3 only): m_fun offsets recorded for the trailer relocation table |
+| `vendor/lean4-src/src/runtime/compact.cpp:566` (`object * region_reader::fix_object_ptr`) | load-side pointer fixup: address mapped back to buffer by base-address search |
+| `vendor/lean4-src/src/runtime/compact.cpp:663` (`object * region_reader::read()`) | load walk: mmap-at-base fast path, else sequential object walk with fixups |
+| `vendor/lean4-src/src/runtime/compact.h:40` (`class LEAN_EXPORT object_compactor {`) | save-side compactor state |
+| `vendor/lean4-src/src/runtime/compact.h:103` (`class LEAN_EXPORT region_reader {`) | load-side reader state |
+
+## 3. Lean-side module structures
+
+### `structure ModuleData` — `vendor/lean4-src/src/Lean/Environment.lean:109`
+
+| # | field | type | default | line |
+|---|---|---|---|---|
+| 0 | `isModule` | `Bool` | — | 111 |
+| 1 | `imports` | `Array Import` | — | 112 |
+| 2 | `constNames` | `Array Name` | — | 119 |
+| 3 | `constants` | `Array ConstantInfo` | — | 120 |
+| 4 | `extraConstNames` | `Array Name` | — | 126 |
+| 5 | `entries` | `Array (Name × Array EnvExtensionEntry)` | — | 127 |
+
+### `structure Import` — `vendor/lean4-src/src/Lean/Setup.lean:25`
+
+| # | field | type | default | line |
+|---|---|---|---|---|
+| 0 | `module` | `Name` | — | 26 |
+| 1 | `importAll` | `Bool` | `false` | 28 |
+| 2 | `isExported` | `Bool` | `true` | 30 |
+| 3 | `isMeta` | `Bool` | `false` | 32 |
+
+### `structure Ilean` — `vendor/lean4-src/src/Lean/Server/References.lean:206`
+
+| # | field | type | default | line |
+|---|---|---|---|---|
+| 0 | `version` | `Nat` | `5` | 208 |
+| 1 | `module` | `Name` | — | 210 |
+| 2 | `directImports` | `Array Lsp.ImportInfo` | — | 212 |
+| 3 | `references` | `Lsp.ModuleRefs` | — | 214 |
+| 4 | `decls` | `Lsp.Decls` | — | 216 |
+
+`.ilean` is a JSON document (`FromJson`/`ToJson`), format version
+**5**. `EnvExtensionEntry` payloads are opaque by
+construction — each extension defines its own encoding via `exportEntriesFn`;
+Grimoire preserves unknown payloads losslessly and never guesses (bead
+franken_lean-y24 consumes this contract).
+

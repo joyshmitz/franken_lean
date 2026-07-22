@@ -1,0 +1,271 @@
+{
+ "compactor_anchors": [
+  {
+   "line": 273,
+   "path": "vendor/lean4-src/src/library/module.cpp",
+   "role": "region payload/base alignment",
+   "symbol": "const size_t ALIGN = "
+  },
+  {
+   "line": 257,
+   "path": "vendor/lean4-src/src/runtime/compact.cpp",
+   "role": "string layout: header + inline UTF-8, no interior pointers",
+   "symbol": "void object_compactor::insert_string"
+  },
+  {
+   "line": 407,
+   "path": "vendor/lean4-src/src/runtime/compact.cpp",
+   "role": "bignum layout: limbs copied after the mpz object; one interior pointer rewritten",
+   "symbol": "void object_compactor::insert_mpz"
+  },
+  {
+   "line": 368,
+   "path": "vendor/lean4-src/src/runtime/compact.cpp",
+   "role": "closure layout (v3 only): m_fun offsets recorded for the trailer relocation table",
+   "symbol": "bool object_compactor::insert_closure"
+  },
+  {
+   "line": 566,
+   "path": "vendor/lean4-src/src/runtime/compact.cpp",
+   "role": "load-side pointer fixup: address mapped back to buffer by base-address search",
+   "symbol": "object * region_reader::fix_object_ptr"
+  },
+  {
+   "line": 663,
+   "path": "vendor/lean4-src/src/runtime/compact.cpp",
+   "role": "load walk: mmap-at-base fast path, else sequential object walk with fixups",
+   "symbol": "object * region_reader::read()"
+  },
+  {
+   "line": 40,
+   "path": "vendor/lean4-src/src/runtime/compact.h",
+   "role": "save-side compactor state",
+   "symbol": "class LEAN_EXPORT object_compactor {"
+  },
+  {
+   "line": 103,
+   "path": "vendor/lean4-src/src/runtime/compact.h",
+   "role": "load-side reader state",
+   "symbol": "class LEAN_EXPORT region_reader {"
+  }
+ ],
+ "header": {
+  "fields": [
+   {
+    "c_type": "char[5]",
+    "line": 109,
+    "name": "marker",
+    "offset": 0,
+    "size": 5
+   },
+   {
+    "c_type": "uint8_t",
+    "line": 113,
+    "name": "version",
+    "offset": 5,
+    "size": 1
+   },
+   {
+    "c_type": "uint8_t",
+    "line": 117,
+    "name": "flags",
+    "offset": 6,
+    "size": 1
+   },
+   {
+    "c_type": "char[33]",
+    "line": 127,
+    "name": "lean_version",
+    "offset": 7,
+    "size": 33
+   },
+   {
+    "c_type": "char[40]",
+    "line": 130,
+    "name": "githash",
+    "offset": 40,
+    "size": 40
+   },
+   {
+    "c_type": "size_t",
+    "line": 132,
+    "name": "base_addr",
+    "offset": 80,
+    "size": 8
+   },
+   {
+    "c_type": "size_t[]",
+    "line": 141,
+    "name": "data",
+    "offset": 88,
+    "size": 0
+   }
+  ],
+  "line": 107,
+  "magic": "olean",
+  "size": 88
+ },
+ "ilean": {
+  "fields": [
+   {
+    "default": "5",
+    "lean_type": "Nat",
+    "line": 208,
+    "name": "version"
+   },
+   {
+    "default": null,
+    "lean_type": "Name",
+    "line": 210,
+    "name": "module"
+   },
+   {
+    "default": null,
+    "lean_type": "Array Lsp.ImportInfo",
+    "line": 212,
+    "name": "directImports"
+   },
+   {
+    "default": null,
+    "lean_type": "Lsp.ModuleRefs",
+    "line": 214,
+    "name": "references"
+   },
+   {
+    "default": null,
+    "lean_type": "Lsp.Decls",
+    "line": 216,
+    "name": "decls"
+   }
+  ],
+  "line": 206,
+  "name": "Ilean",
+  "path": "vendor/lean4-src/src/Lean/Server/References.lean"
+ },
+ "ilean_version": 5,
+ "import_": {
+  "fields": [
+   {
+    "default": null,
+    "lean_type": "Name",
+    "line": 26,
+    "name": "module"
+   },
+   {
+    "default": "false",
+    "lean_type": "Bool",
+    "line": 28,
+    "name": "importAll"
+   },
+   {
+    "default": "true",
+    "lean_type": "Bool",
+    "line": 30,
+    "name": "isExported"
+   },
+   {
+    "default": "false",
+    "lean_type": "Bool",
+    "line": 32,
+    "name": "isMeta"
+   }
+  ],
+  "line": 25,
+  "name": "Import",
+  "path": "vendor/lean4-src/src/Lean/Setup.lean"
+ },
+ "module_data": {
+  "fields": [
+   {
+    "default": null,
+    "lean_type": "Bool",
+    "line": 111,
+    "name": "isModule"
+   },
+   {
+    "default": null,
+    "lean_type": "Array Import",
+    "line": 112,
+    "name": "imports"
+   },
+   {
+    "default": null,
+    "lean_type": "Array Name",
+    "line": 119,
+    "name": "constNames"
+   },
+   {
+    "default": null,
+    "lean_type": "Array ConstantInfo",
+    "line": 120,
+    "name": "constants"
+   },
+   {
+    "default": null,
+    "lean_type": "Array Name",
+    "line": 126,
+    "name": "extraConstNames"
+   },
+   {
+    "default": null,
+    "lean_type": "Array (Name \u00d7 Array EnvExtensionEntry)",
+    "line": 127,
+    "name": "entries"
+   }
+  ],
+  "line": 109,
+  "name": "ModuleData",
+  "path": "vendor/lean4-src/src/Lean/Environment.lean"
+ },
+ "pin": {
+  "commit": "8c9756b28d64dab099da31a4c09229a9e6a2ef35",
+  "repo": "leanprover/lean4",
+  "tag": "v4.32.0",
+  "tree": "ba16913719a2f6a15a826918fbe6ba9dd5413e91"
+ },
+ "region_align": {
+  "line": 273,
+  "value": 65536
+ },
+ "schema": "fln-olean-contract/1",
+ "sizeof_size_t": 8,
+ "sources": [
+  {
+   "lines": 632,
+   "path": "vendor/lean4-src/src/library/module.cpp",
+   "sha256": "7343bfc1691a72d8550e4159e03f22ba528edb1942963f4cf04bb2bfda0b9469"
+  },
+  {
+   "lines": 736,
+   "path": "vendor/lean4-src/src/runtime/compact.cpp",
+   "sha256": "490928b63b781f43956463bc418e3ab1cd218a4f438b72320a463f8dd12cde2c"
+  },
+  {
+   "lines": 145,
+   "path": "vendor/lean4-src/src/runtime/compact.h",
+   "sha256": "89c7868a99e9f494313a5ce6286cf41194e60fea0e0c7178947a0f8ad3673ab6"
+  },
+  {
+   "lines": 2835,
+   "path": "vendor/lean4-src/src/Lean/Environment.lean",
+   "sha256": "100b207523d1005ae87f62f4e1693806854a35c59cd9b3210dfeeaa875d0ff98"
+  },
+  {
+   "lines": 204,
+   "path": "vendor/lean4-src/src/Lean/Setup.lean",
+   "sha256": "7f085003e696df5c29af1dc1342ef3dfaaca70b6eaa5d357ce832abd49e9554c"
+  },
+  {
+   "lines": 858,
+   "path": "vendor/lean4-src/src/Lean/Server/References.lean",
+   "sha256": "b7022ed1a659d5181735d9ef0cd2f13cc2e3f96b11f5ece3e6e5defe8363ee88"
+  }
+ ],
+ "versions": {
+  "acceptance_line": 492,
+  "accepted": [
+   2,
+   3
+  ]
+ }
+}
