@@ -70,6 +70,10 @@ version = "0.0.0"
 [[package]]
 name = "fln-kernel"
 version = "0.0.0"
+dependencies = [
+ "fln-core",
+ "fln-env",
+]
 
 [[package]]
 name = "fln-lake"
