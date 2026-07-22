@@ -25,6 +25,11 @@ row meta-api | mixHash | function | native | L2 | faithful | pinned-source | exa
 row meta-api | Lean.Expr.mkData | function | native | L0 | faithful | pinned-source | exact | , | D0 | TARGETED | inventory-v4.32.0
 row meta-api | Lean.FileMap.toPosition | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/pos.rs | D0 | OBSERVED | unit-suite-v4.32.0
 
+# ---- kernel: judgment rules (symbols are KERNEL_CONTRACT.md rule ids; the linkage
+# ---- is CI-checked by fln-conformance tests/kernel_contract.rs) -----------------------
+row kernel | KR-500 | judgment-rule | native | L2 | faithful | pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | core-observables-v4.32.0
+row kernel | KR-501 | judgment-rule | native | L2 | faithful | pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | core-observables-v4.32.0
+
 # ---- cli: recognized inventory only (no native binaries exist yet) --------------------
 row cli | lean --version | flag | pending | L0 | faithful | pinned-binary | exact | , | D1 | TARGETED | inventory-v4.32.0
 row cli | lean --run | flag | pending | L0 | faithful | pinned-binary | exact | , | D1 | TARGETED | inventory-v4.32.0
