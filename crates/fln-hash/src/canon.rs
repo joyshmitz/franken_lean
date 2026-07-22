@@ -241,17 +241,14 @@ impl Canonical for Name {
 
     fn write_body(&self, w: &mut CanonWriter) {
         // Components root-to-leaf so decoding is a single forward fold.
-        fn components(name: &Name, out: &mut Vec<Name>) {
-            if name.is_anonymous() {
-                return;
-            }
-            components(&name.parent(), out);
-            out.push(name.clone());
-        }
         let mut chain = Vec::new();
-        components(self, &mut chain);
+        let mut cursor = self.clone();
+        while !cursor.is_anonymous() {
+            chain.push(cursor.clone());
+            cursor = cursor.parent();
+        }
         w.u64(chain.len() as u64);
-        for link in chain {
+        for link in chain.iter().rev() {
             match link.leaf() {
                 NameLeaf::Str(s) => {
                     w.u8(NAME_STR);
@@ -327,29 +324,32 @@ impl Canonical for Level {
 
     fn write_body(&self, w: &mut CanonWriter) {
         use fln_core::level::LevelView;
-        match self.view() {
-            LevelView::Zero => w.u8(LEVEL_ZERO),
-            LevelView::Succ(inner) => {
-                w.u8(LEVEL_SUCC);
-                inner.write_body(w);
-            }
-            LevelView::Max(a, b) => {
-                w.u8(LEVEL_MAX);
-                a.write_body(w);
-                b.write_body(w);
-            }
-            LevelView::IMax(a, b) => {
-                w.u8(LEVEL_IMAX);
-                a.write_body(w);
-                b.write_body(w);
-            }
-            LevelView::Param(name) => {
-                w.u8(LEVEL_PARAM);
-                name.write_body(w);
-            }
-            LevelView::MVar(id) => {
-                w.u8(LEVEL_MVAR);
-                id.0.write_body(w);
+        let mut pending = vec![self];
+        while let Some(level) = pending.pop() {
+            match level.view() {
+                LevelView::Zero => w.u8(LEVEL_ZERO),
+                LevelView::Succ(inner) => {
+                    w.u8(LEVEL_SUCC);
+                    pending.push(inner);
+                }
+                LevelView::Max(a, b) => {
+                    w.u8(LEVEL_MAX);
+                    pending.push(b);
+                    pending.push(a);
+                }
+                LevelView::IMax(a, b) => {
+                    w.u8(LEVEL_IMAX);
+                    pending.push(b);
+                    pending.push(a);
+                }
+                LevelView::Param(name) => {
+                    w.u8(LEVEL_PARAM);
+                    name.write_body(w);
+                }
+                LevelView::MVar(id) => {
+                    w.u8(LEVEL_MVAR);
+                    id.0.write_body(w);
+                }
             }
         }
     }
@@ -530,101 +530,119 @@ impl Canonical for Expr {
     const SCHEMA: SchemaId = SCHEMA_EXPR;
 
     fn write_body(&self, w: &mut CanonWriter) {
-        match self.node() {
-            ExprNode::BVar { idx } => {
-                w.u8(EXPR_BVAR);
-                w.u32(*idx);
-            }
-            ExprNode::FVar { id } => {
-                w.u8(EXPR_FVAR);
-                id.0.write_body(w);
-            }
-            ExprNode::MVar { id } => {
-                w.u8(EXPR_MVAR);
-                id.0.write_body(w);
-            }
-            ExprNode::Sort { level } => {
-                w.u8(EXPR_SORT);
-                level.write_body(w);
-            }
-            ExprNode::Const { name, levels } => {
-                w.u8(EXPR_CONST);
-                name.write_body(w);
-                w.u64(levels.len() as u64);
-                for level in levels {
+        enum WriteTask<'a> {
+            Expr(&'a Expr),
+            BinderInfo(BinderInfo),
+            NonDep(bool),
+        }
+
+        let mut pending = vec![WriteTask::Expr(self)];
+        while let Some(task) = pending.pop() {
+            let WriteTask::Expr(expr) = task else {
+                match task {
+                    WriteTask::BinderInfo(info) => w.u8(binder_info_tag(info)),
+                    WriteTask::NonDep(value) => w.bool(value),
+                    WriteTask::Expr(_) => unreachable!("matched above"),
+                }
+                continue;
+            };
+
+            match expr.node() {
+                ExprNode::BVar { idx } => {
+                    w.u8(EXPR_BVAR);
+                    w.u32(*idx);
+                }
+                ExprNode::FVar { id } => {
+                    w.u8(EXPR_FVAR);
+                    id.0.write_body(w);
+                }
+                ExprNode::MVar { id } => {
+                    w.u8(EXPR_MVAR);
+                    id.0.write_body(w);
+                }
+                ExprNode::Sort { level } => {
+                    w.u8(EXPR_SORT);
                     level.write_body(w);
                 }
-            }
-            ExprNode::App { f, a } => {
-                w.u8(EXPR_APP);
-                f.write_body(w);
-                a.write_body(w);
-            }
-            ExprNode::Lam {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => {
-                w.u8(EXPR_LAM);
-                binder_name.write_body(w);
-                binder_type.write_body(w);
-                body.write_body(w);
-                w.u8(binder_info_tag(*binder_info));
-            }
-            ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => {
-                w.u8(EXPR_FORALL);
-                binder_name.write_body(w);
-                binder_type.write_body(w);
-                body.write_body(w);
-                w.u8(binder_info_tag(*binder_info));
-            }
-            ExprNode::LetE {
-                decl_name,
-                type_,
-                value,
-                body,
-                non_dep,
-            } => {
-                w.u8(EXPR_LET);
-                decl_name.write_body(w);
-                type_.write_body(w);
-                value.write_body(w);
-                body.write_body(w);
-                w.bool(*non_dep);
-            }
-            ExprNode::Lit { literal } => match literal {
-                Literal::Nat(n) => {
-                    w.u8(EXPR_LIT_NAT);
-                    w.u64(n.limbs_le().len() as u64);
-                    for limb in n.limbs_le() {
-                        w.u64(*limb);
+                ExprNode::Const { name, levels } => {
+                    w.u8(EXPR_CONST);
+                    name.write_body(w);
+                    w.u64(levels.len() as u64);
+                    for level in levels {
+                        level.write_body(w);
                     }
                 }
-                Literal::Str(s) => {
-                    w.u8(EXPR_LIT_STR);
-                    w.str(s);
+                ExprNode::App { f, a } => {
+                    w.u8(EXPR_APP);
+                    pending.push(WriteTask::Expr(a));
+                    pending.push(WriteTask::Expr(f));
                 }
-            },
-            ExprNode::MData { data, expr } => {
-                w.u8(EXPR_MDATA);
-                data.write_body(w);
-                expr.write_body(w);
-            }
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => {
-                w.u8(EXPR_PROJ);
-                struct_name.write_body(w);
-                w.u64(*idx);
-                expr.write_body(w);
+                ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => {
+                    w.u8(EXPR_LAM);
+                    binder_name.write_body(w);
+                    pending.push(WriteTask::BinderInfo(*binder_info));
+                    pending.push(WriteTask::Expr(body));
+                    pending.push(WriteTask::Expr(binder_type));
+                }
+                ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => {
+                    w.u8(EXPR_FORALL);
+                    binder_name.write_body(w);
+                    pending.push(WriteTask::BinderInfo(*binder_info));
+                    pending.push(WriteTask::Expr(body));
+                    pending.push(WriteTask::Expr(binder_type));
+                }
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value,
+                    body,
+                    non_dep,
+                } => {
+                    w.u8(EXPR_LET);
+                    decl_name.write_body(w);
+                    pending.push(WriteTask::NonDep(*non_dep));
+                    pending.push(WriteTask::Expr(body));
+                    pending.push(WriteTask::Expr(value));
+                    pending.push(WriteTask::Expr(type_));
+                }
+                ExprNode::Lit { literal } => match literal {
+                    Literal::Nat(n) => {
+                        w.u8(EXPR_LIT_NAT);
+                        w.u64(n.limbs_le().len() as u64);
+                        for limb in n.limbs_le() {
+                            w.u64(*limb);
+                        }
+                    }
+                    Literal::Str(s) => {
+                        w.u8(EXPR_LIT_STR);
+                        w.str(s);
+                    }
+                },
+                ExprNode::MData { data, expr } => {
+                    w.u8(EXPR_MDATA);
+                    data.write_body(w);
+                    pending.push(WriteTask::Expr(expr));
+                }
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => {
+                    w.u8(EXPR_PROJ);
+                    struct_name.write_body(w);
+                    w.u64(*idx);
+                    pending.push(WriteTask::Expr(expr));
+                }
             }
         }
     }
@@ -1058,6 +1076,56 @@ mod tests {
     use super::*;
     use fln_core::level::Level;
 
+    // Test-only mutations used by the no-mock E2E lane. They deliberately restore
+    // the exact bug class: syntax-depth recursion on a bounded worker stack. The
+    // parent process must observe their fatal exit instead of accepting them.
+    fn recursive_level_encoder_mutant(level: &Level, w: &mut CanonWriter) {
+        use fln_core::level::LevelView;
+        match level.view() {
+            LevelView::Zero => w.u8(LEVEL_ZERO),
+            LevelView::Succ(inner) => {
+                w.u8(LEVEL_SUCC);
+                recursive_level_encoder_mutant(inner, w);
+                std::hint::black_box(w.buf.len());
+            }
+            _ => panic!("the level mutation probe expects a Succ chain"),
+        }
+    }
+
+    fn recursive_expr_encoder_mutant(expr: &Expr, w: &mut CanonWriter) {
+        match expr.node() {
+            ExprNode::BVar { idx } => {
+                w.u8(EXPR_BVAR);
+                w.u32(*idx);
+            }
+            ExprNode::App { f, a } => {
+                w.u8(EXPR_APP);
+                recursive_expr_encoder_mutant(f, w);
+                recursive_expr_encoder_mutant(a, w);
+                std::hint::black_box(w.buf.len());
+            }
+            _ => panic!("the expression mutation probe expects an App chain"),
+        }
+    }
+
+    fn drop_pair_concurrently<T: Send + 'static>(left: T, right: T) {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let spawn = |value, barrier: std::sync::Arc<std::sync::Barrier>| {
+            std::thread::Builder::new()
+                .stack_size(1024 * 1024)
+                .spawn(move || {
+                    barrier.wait();
+                    drop(value);
+                })
+                .expect("spawn concurrent dropper")
+        };
+        let left_thread = spawn(left, barrier.clone());
+        let right_thread = spawn(right, barrier.clone());
+        barrier.wait();
+        left_thread.join().expect("left dropper completes");
+        right_thread.join().expect("right dropper completes");
+    }
+
     /// Deterministic value generator (LCG — no external randomness, D1).
     struct Gen(u64);
 
@@ -1174,6 +1242,59 @@ mod tests {
             let back = Expr::from_canonical_bytes(&bytes).expect("round-trip");
             assert_eq!(back, expr);
             assert_eq!(back.data(), expr.data(), "observables survive the trip");
+        }
+    }
+
+    #[test]
+    fn iterative_encoders_cover_every_level_and_expr_constructor() {
+        let n = Name::str(Name::anonymous(), "n");
+        let zero = Level::zero();
+        let param = Level::param(n.clone());
+        let mvar_level = Level::mvar(LMVarId(n.clone()));
+        let levels = vec![
+            zero.clone(),
+            zero.clone().succ().expect("packs"),
+            Level::max(param.clone(), zero.clone()).expect("packs"),
+            Level::imax(mvar_level.clone(), param.clone()).expect("packs"),
+            param.clone(),
+            mvar_level.clone(),
+        ];
+        for level in levels {
+            let bytes = level.to_canonical_bytes();
+            let decoded = Level::from_canonical_bytes(&bytes).expect("level round-trip");
+            assert_eq!(decoded.to_canonical_bytes(), bytes);
+        }
+
+        let leaf = Expr::bvar(0).expect("small");
+        let mut metadata = KVMap::new();
+        metadata.insert(n.clone(), DataValue::OfBool(true));
+        let mut expressions = vec![
+            leaf.clone(),
+            Expr::fvar(FVarId(n.clone())),
+            Expr::mvar(MVarId(n.clone())),
+            Expr::sort(param.clone()),
+            Expr::const_(n.clone(), vec![param.clone(), mvar_level]),
+            Expr::app(leaf.clone(), leaf.clone()),
+            Expr::let_e(n.clone(), leaf.clone(), leaf.clone(), leaf.clone(), true),
+            Expr::lit(Literal::Nat(NatLit::from_limbs_le(vec![1, 2]))),
+            Expr::lit(Literal::Str("value".to_string())),
+            Expr::mdata(metadata, leaf.clone()),
+            Expr::proj(n.clone(), 3, leaf.clone()),
+        ];
+        for info in [
+            BinderInfo::Default,
+            BinderInfo::Implicit,
+            BinderInfo::StrictImplicit,
+            BinderInfo::InstImplicit,
+        ] {
+            expressions.push(Expr::lam(n.clone(), leaf.clone(), leaf.clone(), info));
+            expressions.push(Expr::forall_e(n.clone(), leaf.clone(), leaf.clone(), info));
+        }
+        for expr in expressions {
+            let bytes = expr.to_canonical_bytes();
+            let decoded = Expr::from_canonical_bytes(&bytes).expect("expr round-trip");
+            assert_eq!(decoded.to_canonical_bytes(), bytes);
+            assert_eq!(decoded.data(), expr.data());
         }
     }
 
@@ -1295,5 +1416,176 @@ mod tests {
             outcome.is_ok(),
             "decoding deep hostile input aborted the thread (stack overflow) instead of erroring"
         );
+    }
+
+    /// franken_lean-canon-stack-safe-drop-6gy: exercise valid deep decode,
+    /// byte-identical re-encoding, shared-root release, and partial-error cleanup
+    /// in a sacrificial process whose worker has a 1 MiB stack.  The outer test
+    /// remains alive if a recursive mutation aborts the child.
+    #[test]
+    fn deep_valid_lifecycle_is_stack_safe_in_subprocess() {
+        const CHILD: &str = "FLN_CANON_LIFECYCLE_CHILD";
+        const DEPTH: &str = "FLN_CANON_LIFECYCLE_DEPTH";
+        const RUNS: &str = "FLN_CANON_LIFECYCLE_RUNS";
+        const ITERATION: &str = "FLN_CANON_LIFECYCLE_ITERATION";
+        const MUTANT: &str = "FLN_CANON_LIFECYCLE_MUTANT";
+        const NAME_DEPTH: &str = "FLN_CANON_LIFECYCLE_NAME_DEPTH";
+
+        if std::env::var_os(CHILD).is_some() {
+            let depth = std::env::var(DEPTH)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(100_000);
+            let iteration = std::env::var(ITERATION).unwrap_or_else(|_| "0".to_string());
+            let mutant = std::env::var(MUTANT).ok();
+            let name_depth = std::env::var(NAME_DEPTH)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(depth.min(100_000));
+            let outcome = std::thread::Builder::new()
+                .name("canon-lifecycle-probe".to_string())
+                .stack_size(1024 * 1024)
+                .spawn(move || {
+                    let mut level = Level::zero();
+                    for _ in 0..depth {
+                        level = level.succ().expect("depth is below the level covenant");
+                    }
+                    if mutant.as_deref() == Some("recursive-level-encoder") {
+                        recursive_level_encoder_mutant(&level, &mut CanonWriter::new());
+                        panic!("recursive Level encoder mutation unexpectedly survived");
+                    }
+                    let level_bytes = level.to_canonical_bytes();
+                    let decoded_level = Level::from_canonical_bytes(&level_bytes)
+                        .expect("deep valid level decodes");
+                    assert_eq!(decoded_level.to_canonical_bytes(), level_bytes);
+
+                    let level_clone = decoded_level.clone();
+                    drop_pair_concurrently(decoded_level, level_clone);
+
+                    let leaf = Expr::bvar(0).expect("small bvar");
+                    let mut expr = leaf.clone();
+                    for _ in 0..depth {
+                        expr = Expr::app(expr, leaf.clone());
+                    }
+                    if mutant.as_deref() == Some("recursive-expr-encoder") {
+                        recursive_expr_encoder_mutant(&expr, &mut CanonWriter::new());
+                        panic!("recursive Expr encoder mutation unexpectedly survived");
+                    }
+                    let expr_bytes = expr.to_canonical_bytes();
+                    let decoded_expr = Expr::from_canonical_bytes(&expr_bytes)
+                        .expect("deep valid expression decodes");
+                    assert_eq!(decoded_expr.to_canonical_bytes(), expr_bytes);
+
+                    let expr_clone = decoded_expr.clone();
+                    drop_pair_concurrently(decoded_expr, expr_clone);
+
+                    // Deep names are recursive payloads of multiple Expr/Level
+                    // constructors. Their encoding and final Arc release must not
+                    // punch a hidden recursive hole through the outer lifecycle.
+                    let mut deep_name = Name::anonymous();
+                    for _ in 0..name_depth {
+                        deep_name = Name::str(deep_name, "n");
+                    }
+                    let name_bytes = deep_name.to_canonical_bytes();
+                    let decoded_name = Name::from_canonical_bytes(&name_bytes)
+                        .expect("deep valid name decodes");
+                    assert_eq!(decoded_name.to_canonical_bytes(), name_bytes);
+                    let named_expr = Expr::const_(deep_name.clone(), Vec::new());
+                    let named_expr_bytes = named_expr.to_canonical_bytes();
+                    assert_eq!(
+                        Expr::from_canonical_bytes(&named_expr_bytes)
+                            .expect("deep name in Expr decodes")
+                            .to_canonical_bytes(),
+                        named_expr_bytes
+                    );
+                    let named_level = Level::param(deep_name.clone());
+                    let named_level_bytes = named_level.to_canonical_bytes();
+                    assert_eq!(
+                        Level::from_canonical_bytes(&named_level_bytes)
+                            .expect("deep name in Level decodes")
+                            .to_canonical_bytes(),
+                        named_level_bytes
+                    );
+                    drop(named_expr);
+                    drop(named_level);
+                    let decoded_name_clone = decoded_name.clone();
+                    drop_pair_concurrently(decoded_name, decoded_name_clone);
+                    drop(deep_name);
+
+                    // A later missing child must clean up the already-built deep
+                    // first child without recursively unwinding its Arc chain.
+                    let mut partial_level = CanonWriter::new();
+                    partial_level.schema(SCHEMA_LEVEL);
+                    partial_level.u8(LEVEL_MAX);
+                    level.write_body(&mut partial_level);
+                    assert_eq!(
+                        Level::from_canonical_bytes(&partial_level.into_bytes())
+                            .expect_err("second Max child is absent")
+                            .what,
+                        "input truncated"
+                    );
+
+                    let mut partial_expr = CanonWriter::new();
+                    partial_expr.schema(SCHEMA_EXPR);
+                    partial_expr.u8(EXPR_APP);
+                    expr.write_body(&mut partial_expr);
+                    assert_eq!(
+                        Expr::from_canonical_bytes(&partial_expr.into_bytes())
+                            .expect_err("second App child is absent")
+                            .what,
+                        "input truncated"
+                    );
+
+                    let level_hash = crate::domain::hash(
+                        crate::domain::Domain::Fixture,
+                        &level_bytes,
+                    );
+                    let expr_hash =
+                        crate::domain::hash(crate::domain::Domain::Fixture, &expr_bytes);
+                    drop(expr);
+                    drop(level);
+                    drop(leaf);
+
+                    // Recovery after both partial failures uses the same real codec.
+                    let recovery = Expr::bvar(7).expect("small").to_canonical_bytes();
+                    Expr::from_canonical_bytes(&recovery).expect("shallow recovery decode");
+
+                    println!(
+                        "{{\"schema\":\"fln.e2e.canon-lifecycle\",\"version\":1,\"bead\":\"franken_lean-canon-stack-safe-drop-6gy\",\"invariant\":\"FL-INV-07\",\"scenario\":\"deep-valid-lifecycle\",\"iteration\":{iteration},\"depth\":{depth},\"name_depth\":{name_depth},\"stack_bytes\":1048576,\"level_bytes\":{},\"expr_bytes\":{},\"level_hash\":\"{}\",\"expr_hash\":\"{}\",\"expected\":\"pass\",\"actual\":\"pass\",\"cleanup\":\"complete\",\"final_state\":\"recovery-decoded\"}}",
+                        level_bytes.len(),
+                        expr_bytes.len(),
+                        level_hash,
+                        expr_hash,
+                    );
+                })
+                .expect("spawn bounded-stack probe")
+                .join();
+            assert!(outcome.is_ok(), "bounded-stack lifecycle worker panicked");
+            return;
+        }
+
+        let runs = std::env::var(RUNS)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let executable = std::env::current_exe().expect("locate current test binary");
+        for iteration in 0..runs {
+            let output = std::process::Command::new(&executable)
+                .arg("--exact")
+                .arg("canon::tests::deep_valid_lifecycle_is_stack_safe_in_subprocess")
+                .arg("--nocapture")
+                .env(CHILD, "1")
+                .env(ITERATION, iteration.to_string())
+                .output()
+                .expect("launch sacrificial lifecycle process");
+            assert!(
+                output.status.success(),
+                "lifecycle child {iteration} failed: status={:?}\nstdout={}\nstderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+        }
     }
 }
