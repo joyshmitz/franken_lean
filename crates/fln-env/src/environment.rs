@@ -207,6 +207,14 @@ impl Environment {
                 for n in &v.ctors {
                     n.write_body(&mut w);
                 }
+                // The mutual-inductive block is part of the declaration's content
+                // (as it is for `Defn`/`Thm`): two inductives identical except for
+                // their block grouping are distinct declarations and must not share
+                // a content digest.
+                w.u64(v.all.len() as u64);
+                for n in &v.all {
+                    n.write_body(&mut w);
+                }
             }
             ConstantInfo::Ctor(v) => {
                 v.induct.write_body(&mut w);
@@ -227,6 +235,11 @@ impl Environment {
                     rule.ctor.write_body(&mut w);
                     w.u32(rule.nfields);
                     rule.rhs.write_body(&mut w);
+                }
+                // The mutual block is content here too (mirrors `Defn`/`Thm`).
+                w.u64(v.all.len() as u64);
+                for n in &v.all {
+                    n.write_body(&mut w);
                 }
             }
         }
@@ -421,6 +434,85 @@ mod tests {
             Environment::operational_root(&host_a),
             Environment::operational_root(&host_b)
         );
+    }
+
+    #[test]
+    fn mutual_block_membership_changes_the_content_digest() {
+        use crate::constants::{
+            DefinitionSafety, DefinitionVal, InductiveVal, RecursorRule, RecursorVal,
+            ReducibilityHints, TheoremVal,
+        };
+        // Every kind that carries an `all` (mutual block) must fold it into its
+        // content digest: two otherwise-identical declarations that differ only in
+        // their block grouping are distinct and must not collide (a per-decl CAS
+        // keyed on this digest would otherwise return a stale `all`).
+        let body = || Expr::sort(Level::zero());
+        let ty = || ConstantVal {
+            name: n("d"),
+            level_params: vec![],
+            type_: Expr::sort(Level::zero()),
+        };
+
+        let defn = |all: Vec<Name>| {
+            ConstantInfo::Defn(DefinitionVal {
+                base: ty(),
+                value: body(),
+                hints: ReducibilityHints::Opaque,
+                safety: DefinitionSafety::Safe,
+                all,
+            })
+        };
+        let thm = |all: Vec<Name>| {
+            ConstantInfo::Thm(TheoremVal {
+                base: ty(),
+                value: body(),
+                all,
+            })
+        };
+        let induct = |all: Vec<Name>| {
+            ConstantInfo::Induct(InductiveVal {
+                base: ty(),
+                num_params: 0,
+                num_indices: 0,
+                all,
+                ctors: vec![n("mk")],
+                num_nested: 0,
+                is_rec: false,
+                is_unsafe: false,
+                is_reflexive: false,
+            })
+        };
+        let rec = |all: Vec<Name>| {
+            ConstantInfo::Rec(RecursorVal {
+                base: ty(),
+                all,
+                num_params: 0,
+                num_indices: 0,
+                num_motives: 1,
+                num_minors: 1,
+                rules: vec![RecursorRule {
+                    ctor: n("mk"),
+                    nfields: 0,
+                    rhs: body(),
+                }],
+                k: false,
+                is_unsafe: false,
+            })
+        };
+
+        for make in [
+            &defn as &dyn Fn(Vec<Name>) -> ConstantInfo,
+            &thm,
+            &induct,
+            &rec,
+        ] {
+            let solo = Environment::decl_content_digest(&make(vec![n("d")]));
+            let grouped = Environment::decl_content_digest(&make(vec![n("d"), n("e")]));
+            assert_ne!(
+                solo, grouped,
+                "mutual-block membership must change the content digest"
+            );
+        }
     }
 
     #[test]
