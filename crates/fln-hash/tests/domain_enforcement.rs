@@ -11,18 +11,47 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The code portion of a line: everything before the first `//` that is NOT inside a
+/// string literal. A naive `line.find("//")` would truncate at a `//` *inside a
+/// string* (e.g. a URL literal), hiding a later raw-hasher reference on the same line
+/// — the evasion RubyForest flagged. `//` can only appear in a string or a comment
+/// (a char literal holds one char), so tracking double-quoted strings suffices; we do
+/// not track char literals or lifetimes (both use `'` and would otherwise mislead).
+fn code_before_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else if b == b'"' {
+            in_str = true;
+        } else if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            return &line[..i];
+        }
+        i += 1;
+    }
+    line
+}
+
 /// Occurrences of a raw-hashing reference in one file: (line number, line text).
 fn raw_hash_references(source: &str) -> Vec<(usize, String)> {
     let mut findings = Vec::new();
     for (idx, line) in source.lines().enumerate() {
-        let code = match line.find("//") {
-            Some(pos) => &line[..pos],
-            None => line,
-        };
         // The raw surface is reachable only by naming the module. The domain
         // registry path (`fln_hash::domain`, `Domain::`, `DomainHasher`) is the
-        // sanctioned vocabulary and never names `blake3`.
-        if code.contains("blake3") {
+        // sanctioned vocabulary and never names `blake3`. Scanning the code portion
+        // (comment stripped string-aware) keeps genuine comment mentions exempt while
+        // never letting a string-embedded `//` hide a real reference.
+        if code_before_comment(line).contains("blake3") {
             findings.push((idx + 1, line.trim().to_string()));
         }
     }
@@ -167,4 +196,17 @@ fn the_scanner_detects_a_planted_violation() {
     assert!(raw_hash_references("// blake3 is wrapped by the domain registry\n").is_empty());
     // The sanctioned vocabulary never trips it.
     assert!(raw_hash_references("use fln_hash::domain::{Domain, DomainHasher};\n").is_empty());
+
+    // Bypass regression (RubyForest): a string literal containing `//` must NOT hide
+    // a raw-hasher reference later on the same line. A naive first-`//` strip would
+    // truncate at the URL's `//` and miss the `blake3` use.
+    let bypass = "let _u = \"http://example\"; use fln_hash::blake3::hash;\n";
+    assert_eq!(
+        raw_hash_references(bypass).len(),
+        1,
+        "a `//` inside a string must not hide a raw-hasher reference"
+    );
+    // A blake3 mention that really is only in a trailing comment stays exempt even
+    // when a string precedes it.
+    assert!(raw_hash_references("let _u = \"ok\"; // blake3 note\n").is_empty());
 }
