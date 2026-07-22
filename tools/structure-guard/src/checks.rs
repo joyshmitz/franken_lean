@@ -787,13 +787,19 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         let Some(decl) = g.crates.get(&c.name) else {
             continue;
         };
-        let roots = crate_roots(c)?;
-        if roots.is_empty() {
+        let has_primary_root = ["lib.rs", "main.rs"]
+            .iter()
+            .any(|file| is_regular_file(&c.dir.join("src").join(file)));
+        if !has_primary_root {
             findings.push(Finding {
                 code: "FLN-STRUCT-016",
                 path: c.rel.clone(),
-                detail: "crate has neither src/lib.rs nor src/main.rs".to_string(),
+                detail: "crate has neither src/lib.rs nor src/main.rs; auxiliary Cargo targets do not satisfy the declared product crate"
+                    .to_string(),
             });
+        }
+        let roots = crate_roots(c)?;
+        if roots.is_empty() {
             continue;
         }
         for root_file in roots {

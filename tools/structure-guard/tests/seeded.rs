@@ -813,6 +813,22 @@ fn integration_targets_cannot_bypass_ordinary_unsafe_posture() {
 }
 
 #[test]
+fn auxiliary_target_cannot_replace_the_declared_product_crate() {
+    let ws = TempWs::new("missing-primary-root");
+    base(&ws);
+    ws.files
+        .borrow_mut()
+        .retain(|path, _| path != "crates/fln-hash/src/lib.rs");
+    ws.write(
+        "crates/fln-hash/tests/only_target.rs",
+        "#![forbid(unsafe_code)]\nfn auxiliary_only() {}\n",
+    );
+    let out = ws.run();
+    assert_eq!(codes(&out), vec!["FLN-STRUCT-016"]);
+    assert!(out.findings[0].detail.contains("auxiliary Cargo targets"));
+}
+
+#[test]
 fn repository_cargo_config_cannot_bypass_the_reviewed_compilation_contract() {
     for (tag, rel) in [
         ("cargo-config-toml", ".cargo/config.toml"),
