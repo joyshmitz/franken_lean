@@ -5,5 +5,10 @@ edition = "2024"
 license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 publish = false
 
+[features]
+# Development-only lockstep-diagnosis machinery (plan §18.10, D8). NEVER a default;
+# release CI proves its absence (tests/poison_compile_out.rs + the workspace grep).
+oracle-fallback-dev = []
+
 [dependencies]
 fln-core = { path = "../fln-core" }

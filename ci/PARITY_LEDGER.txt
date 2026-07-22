@@ -1,0 +1,30 @@
+# PARITY_LEDGER.txt — the row-per-symbol Parity Ledger (plan §18.1, D6; bead fln-euo).
+#
+# Row-per-symbol or it is marketing: headline percentages are never accepted as
+# evidence. Every row cites its fixtures (validated to exist by the ledger gate in
+# fln-conformance) and its evidence freshness. L-levels only ever move on evidence;
+# an unclassified divergence BLOCKS the surface's claim (oracle-precedence ladder).
+#
+# Row grammar (12 '|'-separated fields on one line):
+#   row <surface> | <symbol> | <kind> | <semantic-status> | <L-level> | <mode>
+#       | <oracle-kind> | <comparison-class> | <fixtures> | <determinism-class>
+#       | <claim-state> | <freshness>
+
+schema fln-parity-ledger/1
+
+# ---- meta-api: term-plane observables proven against the pinned binary (p8a) ----------
+row meta-api | Lean.Name.hash | function | native | L2 | faithful | pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | core-observables-v4.32.0
+row meta-api | Lean.Level.data | computed-field | native | L2 | faithful | pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | core-observables-v4.32.0
+row meta-api | Lean.Level.normalize | function | native | L2 | faithful | pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | core-observables-v4.32.0
+row meta-api | Lean.Level.isEquiv | function | native | L2 | faithful | pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | core-observables-v4.32.0
+row meta-api | Lean.Expr.data | computed-field | native | L2 | faithful | pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | core-observables-v4.32.0
+row meta-api | String.hash | function | native | L2 | faithful | pinned-binary | exact | crates/fln-conformance/fixtures/core_observables.txt,crates/fln-hash/fixtures/blake3_vectors.txt | D0 | OBSERVED | core-observables-v4.32.0
+row meta-api | mixHash | function | native | L2 | faithful | pinned-source | exact | crates/fln-conformance/fixtures/core_observables.txt | D0 | OBSERVED | core-observables-v4.32.0
+
+# ---- meta-api: inventoried, shape pending (recognized only — precise unsupported) -----
+row meta-api | Lean.Expr.mkData | function | native | L0 | faithful | pinned-source | exact | , | D0 | TARGETED | inventory-v4.32.0
+row meta-api | Lean.FileMap.toPosition | function | native | L1 | faithful | pinned-source | exact | crates/fln-core/src/pos.rs | D0 | OBSERVED | unit-suite-v4.32.0
+
+# ---- cli: recognized inventory only (no native binaries exist yet) --------------------
+row cli | lean --version | flag | pending | L0 | faithful | pinned-binary | exact | , | D1 | TARGETED | inventory-v4.32.0
+row cli | lean --run | flag | pending | L0 | faithful | pinned-binary | exact | , | D1 | TARGETED | inventory-v4.32.0
