@@ -326,15 +326,29 @@ pub enum ExprNode {
 }
 
 /// A kernel expression carrying its computed observable data word.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Expr {
-    node: Arc<ExprNode>,
+    // `Option` is a drop-state marker, not a semantic state: live values always
+    // contain `Some`.  It lets `Drop` take ownership of the root `Arc` in safe
+    // Rust and drain uniquely owned descendants with an explicit heap worklist.
+    // `Option<Arc<_>>` has the same pointer-sized representation as `Arc<_>`.
+    node: Option<Arc<ExprNode>>,
     data: ExprData,
+}
+
+impl std::fmt::Debug for Expr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Expr")
+            .field("node", self.node())
+            .field("data", &self.data)
+            .finish()
+    }
 }
 
 impl PartialEq for Expr {
     fn eq(&self, other: &Expr) -> bool {
-        self.data == other.data && (Arc::ptr_eq(&self.node, &other.node) || self.node == other.node)
+        self.data == other.data
+            && (Arc::ptr_eq(self.node_arc(), other.node_arc()) || self.node() == other.node())
     }
 }
 impl Eq for Expr {}
@@ -363,9 +377,17 @@ fn list_level_hash(levels: &[Level]) -> u64 {
 impl Expr {
     fn with(node: ExprNode, data: ExprData) -> Expr {
         Expr {
-            node: Arc::new(node),
+            node: Some(Arc::new(node)),
             data,
         }
+    }
+
+    fn node_arc(&self) -> &Arc<ExprNode> {
+        self.node.as_ref().expect("a live Expr always owns a node")
+    }
+
+    fn take_node_for_drop(&mut self) -> Option<Arc<ExprNode>> {
+        self.node.take()
     }
 
     /// `.bvar idx`. The only constructor that can exceed the 20-bit range covenant
@@ -645,7 +667,71 @@ impl Expr {
 
     /// The structural node (metaprograms pattern-match on the inventory).
     pub fn node(&self) -> &ExprNode {
-        &self.node
+        self.node_arc()
+    }
+}
+
+impl Drop for Expr {
+    fn drop(&mut self) {
+        let Some(root) = self.take_node_for_drop() else {
+            return;
+        };
+
+        // A last-reference cascade through `Arc<ExprNode>` would normally recurse
+        // through one Rust destructor frame per input node.  Drain unique nodes on
+        // this explicit heap stack instead.  A shared node is only decremented;
+        // whichever `Expr` later owns its final reference will perform the drain.
+        let mut pending = vec![root];
+        let mut drained = 0usize;
+        while let Some(node) = pending.pop() {
+            let Ok(node) = Arc::try_unwrap(node) else {
+                continue;
+            };
+            drained += 1;
+            if drained.is_multiple_of(4096) {
+                std::thread::yield_now();
+            }
+            match node {
+                ExprNode::App { mut f, mut a } => {
+                    pending.extend(f.take_node_for_drop());
+                    pending.extend(a.take_node_for_drop());
+                }
+                ExprNode::Lam {
+                    mut binder_type,
+                    mut body,
+                    ..
+                }
+                | ExprNode::ForallE {
+                    mut binder_type,
+                    mut body,
+                    ..
+                } => {
+                    pending.extend(binder_type.take_node_for_drop());
+                    pending.extend(body.take_node_for_drop());
+                }
+                ExprNode::LetE {
+                    mut type_,
+                    mut value,
+                    mut body,
+                    ..
+                } => {
+                    pending.extend(type_.take_node_for_drop());
+                    pending.extend(value.take_node_for_drop());
+                    pending.extend(body.take_node_for_drop());
+                }
+                ExprNode::MData { mut expr, .. } | ExprNode::Proj { mut expr, .. } => {
+                    pending.extend(expr.take_node_for_drop());
+                }
+                // `Level` has its own stack-safe last-reference drain.  All other
+                // payloads are non-recursive with respect to `Expr`.
+                ExprNode::BVar { .. }
+                | ExprNode::FVar { .. }
+                | ExprNode::MVar { .. }
+                | ExprNode::Sort { .. }
+                | ExprNode::Const { .. }
+                | ExprNode::Lit { .. } => {}
+            }
+        }
     }
 }
 
@@ -870,5 +956,23 @@ mod tests {
             Expr::bvar(0).expect("packs"),
         );
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn iterative_drop_preserves_shared_expr_arcs() {
+        let leaf = Expr::bvar(0).expect("small");
+        assert_eq!(Arc::strong_count(leaf.node_arc()), 1);
+
+        let root = Expr::app(leaf.clone(), leaf.clone());
+        assert_eq!(Arc::strong_count(leaf.node_arc()), 3);
+        let retained_root = root.clone();
+        assert_eq!(Arc::strong_count(root.node_arc()), 2);
+
+        // The first root drop must only decrement the shared root.  The final root
+        // drop unwraps it iteratively and releases exactly its two leaf references.
+        drop(root);
+        assert_eq!(Arc::strong_count(retained_root.node_arc()), 1);
+        drop(retained_root);
+        assert_eq!(Arc::strong_count(leaf.node_arc()), 1);
     }
 }

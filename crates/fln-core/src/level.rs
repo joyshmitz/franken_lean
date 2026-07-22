@@ -108,17 +108,30 @@ enum Node {
 }
 
 /// A universe level. Immutable, cheaply clonable, carrying its computed data word.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Level {
-    node: Arc<Node>,
+    // Live values are always `Some`; `None` exists only while `Drop` drains a
+    // last-reference cascade iteratively in safe Rust. `Option<Arc<_>>` uses the
+    // null-pointer niche, so this does not enlarge `Level`.
+    node: Option<Arc<Node>>,
     data: LevelData,
+}
+
+impl std::fmt::Debug for Level {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Level")
+            .field("node", self.node())
+            .field("data", &self.data)
+            .finish()
+    }
 }
 
 impl PartialEq for Level {
     fn eq(&self, other: &Level) -> bool {
         // Data word first (hash/depth/flags reject fast), then structure — the same
         // discipline as lean_level_eq (kernel/level.cpp:125-150).
-        self.data == other.data && (Arc::ptr_eq(&self.node, &other.node) || self.node == other.node)
+        self.data == other.data
+            && (Arc::ptr_eq(self.node_arc(), other.node_arc()) || self.node() == other.node())
     }
 }
 impl Eq for Level {}
@@ -151,7 +164,7 @@ impl Level {
     /// `Level.zero`.
     pub fn zero() -> Level {
         Level {
-            node: Arc::new(Node::Zero),
+            node: Some(Arc::new(Node::Zero)),
             data: LevelData::pack(SEED_ZERO, 0, false, false).expect("depth 0 packs"),
         }
     }
@@ -166,7 +179,7 @@ impl Level {
         let data = LevelData::pack(mix_hash(SEED_PARAM, name.hash()), 0, false, true)
             .expect("depth 0 packs");
         Level {
-            node: Arc::new(Node::Param(name)),
+            node: Some(Arc::new(Node::Param(name))),
             data,
         }
     }
@@ -176,7 +189,7 @@ impl Level {
         let data =
             LevelData::pack(mix_hash(SEED_MVAR, id.hash()), 0, true, false).expect("depth 0 packs");
         Level {
-            node: Arc::new(Node::MVar(id)),
+            node: Some(Arc::new(Node::MVar(id))),
             data,
         }
     }
@@ -190,7 +203,7 @@ impl Level {
             self.data.has_param(),
         )?;
         Ok(Level {
-            node: Arc::new(Node::Succ(self)),
+            node: Some(Arc::new(Node::Succ(self))),
             data,
         })
     }
@@ -204,7 +217,7 @@ impl Level {
             u.data.has_param() || v.data.has_param(),
         )?;
         Ok(Level {
-            node: Arc::new(Node::Max(u, v)),
+            node: Some(Arc::new(Node::Max(u, v))),
             data,
         })
     }
@@ -218,9 +231,21 @@ impl Level {
             u.data.has_param() || v.data.has_param(),
         )?;
         Ok(Level {
-            node: Arc::new(Node::IMax(u, v)),
+            node: Some(Arc::new(Node::IMax(u, v))),
             data,
         })
+    }
+
+    fn node_arc(&self) -> &Arc<Node> {
+        self.node.as_ref().expect("a live Level always owns a node")
+    }
+
+    fn node(&self) -> &Node {
+        self.node_arc()
+    }
+
+    fn take_node_for_drop(&mut self) -> Option<Arc<Node>> {
+        self.node.take()
     }
 
     // ---- observables -------------------------------------------------------------------
@@ -249,13 +274,13 @@ impl Level {
     }
 
     pub fn is_zero(&self) -> bool {
-        matches!(&*self.node, Node::Zero)
+        matches!(self.node(), Node::Zero)
     }
 
     /// Borrowed structural view — the constructor-inventory access canonical codecs
     /// and pretty-printers need without exposing the internal representation.
     pub fn view(&self) -> LevelView<'_> {
-        match &*self.node {
+        match self.node() {
             Node::Zero => LevelView::Zero,
             Node::Succ(u) => LevelView::Succ(u),
             Node::Max(u, v) => LevelView::Max(u, v),
@@ -269,7 +294,7 @@ impl Level {
 
     /// `Level.isExplicit`: a numeral `succ^k zero` (Level.lean:233-236).
     pub fn is_explicit(&self) -> bool {
-        match &*self.node {
+        match self.node() {
             Node::Zero => true,
             Node::Succ(u) => !u.has_mvar() && !u.has_param() && u.is_explicit(),
             _ => false,
@@ -280,7 +305,7 @@ impl Level {
     pub fn get_offset(&self) -> u32 {
         let mut level = self;
         let mut offset = 0;
-        while let Node::Succ(u) = &*level.node {
+        while let Node::Succ(u) = level.node() {
             offset += 1;
             level = u;
         }
@@ -290,7 +315,7 @@ impl Level {
     /// `Level.getLevelOffset`: the level under all outer `succ`s.
     pub fn get_level_offset(&self) -> &Level {
         let mut level = self;
-        while let Node::Succ(u) = &*level.node {
+        while let Node::Succ(u) = level.node() {
             level = u;
         }
         level
@@ -316,7 +341,7 @@ impl Level {
 
     /// `Level.isNeverZero` (Level.lean:210-217).
     pub fn is_never_zero(&self) -> bool {
-        match &*self.node {
+        match self.node() {
             Node::Zero | Node::Param(_) | Node::MVar(_) => false,
             Node::Succ(_) => true,
             Node::Max(u, v) => u.is_never_zero() || v.is_never_zero(),
@@ -326,7 +351,7 @@ impl Level {
 
     /// `Level.isAlwaysZero` (Level.lean:199-208).
     pub fn is_always_zero(&self) -> bool {
-        match &*self.node {
+        match self.node() {
             Node::Zero => true,
             Node::Param(_) | Node::MVar(_) | Node::Succ(_) => false,
             Node::Max(u, v) => u.is_always_zero() && v.is_always_zero(),
@@ -339,7 +364,7 @@ impl Level {
         if self == inside {
             return true;
         }
-        match &*inside.node {
+        match inside.node() {
             Node::Succ(u) => self.occurs_in(u),
             Node::Max(u, v) | Node::IMax(u, v) => self.occurs_in(u) || self.occurs_in(v),
             _ => false,
@@ -349,7 +374,7 @@ impl Level {
     /// `Level.dec` (Level.lean:411-419). Note the pin maps BOTH `max` and `imax`
     /// through `mkLevelMax` — faithful, not a typo here.
     pub fn dec(&self) -> Option<Level> {
-        match &*self.node {
+        match self.node() {
             Node::Zero | Node::Param(_) | Node::MVar(_) => None,
             Node::Succ(u) => Some(u.clone()),
             Node::Max(u, v) | Node::IMax(u, v) => {
@@ -364,7 +389,7 @@ impl Level {
 
     /// `ctorToNat` (Level.lean:266-272) — note: NOT the declaration order.
     fn ctor_rank(&self) -> u8 {
-        match &*self.node {
+        match self.node() {
             Node::Zero => 0,
             Node::Param(_) => 1,
             Node::MVar(_) => 2,
@@ -376,13 +401,13 @@ impl Level {
 
     /// `normLtAux` (Level.lean:274-293).
     fn norm_lt_aux(l1: &Level, k1: u32, l2: &Level, k2: u32) -> bool {
-        if let Node::Succ(u1) = &*l1.node {
+        if let Node::Succ(u1) = l1.node() {
             return Level::norm_lt_aux(u1, k1 + 1, l2, k2);
         }
-        if let Node::Succ(u2) = &*l2.node {
+        if let Node::Succ(u2) = l2.node() {
             return Level::norm_lt_aux(l1, k1, u2, k2 + 1);
         }
-        match (&*l1.node, &*l2.node) {
+        match (l1.node(), l2.node()) {
             (Node::Max(a1, b1), Node::Max(a2, b2)) | (Node::IMax(a1, b1), Node::IMax(a2, b2)) => {
                 if l1 == l2 {
                     k1 < k2
@@ -424,7 +449,7 @@ impl Level {
 
     /// `isAlreadyNormalizedCheap` (Level.lean:303-308).
     fn is_already_normalized_cheap(&self) -> bool {
-        match &*self.node {
+        match self.node() {
             Node::Zero | Node::Param(_) | Node::MVar(_) => true,
             Node::Succ(u) => u.is_already_normalized_cheap(),
             _ => false,
@@ -439,7 +464,7 @@ impl Level {
         if u1.is_zero() {
             return u2; // imax 0 u = u
         }
-        if let Node::Succ(inner) = &*u1.node
+        if let Node::Succ(inner) = u1.node()
             && inner.is_zero()
         {
             return u2; // imax 1 u = u
@@ -453,7 +478,7 @@ impl Level {
     /// `getMaxArgsAux` (Level.lean:318-321): flatten nested `max`, normalizing each
     /// non-max leaf once. Left child first.
     fn collect_max_args(level: &Level, already_normalized: bool, out: &mut Vec<Level>) {
-        match &*level.node {
+        match level.node() {
             Node::Max(a, b) => {
                 Level::collect_max_args(a, already_normalized, out);
                 Level::collect_max_args(b, already_normalized, out);
@@ -529,7 +554,7 @@ impl Level {
         }
         let k = self.get_offset();
         let u = self.get_level_offset();
-        match &*u.node {
+        match u.node() {
             Node::Max(l1, l2) => {
                 let mut lvls: Vec<Level> = Vec::new();
                 Level::collect_max_args(l1, false, &mut lvls);
@@ -587,7 +612,7 @@ impl Level {
         if v.is_explicit() && u.get_offset() >= v.get_offset() {
             return true;
         }
-        match &*u.node {
+        match u.node() {
             Node::Max(a, b) => v == a || v == b,
             _ => false,
         }
@@ -632,6 +657,38 @@ impl Level {
             u
         } else {
             Level::imax(u, v).expect("children already packed")
+        }
+    }
+}
+
+impl Drop for Level {
+    fn drop(&mut self) {
+        let Some(root) = self.take_node_for_drop() else {
+            return;
+        };
+
+        // Destruction follows ownership, not syntax depth.  Unwrap unique nodes
+        // and move their child roots onto a heap worklist; shared nodes are only
+        // decremented.  The holder of the eventual final reference performs the
+        // same iterative drain, preserving exact `Arc` sharing without recursion.
+        let mut pending = vec![root];
+        let mut drained = 0usize;
+        while let Some(node) = pending.pop() {
+            let Ok(node) = Arc::try_unwrap(node) else {
+                continue;
+            };
+            drained += 1;
+            if drained.is_multiple_of(4096) {
+                std::thread::yield_now();
+            }
+            match node {
+                Node::Succ(mut level) => pending.extend(level.take_node_for_drop()),
+                Node::Max(mut left, mut right) | Node::IMax(mut left, mut right) => {
+                    pending.extend(left.take_node_for_drop());
+                    pending.extend(right.take_node_for_drop());
+                }
+                Node::Zero | Node::Param(_) | Node::MVar(_) => {}
+            }
         }
     }
 }
@@ -823,5 +880,21 @@ mod tests {
         assert_eq!(u.dec(), None);
         assert!(nat(2).is_explicit());
         assert!(!u.is_explicit());
+    }
+
+    #[test]
+    fn iterative_drop_preserves_shared_level_arcs() {
+        let leaf = p("u");
+        assert_eq!(Arc::strong_count(leaf.node_arc()), 1);
+
+        let root = Level::max(leaf.clone(), leaf.clone()).expect("packs");
+        assert_eq!(Arc::strong_count(leaf.node_arc()), 3);
+        let retained_root = root.clone();
+        assert_eq!(Arc::strong_count(root.node_arc()), 2);
+
+        drop(root);
+        assert_eq!(Arc::strong_count(retained_root.node_arc()), 1);
+        drop(retained_root);
+        assert_eq!(Arc::strong_count(leaf.node_arc()), 1);
     }
 }

@@ -139,31 +139,66 @@ impl Name {
 
     /// Dot-rendered form; anonymous renders as `[anonymous]` (upstream convention).
     pub fn to_display_string(&self) -> String {
-        fn go(name: &Name, out: &mut String) {
-            match &name.0 {
-                Repr::Anonymous => {}
-                Repr::Str(node) => {
-                    go(&node.pre, out);
-                    if !out.is_empty() {
-                        out.push('.');
-                    }
-                    out.push_str(&node.component);
-                }
-                Repr::Num(node) => {
-                    go(&node.pre, out);
-                    if !out.is_empty() {
-                        out.push('.');
-                    }
-                    out.push_str(&node.component.to_string());
-                }
-            }
+        let mut chain = Vec::new();
+        let mut cursor = self;
+        while !cursor.is_anonymous() {
+            chain.push(cursor);
+            cursor = match &cursor.0 {
+                Repr::Str(node) => &node.pre,
+                Repr::Num(node) => &node.pre,
+                Repr::Anonymous => unreachable!("loop excludes anonymous"),
+            };
         }
         let mut out = String::new();
-        go(self, &mut out);
+        for name in chain.into_iter().rev() {
+            if !out.is_empty() {
+                out.push('.');
+            }
+            match &name.0 {
+                Repr::Str(node) => out.push_str(&node.component),
+                Repr::Num(node) => out.push_str(&node.component.to_string()),
+                Repr::Anonymous => unreachable!("chain excludes anonymous"),
+            }
+        }
         if out.is_empty() {
             "[anonymous]".to_string()
         } else {
             out
+        }
+    }
+}
+
+impl Drop for Name {
+    fn drop(&mut self) {
+        // `Name` is itself a persistent Arc chain.  An Expr/Level node containing
+        // one deeply qualified name must not reintroduce a recursive destructor
+        // cascade after those outer structures have been drained iteratively.
+        let mut repr = std::mem::replace(&mut self.0, Repr::Anonymous);
+        let mut drained = 0usize;
+        loop {
+            repr = match repr {
+                Repr::Anonymous => break,
+                Repr::Str(node) => {
+                    let Ok(StrNode { mut pre, .. }) = Arc::try_unwrap(node) else {
+                        break;
+                    };
+                    drained += 1;
+                    if drained.is_multiple_of(4096) {
+                        std::thread::yield_now();
+                    }
+                    std::mem::replace(&mut pre.0, Repr::Anonymous)
+                }
+                Repr::Num(node) => {
+                    let Ok(NumNode { mut pre, .. }) = Arc::try_unwrap(node) else {
+                        break;
+                    };
+                    drained += 1;
+                    if drained.is_multiple_of(4096) {
+                        std::thread::yield_now();
+                    }
+                    std::mem::replace(&mut pre.0, Repr::Anonymous)
+                }
+            };
         }
     }
 }
