@@ -242,6 +242,25 @@ fn rust_lexemes(text: &str) -> Vec<Lexeme> {
                 continue;
             }
         }
+        if bytes.get(cursor..cursor + 2) == Some(b"r#")
+            && bytes
+                .get(cursor + 2)
+                .is_some_and(|next| next.is_ascii_alphabetic() || *next == b'_')
+        {
+            let start = cursor;
+            cursor += 3;
+            while cursor < bytes.len()
+                && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+            {
+                cursor += 1;
+            }
+            out.push(Lexeme {
+                text: text[start..cursor].to_string(),
+                line,
+                delimiter_depth,
+            });
+            continue;
+        }
         if byte.is_ascii_alphabetic() || byte == b'_' {
             let start = cursor;
             cursor += 1;
@@ -664,6 +683,7 @@ fn two() {}
     #[test]
     fn conservative_export_scan_allows_restricted_visibility_only() {
         assert!(external_export_sites("pub(crate) fn local() {}\n").is_empty());
+        assert!(external_export_sites("fn private(r#pub: u8) {}\n").is_empty());
         let sites = external_export_sites(
             "pub fn outward() {}\n#[unsafe(no_mangle)]\nextern \"C\" fn symbol() {}\n",
         );
