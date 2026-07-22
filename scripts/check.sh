@@ -82,6 +82,7 @@ FINALIZING=0
 FINALIZER_TRANSITION=0
 FINALIZER_PID=""
 FINALIZER_START_TICKS=""
+FINALIZER_CLEANUP_UNPROVEN=0
 FINALIZATION_SIGNAL=""
 FINALIZATION_SIGNAL_EXIT=0
 FINALIZATION_SIGNAL_GENERATION=0
@@ -95,6 +96,7 @@ INPUT_PATHS=(
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh
   scripts/e2e/structural_gate.sh scripts/e2e/core_observables.sh
   scripts/e2e/hash_identity.sh scripts/e2e/diag_goldens.sh
+  scripts/e2e/env_snapshots.sh
   scripts/extract/gen_core_fixtures.sh scripts/extract/gen_core_fixtures.lean
   scripts/extract/convert_blake3_vectors.py
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
@@ -363,6 +365,7 @@ on_finalizer_signal() {
   [ "$noclobber_was_set" -eq 1 ] || set +o noclobber
   FINALIZATION_SIGNAL_GENERATION=$((FINALIZATION_SIGNAL_GENERATION + 1))
   if [ -s "$FINALIZATION_DECISION" ]; then
+    trap '' HUP INT TERM
     return 0
   fi
   if [ -z "$FINALIZATION_SIGNAL" ]; then
@@ -377,18 +380,19 @@ on_finalizer_signal() {
 
 # shellcheck disable=SC2317
 run_finalizer_command() {
-  local rc=0 generation bind_rc=0 binding_valid=1
+  local rc=0 generation binding_valid=1 resume_failed=0
   [ -z "$FINALIZATION_SIGNAL" ] || return 125
-  setsid -- "$@" &
+  if [ -s "$FINALIZATION_DECISION" ]; then trap '' HUP INT TERM; fi
+  setsid -- python3 "$EVIDENCE" stopped-exec \
+    --expected-parent-pid "$$" -- "$@" &
   FINALIZER_PID=$!
   FINALIZER_START_TICKS="$(
     setsid -- python3 "$EVIDENCE" process-start-ticks --pid "$FINALIZER_PID" \
-      --expected-parent-pid "$$" --wait-ms 500 --session-leader \
+      --expected-parent-pid "$$" --wait-ms 5000 --session-leader --stopped \
       2>/dev/null
-  )"
-  bind_rc=$?
+  )" || true
   case "$FINALIZER_START_TICKS" in ''|*[!0-9]*) binding_valid=0 ;; esac
-  if [ "$binding_valid" -eq 0 ] && [ ! -s "$FINALIZATION_DECISION" ]; then
+  if [ "$binding_valid" -eq 0 ]; then
     # The still-unwaited numeric PID is our direct setsid child. Its unreaped
     # lifetime pins the PGID while the whole finalizer group is killed and checked.
     kill -KILL -- "-$FINALIZER_PID" 2>/dev/null || true
@@ -396,6 +400,7 @@ run_finalizer_command() {
     if ! python3 "$EVIDENCE" assert-process-group-empty \
         --pgid "$FINALIZER_PID" --wait-ms 2000; then
       note "INTERNAL FAULT: finalizer process-group cleanup remained unproven"
+      FINALIZER_CLEANUP_UNPROVEN=1
     fi
     while true; do
       generation="$FINALIZATION_SIGNAL_GENERATION"
@@ -414,13 +419,22 @@ run_finalizer_command() {
     return 2
   fi
   # A terminal trap can interrupt Bash's command-substitution wait after the
-  # isolated binder already emitted a valid identity. Trust the canonical value;
-  # after a full decision, an unavailable binding may only be waited, never killed.
-  if [ "$binding_valid" -eq 1 ]; then
-    bind_rc=0
-  fi
-  if [ "$bind_rc" -ne 0 ] && [ -s "$FINALIZATION_DECISION" ]; then
-    FINALIZER_START_TICKS=""
+  # isolated binder emitted a valid identity, so the canonical digits are the proof.
+  if [ -z "$FINALIZATION_SIGNAL" ]; then
+    if ! setsid -- python3 "$EVIDENCE" resume-bound-process \
+        --pid "$FINALIZER_PID" \
+        --expected-start-ticks "$FINALIZER_START_TICKS" \
+        --expected-parent-pid "$$"; then
+      if ! python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
+          --expected-start-ticks "$FINALIZER_START_TICKS" >/dev/null 2>&1; then
+        FINALIZER_CLEANUP_UNPROVEN=1
+      fi
+      if ! python3 "$EVIDENCE" assert-process-group-empty \
+          --pgid "$FINALIZER_PID" --wait-ms 2000; then
+        FINALIZER_CLEANUP_UNPROVEN=1
+      fi
+      resume_failed=1
+    fi
   fi
   if [ -n "$FINALIZATION_SIGNAL" ] && [ -n "$FINALIZER_START_TICKS" ]; then
     python3 "$EVIDENCE" kill-bound-group --pid "$FINALIZER_PID" \
@@ -440,11 +454,16 @@ run_finalizer_command() {
   done
   FINALIZER_PID=""
   FINALIZER_START_TICKS=""
+  if [ "$resume_failed" -ne 0 ]; then return 2; fi
   return "$rc"
 }
 
 # shellcheck disable=SC2317
 abort_if_finalizer_signalled() {
+  if [ "$FINALIZER_CLEANUP_UNPROVEN" -ne 0 ]; then
+    note "INTERNAL FAULT: finalizer cleanup was not proven"
+    exit 2
+  fi
   if [ -n "$FINALIZATION_SIGNAL" ]; then
     if [ -s "$FINALIZATION_DECISION" ]; then
       return 0
@@ -667,17 +686,27 @@ run_stage() {
   ACTIVE_RUNNER_ART_DIR="$ART_DIR"
   if ! release_guardian_launch "$name" "$ACTIVE_RUNNER_PID" \
       "$ACTIVE_RUNNER_START_TICKS" "$launch_ready" "$launch_release"; then
+    local release_cleanup_failed=0
     if [ -s "$launch_release" ]; then
-      SPAWNING=0
       if ! stop_active_runner TERM; then
-        set_final internal_fault process_tree_cleanup_unproven 2
-        exit 2
+        release_cleanup_failed=1
       fi
     else
       terminate_unreleased_runner "$ACTIVE_RUNNER_PID"
-      SPAWNING=0
     fi
+    SPAWNING=0
     ACTIVE_RUNNER_PID=""
+    ACTIVE_RUNNER_START_TICKS=""
+    if [ "$release_cleanup_failed" -ne 0 ]; then
+      set_final internal_fault process_tree_cleanup_unproven 2
+      exit 2
+    fi
+    if [ -n "$PENDING_SIGNAL" ]; then
+      local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+      PENDING_SIGNAL=""
+      set_final cancelled "signal_$pending_name" "$pending_exit"
+      exit "$pending_exit"
+    fi
     set_final internal_fault active_runner_launch_unproven 2
     exit 2
   fi
@@ -808,17 +837,27 @@ self_test() {
     if ! release_guardian_launch "selftest-$stage" "$child_pid" \
         "$ACTIVE_RUNNER_START_TICKS" "$wrapper_launch_ready" \
         "$wrapper_launch_release"; then
+      local release_cleanup_failed=0
       if [ -s "$wrapper_launch_release" ]; then
-        SPAWNING=0
         if ! stop_active_runner TERM; then
-          set_final internal_fault process_tree_cleanup_unproven 2
-          exit 2
+          release_cleanup_failed=1
         fi
       else
         terminate_unreleased_runner "$child_pid"
-        SPAWNING=0
       fi
+      SPAWNING=0
       ACTIVE_RUNNER_PID=""
+      ACTIVE_RUNNER_START_TICKS=""
+      if [ "$release_cleanup_failed" -ne 0 ]; then
+        set_final internal_fault process_tree_cleanup_unproven 2
+        exit 2
+      fi
+      if [ -n "$PENDING_SIGNAL" ]; then
+        local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+        PENDING_SIGNAL=""
+        set_final cancelled "signal_$pending_name" "$pending_exit"
+        exit "$pending_exit"
+      fi
       set_final internal_fault active_runner_launch_unproven 2
       exit 2
     fi
@@ -911,17 +950,27 @@ self_test() {
   if ! release_guardian_launch selftest-cancel-term "$child_pid" \
       "$ACTIVE_RUNNER_START_TICKS" "$wrapper_launch_ready" \
       "$wrapper_launch_release"; then
+    local release_cleanup_failed=0
     if [ -s "$wrapper_launch_release" ]; then
-      SPAWNING=0
       if ! stop_active_runner TERM; then
-        set_final internal_fault process_tree_cleanup_unproven 2
-        exit 2
+        release_cleanup_failed=1
       fi
     else
       terminate_unreleased_runner "$child_pid"
-      SPAWNING=0
     fi
+    SPAWNING=0
     ACTIVE_RUNNER_PID=""
+    ACTIVE_RUNNER_START_TICKS=""
+    if [ "$release_cleanup_failed" -ne 0 ]; then
+      set_final internal_fault process_tree_cleanup_unproven 2
+      exit 2
+    fi
+    if [ -n "$PENDING_SIGNAL" ]; then
+      local pending_name="$PENDING_SIGNAL" pending_exit="$PENDING_SIGNAL_EXIT"
+      PENDING_SIGNAL=""
+      set_final cancelled "signal_$pending_name" "$pending_exit"
+      exit "$pending_exit"
+    fi
     set_final internal_fault active_runner_launch_unproven 2
     exit 2
   fi
@@ -991,6 +1040,7 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh scripts/e2e/structural_gate.sh \
   scripts/e2e/core_observables.sh scripts/extract/gen_core_fixtures.sh \
   scripts/e2e/hash_identity.sh scripts/e2e/diag_goldens.sh \
+  scripts/e2e/env_snapshots.sh \
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
 run_stage fmt cargo fmt --check
 run_stage check cargo check --locked --all-targets

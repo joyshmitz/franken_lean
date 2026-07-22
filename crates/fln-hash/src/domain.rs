@@ -53,6 +53,10 @@ pub enum Domain {
     TransparencyNode,
     /// A Ledger cache key (query fingerprint, §13.2).
     CacheKey,
+    /// The operational-metadata root of an environment commit (§7.1) — host facts,
+    /// paths, timings: everything the logical root deliberately excludes, digested
+    /// separately so receipts carry both without mixing them.
+    OperationalMeta,
     /// A canonical-serialization schema descriptor (self-describing corpora).
     CanonicalSchema,
     /// Tribunal fixture and corpus identity (test apparatus only).
@@ -71,6 +75,7 @@ impl Domain {
             Domain::TransparencyLeaf => "fln 2026 domain tlog-leaf/1",
             Domain::TransparencyNode => "fln 2026 domain tlog-node/1",
             Domain::CacheKey => "fln 2026 domain cache-key/1",
+            Domain::OperationalMeta => "fln 2026 domain operational-meta/1",
             Domain::CanonicalSchema => "fln 2026 domain canonical-schema/1",
             Domain::Fixture => "fln 2026 domain fixture/1",
         }
