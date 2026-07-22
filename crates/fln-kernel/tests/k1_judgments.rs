@@ -686,3 +686,68 @@ fn kr109_let_inference_zeta_substitutes_the_value_into_the_body_type() {
         "let value b : B does not match ascribed type A: {bad_val:?}"
     );
 }
+
+#[test]
+fn kr107_binder_domain_that_is_not_a_type_is_rejected() {
+    // A : Sort 1; a : A (a term, not a type). `fun (x : a) => x` uses a term as a
+    // binder domain — ensure_sort_of must reject it (KR-107/KR-108 well-formedness),
+    // never treat a proof/datum as a type.
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let env = admit(&env, &axiom("a", Expr::const_(n("A"), vec![])));
+    let a = Expr::const_(n("a"), vec![]);
+    let bad_lam = Expr::lam(
+        n("x"),
+        a, // <- a term where a type is required
+        Expr::bvar(0).expect("packs"),
+        BinderInfo::Default,
+    );
+    let verdict = check(&env, &defn("bad", sort1(), bad_lam), Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::SortExpected),
+        "a binder domain that is not a type must be rejected: {verdict:?}"
+    );
+}
+
+#[test]
+fn kr200_unsafe_definitions_are_not_delta_unfolded() {
+    // The kernel treats unsafe/partial definitions as irreducible: they bypass the
+    // logic's termination/consistency guarantees, so unfolding one in defeq could
+    // import inconsistency. A SAFE def unfolds; an UNSAFE def with the same body
+    // does NOT. Note: this property is guarded by defense-in-depth — BOTH
+    // `unfold_definition` and `definition_height` gate on `safety == Safe`, so a
+    // single-gate mutation is masked by the other; this test fails only if the
+    // whole irreducibility mechanism is removed (both gates), which is the property
+    // that actually matters for soundness.
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a = Expr::const_(n("A"), vec![]);
+
+    // safe d := A  →  d ≟ A holds (delta unfolds).
+    let env = admit(&env, &defn("d_safe", sort1(), a.clone()));
+    let d_safe = Expr::const_(n("d_safe"), vec![]);
+    assert!(
+        check_def_eq(&env, &[], &d_safe, &a, Budget::DEFAULT).is_accepted(),
+        "a safe definition unfolds under delta"
+    );
+
+    // unsafe u := A  →  u ≟ A must NOT hold (never unfolded).
+    let unsafe_def = Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: n("u_unsafe"),
+            level_params: vec![],
+            type_: sort1(),
+        },
+        value: a.clone(),
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Unsafe,
+        all: vec![n("u_unsafe")],
+    });
+    let env = admit(&env, &unsafe_def);
+    let u_unsafe = Expr::const_(n("u_unsafe"), vec![]);
+    let verdict = check_def_eq(&env, &[], &u_unsafe, &a, Budget::DEFAULT);
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::NotDefEq),
+        "an unsafe definition must not be delta-unfolded by the kernel: {verdict:?}"
+    );
+}
