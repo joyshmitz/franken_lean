@@ -173,6 +173,90 @@ fn bool_str(v: bool) -> &'static str {
     if v { "1" } else { "0" }
 }
 
+/// The native case inventory. The reverse direction of the closed-corpus law walks
+/// these: every label a `*_case` builder knows must have a fixture record, so a row
+/// dropped from the fixture fails loudly instead of shrinking coverage silently.
+const STRING_CASES: [&str; 12] = [
+    "empty",
+    "a",
+    "ab",
+    "abc",
+    "abcd",
+    "abcde",
+    "abcdef",
+    "abcdefg",
+    "abcdefgh",
+    "abcdefghi",
+    "unicode",
+    "long",
+];
+const NAME_CASES: [&str; 9] = [
+    "anonymous",
+    "Lean",
+    "Lean.Meta",
+    "Lean.Meta.run",
+    "uniq231",
+    "num0",
+    "numMax",
+    "numOverflow",
+    "mixed",
+];
+const LEVEL_CASES: [&str; 20] = [
+    "zero",
+    "one",
+    "five",
+    "u",
+    "v",
+    "mvar",
+    "succ_u",
+    "max_u_v",
+    "max_v_u",
+    "imax_u_v",
+    "imax_u_zero",
+    "imax_zero_u",
+    "imax_one_u",
+    "imax_u_u",
+    "imax_u_succ_v",
+    "nested_max",
+    "succ_max",
+    "max_one_succ_u",
+    "max_three_u",
+    "max_u_mvar",
+];
+const EQUIV_CASES: [(&str, &str); 4] = [
+    ("max_u_v", "max_v_u"),
+    ("imax_u_zero", "zero"),
+    ("succ_max", "max_succ"),
+    ("u", "v"),
+];
+const EXPR_CASES: [&str; 25] = [
+    "bvar0",
+    "bvar5",
+    "fvar_x",
+    "mvar_m",
+    "sort_zero",
+    "sort_u",
+    "sort_mvar",
+    "const_Nat",
+    "const_Foo",
+    "app",
+    "app_chain",
+    "app_bvar",
+    "lam_id",
+    "lam_loose",
+    "forall_dom_loose",
+    "letE",
+    "lit_nat",
+    "lit_nat_zero",
+    "lit_nat_big",
+    "lit_str",
+    "mdata",
+    "proj",
+    "proj_deep",
+    "mdata_deep300",
+    "mdata_deep301",
+];
+
 #[test]
 fn core_observables_match_the_reference_fixture() {
     let text = include_str!("../fixtures/core_observables.txt");
@@ -326,6 +410,49 @@ fn core_observables_match_the_reference_fixture() {
                 }
             }
             other => mismatches.push(format!("malformed fixture record: {other:?}")),
+        }
+    }
+
+    // Reverse closure: every native case must have appeared in the fixture. The
+    // builder cross-check keeps the inventory arrays and the `*_case` matches from
+    // drifting apart.
+    for label in STRING_CASES {
+        if string_case(label).is_none() {
+            mismatches.push(format!("inventory string case `{label}` has no builder"));
+        }
+        if !seen.contains(&format!("string/{label}")) {
+            mismatches.push(format!("fixture lacks native case string/{label}"));
+        }
+    }
+    for label in NAME_CASES {
+        if name_case(label).is_none() {
+            mismatches.push(format!("inventory name case `{label}` has no builder"));
+        }
+        if !seen.contains(&format!("name/{label}")) {
+            mismatches.push(format!("fixture lacks native case name/{label}"));
+        }
+    }
+    for label in LEVEL_CASES {
+        if level_case(label).is_none() {
+            mismatches.push(format!("inventory level case `{label}` has no builder"));
+        }
+        if !seen.contains(&format!("level/{label}")) {
+            mismatches.push(format!("fixture lacks native case level/{label}"));
+        }
+    }
+    for (label_a, label_b) in EQUIV_CASES {
+        if !seen.contains(&format!("equiv/{label_a}/{label_b}")) {
+            mismatches.push(format!(
+                "fixture lacks native case equiv/{label_a}/{label_b}"
+            ));
+        }
+    }
+    for label in EXPR_CASES {
+        if expr_case(label).is_none() {
+            mismatches.push(format!("inventory expr case `{label}` has no builder"));
+        }
+        if !seen.contains(&format!("expr/{label}")) {
+            mismatches.push(format!("fixture lacks native case expr/{label}"));
         }
     }
 

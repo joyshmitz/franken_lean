@@ -31,12 +31,9 @@ fn parse_frame(line: &str) -> Option<Diagnostic> {
     let label = parts.next()?;
     let message = parts.next()?.strip_prefix(' ')?.to_string();
     let label = label.strip_prefix(' ')?;
-    let (severity, name_part) = if let Some(rest) = label.strip_prefix("error") {
-        (Severity::Error, rest)
-    } else if let Some(rest) = label.strip_prefix("warning") {
-        (Severity::Warning, rest)
-    } else {
-        return None;
+    let (severity, name_part) = match label.strip_prefix("error") {
+        Some(rest) => (Severity::Error, rest),
+        None => (Severity::Warning, label.strip_prefix("warning")?),
     };
     let error_name = if name_part.is_empty() {
         None

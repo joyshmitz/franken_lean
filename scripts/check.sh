@@ -990,7 +990,7 @@ run_stage evidence-self-test python3 scripts/evidence.py self-test \
 run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
   scripts/e2e/structure_gate.sh scripts/e2e/closure_audit.sh scripts/e2e/structural_gate.sh \
   scripts/e2e/core_observables.sh scripts/extract/gen_core_fixtures.sh \
-  scripts/e2e/hash_identity.sh \
+  scripts/e2e/hash_identity.sh scripts/e2e/diag_goldens.sh \
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
 run_stage fmt cargo fmt --check
 run_stage check cargo check --locked --all-targets
