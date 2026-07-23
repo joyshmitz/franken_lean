@@ -8,8 +8,142 @@
 
 use std::path::PathBuf;
 
+use fln_core::name::Name;
 use fln_olean::format;
-use fln_olean::region::{OleanView, RegionError, WalkBudget};
+use fln_olean::region::{ModuleImport, OleanView, RegionError, WalkBudget};
+use fln_rt::abi;
+
+const SYNTHETIC_BASE: u64 = 1 << 16;
+
+#[derive(Debug)]
+struct SyntheticImports {
+    bytes: Vec<u8>,
+    import_offsets: Vec<usize>,
+}
+
+fn ctor_header(tag: u8, other: u8, cs_sz: u16) -> u64 {
+    let packed = u64::from(cs_sz) | (u64::from(other) << 16) | (u64::from(tag) << 24);
+    packed << 32
+}
+
+fn align_word(bytes: &mut Vec<u8>) {
+    let remainder = bytes.len() % abi::OBJECT_SIZE_DELTA;
+    if remainder != 0 {
+        bytes.resize(bytes.len() + abi::OBJECT_SIZE_DELTA - remainder, 0);
+    }
+}
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn get_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("test word is in bounds"),
+    )
+}
+
+fn synthetic_ptr(offset: usize) -> u64 {
+    SYNTHETIC_BASE + u64::try_from(offset).expect("test offset fits u64")
+}
+
+fn module_name(value: &str) -> Name {
+    Name::from_components(value.split('.'))
+}
+
+fn push_string(bytes: &mut Vec<u8>, value: &str) -> usize {
+    align_word(bytes);
+    let offset = bytes.len();
+    let size = value.len() + 1;
+    bytes.resize(offset + 32 + size, 0);
+    put_u64(bytes, offset, ctor_header(abi::TAG_STRING, 0, 1));
+    put_u64(bytes, offset + 8, size as u64);
+    put_u64(bytes, offset + 16, size as u64);
+    put_u64(bytes, offset + 24, value.chars().count() as u64);
+    bytes[offset + 32..offset + 32 + value.len()].copy_from_slice(value.as_bytes());
+    align_word(bytes);
+    offset
+}
+
+fn push_name(bytes: &mut Vec<u8>, value: &str) -> usize {
+    let string = push_string(bytes, value);
+    let offset = bytes.len();
+    bytes.resize(offset + 32, 0);
+    put_u64(bytes, offset, ctor_header(1, 2, 32));
+    put_u64(bytes, offset + 8, 1); // Name.anonymous
+    put_u64(bytes, offset + 16, synthetic_ptr(string));
+    // The cached hash is a scalar usize. Its value is irrelevant to Name text
+    // decoding, but its storage is part of the exact constructor shape.
+    put_u64(bytes, offset + 24, 0);
+    offset
+}
+
+fn push_array(bytes: &mut Vec<u8>, elements: &[u64]) -> usize {
+    align_word(bytes);
+    let offset = bytes.len();
+    bytes.resize(offset + 24 + 8 * elements.len(), 0);
+    put_u64(bytes, offset, ctor_header(abi::TAG_ARRAY, 0, 1));
+    put_u64(bytes, offset + 8, elements.len() as u64);
+    put_u64(bytes, offset + 16, elements.len() as u64);
+    for (index, element) in elements.iter().copied().enumerate() {
+        put_u64(bytes, offset + 24 + 8 * index, element);
+    }
+    align_word(bytes);
+    offset
+}
+
+fn synthetic_imports(rows: &[(&str, bool, bool, bool)]) -> SyntheticImports {
+    let mut bytes = vec![0; format::OLEAN_HEADER_SIZE + 8];
+    bytes[..format::OLEAN_MAGIC.len()].copy_from_slice(&format::OLEAN_MAGIC);
+    bytes[5] = 2;
+    bytes[6] = 1;
+    bytes[7..13].copy_from_slice(b"4.32.0");
+    bytes[40..80].copy_from_slice(format::PIN_COMMIT.as_bytes());
+    put_u64(&mut bytes, 80, SYNTHETIC_BASE);
+
+    let empty_array = push_array(&mut bytes, &[]);
+    let names: Vec<usize> = rows
+        .iter()
+        .map(|(module, _, _, _)| push_name(&mut bytes, module))
+        .collect();
+
+    let import_array = push_array(&mut bytes, &vec![0; rows.len()]);
+
+    let root = bytes.len();
+    bytes.resize(root + 56, 0);
+    put_u64(&mut bytes, root, ctor_header(0, 5, 56));
+    put_u64(&mut bytes, root + 8, synthetic_ptr(import_array));
+    for field in 1..5 {
+        put_u64(&mut bytes, root + 8 + 8 * field, synthetic_ptr(empty_array));
+    }
+    bytes[root + 48] = 1;
+    put_u64(&mut bytes, format::OLEAN_HEADER_SIZE, synthetic_ptr(root));
+
+    let mut import_offsets = Vec::with_capacity(rows.len());
+    for (index, ((_, import_all, is_exported, is_meta), name)) in rows.iter().zip(names).enumerate()
+    {
+        let offset = bytes.len();
+        bytes.resize(offset + 24, 0);
+        put_u64(&mut bytes, offset, ctor_header(0, 1, 24));
+        put_u64(&mut bytes, offset + 8, synthetic_ptr(name));
+        bytes[offset + 16] = u8::from(*import_all);
+        bytes[offset + 17] = u8::from(*is_exported);
+        bytes[offset + 18] = u8::from(*is_meta);
+        put_u64(
+            &mut bytes,
+            import_array + 24 + 8 * index,
+            synthetic_ptr(offset),
+        );
+        import_offsets.push(offset);
+    }
+
+    SyntheticImports {
+        bytes,
+        import_offsets,
+    }
+}
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -23,6 +157,156 @@ fn fixture(name: &str) -> Vec<u8> {
         data.err()
     );
     data.expect("asserted above")
+}
+
+#[test]
+fn import_decoder_preserves_all_eight_flag_combinations() {
+    for bits in 0u8..8 {
+        let expected = ModuleImport {
+            module: module_name("TruthTable"),
+            import_all: bits & 0b001 != 0,
+            is_exported: bits & 0b010 != 0,
+            is_meta: bits & 0b100 != 0,
+        };
+        let fixture = synthetic_imports(&[(
+            "TruthTable",
+            expected.import_all,
+            expected.is_exported,
+            expected.is_meta,
+        )]);
+        let view = OleanView::parse(&fixture.bytes).expect("synthetic header");
+        let module = view
+            .module_data(WalkBudget::default())
+            .expect("synthetic module");
+        assert_eq!(module.imports, [expected], "flag combination {bits:03b}");
+    }
+}
+
+#[test]
+fn import_decoder_preserves_order_and_duplicate_rows() {
+    let fixture = synthetic_imports(&[
+        ("Alpha", false, true, false),
+        ("Beta", true, false, true),
+        ("Alpha", true, true, false),
+    ]);
+    let view = OleanView::parse(&fixture.bytes).expect("synthetic header");
+    let module = view
+        .module_data(WalkBudget::default())
+        .expect("synthetic module");
+    assert_eq!(
+        module.imports,
+        [
+            ModuleImport {
+                module: module_name("Alpha"),
+                import_all: false,
+                is_exported: true,
+                is_meta: false,
+            },
+            ModuleImport {
+                module: module_name("Beta"),
+                import_all: true,
+                is_exported: false,
+                is_meta: true,
+            },
+            ModuleImport {
+                module: module_name("Alpha"),
+                import_all: true,
+                is_exported: true,
+                is_meta: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn import_module_name_preserves_numeric_component_kind() {
+    let mut fixture = synthetic_imports(&[("7", false, true, false)]);
+    let import = fixture.import_offsets[0];
+    let name = usize::try_from(get_u64(&fixture.bytes, import + 8) - SYNTHETIC_BASE)
+        .expect("synthetic Name offset fits usize");
+    put_u64(&mut fixture.bytes, name, ctor_header(2, 2, 32));
+    put_u64(&mut fixture.bytes, name + 16, (7 << 1) | 1);
+
+    let view = OleanView::parse(&fixture.bytes).expect("synthetic header");
+    let module = view
+        .module_data(WalkBudget::default())
+        .expect("numeric module Name");
+    assert_eq!(module.imports[0].module, Name::num(Name::anonymous(), 7));
+    assert_ne!(module.imports[0].module, module_name("7"));
+}
+
+#[test]
+fn import_decoder_rejects_each_noncanonical_bool() {
+    let reasons = [
+        "noncanonical Import.importAll Bool",
+        "noncanonical Import.isExported Bool",
+        "noncanonical Import.isMeta Bool",
+    ];
+    for (index, reason) in reasons.into_iter().enumerate() {
+        let mut fixture = synthetic_imports(&[("BadBool", false, true, false)]);
+        let import = fixture.import_offsets[0];
+        fixture.bytes[import + 16 + index] = 2;
+        let view = OleanView::parse(&fixture.bytes).expect("synthetic header");
+        assert!(
+            matches!(
+                view.module_data(WalkBudget::default()),
+                Err(RegionError::DecodeShape { reason: actual, .. }) if actual == reason
+            ),
+            "field {index} accepted a noncanonical Bool"
+        );
+    }
+}
+
+#[test]
+fn import_decoder_rejects_wrong_arity_and_scalar_size() {
+    let mut wrong_arity = synthetic_imports(&[("WrongArity", false, true, false)]);
+    let import = wrong_arity.import_offsets[0];
+    put_u64(&mut wrong_arity.bytes, import, ctor_header(0, 0, 24));
+    let view = OleanView::parse(&wrong_arity.bytes).expect("synthetic header");
+    assert!(matches!(
+        view.module_data(WalkBudget::default()),
+        Err(RegionError::DecodeShape {
+            reason: "Import shape",
+            ..
+        })
+    ));
+
+    let mut short_scalar = synthetic_imports(&[("ShortScalar", false, true, false)]);
+    let import = short_scalar.import_offsets[0];
+    put_u64(&mut short_scalar.bytes, import, ctor_header(0, 1, 16));
+    let view = OleanView::parse(&short_scalar.bytes).expect("synthetic header");
+    assert!(matches!(
+        view.module_data(WalkBudget::default()),
+        Err(RegionError::DecodeShape {
+            reason: "Import shape",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn import_decoder_rejects_physically_truncated_scalar_storage() {
+    let mut fixture = synthetic_imports(&[("Truncated", false, true, false)]);
+    let import = fixture.import_offsets[0];
+    fixture.bytes.truncate(import + 18);
+    let view = OleanView::parse(&fixture.bytes).expect("synthetic header");
+    assert!(matches!(
+        view.module_data(WalkBudget::default()),
+        Err(RegionError::Truncated { .. })
+    ));
+}
+
+#[test]
+fn module_decode_budget_is_cumulative_across_import_work() {
+    let fixture = synthetic_imports(&[("Budgeted", false, true, false)]);
+    let view = OleanView::parse(&fixture.bytes).expect("synthetic header");
+    assert!(matches!(
+        view.module_data(WalkBudget { max_objects: 2 }),
+        Err(RegionError::BudgetExhausted {
+            visited: 3,
+            budget: 2
+        })
+    ));
 }
 
 #[test]
@@ -44,7 +328,41 @@ fn init_aggregator_walks_clean() {
     assert!(md.is_module);
     assert_eq!(md.imports.len(), 43);
     assert_eq!(md.constants, 0, "Init is an import aggregator");
-    assert!(md.imports.iter().any(|i| i == "Init.Prelude"));
+    assert!(
+        md.imports
+            .iter()
+            .any(|import| import.module == module_name("Init.Prelude"))
+    );
+    assert!(
+        md.imports
+            .iter()
+            .all(|import| !import.import_all && import.is_exported),
+        "Init.lean has only public, non-all imports at the pin"
+    );
+    let init_try: Vec<ModuleImport> = md
+        .imports
+        .iter()
+        .filter(|import| import.module == module_name("Init.Try"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        init_try,
+        [
+            ModuleImport {
+                module: module_name("Init.Try"),
+                import_all: false,
+                is_exported: true,
+                is_meta: false,
+            },
+            ModuleImport {
+                module: module_name("Init.Try"),
+                import_all: false,
+                is_exported: true,
+                is_meta: true,
+            },
+        ],
+        "the two Reference-produced Init.Try rows must not collapse"
+    );
 }
 
 #[test]
@@ -55,6 +373,25 @@ fn binder_name_hint_decodes_constants_and_extensions() {
     let md = view
         .module_data(WalkBudget::default())
         .expect("module data");
+    // Independently recorded from the ordered import declarations in the
+    // pinned Reference source `Init/BinderNameHint.lean`.
+    assert_eq!(
+        md.imports,
+        [
+            ModuleImport {
+                module: module_name("Init.Prelude"),
+                import_all: false,
+                is_exported: true,
+                is_meta: false,
+            },
+            ModuleImport {
+                module: module_name("Init.Tactics"),
+                import_all: false,
+                is_exported: false,
+                is_meta: false,
+            },
+        ]
+    );
     assert_eq!(md.constants, 2);
     assert_eq!(md.const_names.len(), 2, "constNames must mirror constants");
     assert!(
@@ -77,6 +414,44 @@ fn size_of_lemmas_carries_simp_extension_payloads() {
     let md = view
         .module_data(WalkBudget::default())
         .expect("module data");
+    // This real Reference artifact covers import-all, public, private, meta,
+    // and an ordered duplicate. Expectations are independently recorded from
+    // `Init/SizeOfLemmas.lean` at the pinned commit.
+    assert_eq!(
+        md.imports,
+        [
+            ModuleImport {
+                module: module_name("Init.Data.Char.Basic"),
+                import_all: true,
+                is_exported: false,
+                is_meta: false,
+            },
+            ModuleImport {
+                module: module_name("Init.SizeOf"),
+                import_all: true,
+                is_exported: false,
+                is_meta: false,
+            },
+            ModuleImport {
+                module: module_name("Init.Data.Char.Basic"),
+                import_all: false,
+                is_exported: true,
+                is_meta: false,
+            },
+            ModuleImport {
+                module: module_name("Init.Data.Nat.Linear"),
+                import_all: false,
+                is_exported: false,
+                is_meta: false,
+            },
+            ModuleImport {
+                module: module_name("Init.MetaTypes"),
+                import_all: false,
+                is_exported: false,
+                is_meta: true,
+            },
+        ]
+    );
     assert_eq!(md.constants, 16);
     assert!(
         md.extensions.iter().any(|e| e.name.contains("simp")),

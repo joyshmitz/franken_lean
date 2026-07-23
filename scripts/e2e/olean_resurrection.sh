@@ -14,15 +14,27 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MODE="${1:-full}"
+case "$MODE" in
+  full|imports-only) ;;
+  *)
+    echo "usage: $0 [full|imports-only]" >&2
+    exit 2
+    ;;
+esac
 RUN_ID="olean-resurrection-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_DIR="$ROOT/target/e2e/$RUN_ID"
 LOG="$ART_DIR/run.ndjson"
 mkdir -p "$ART_DIR"
+BUILD_TARGET="${FLN_E2E_CARGO_TARGET_DIR:-$ROOT/target_local}"
 
 BEAD="franken_lean-y24"
 SCHEMA="fln-e2e/1"
 HOST="$(uname -sr)"
 start_ns=$(date +%s%N)
+REFERENCE_ROW="$(grep -E '^reference ' "$ROOT/SUITE.lock")"
+PIN_TAG="$(sed -E 's/.*tag=([^ ]+).*/\1/' <<<"$REFERENCE_ROW")"
+PIN_COMMIT="$(sed -E 's/.*commit=([^ ]+).*/\1/' <<<"$REFERENCE_ROW")"
 
 emit() { # emit <step_id> <status> <detail-json-fragment>
   local now_ns
@@ -33,7 +45,7 @@ emit() { # emit <step_id> <status> <detail-json-fragment>
 
 note() { echo "[olean_resurrection] $*" >&2; }
 
-emit run_start started "\"cwd\":\"$ROOT\",\"argv\":\"$0\""
+emit run_start started "\"cwd\":\"$ROOT\",\"argv\":\"$0 $MODE\",\"mode\":\"$MODE\""
 
 # ---- lane 1: fixture provenance — C3 corpus matches its manifest -----------------------
 note "verifying C3 fixture corpus against MANIFEST.txt"
@@ -57,7 +69,7 @@ emit fixtures passed "\"count\":3,\"manifest\":\"tribunal/fixtures/c3/MANIFEST.t
 # ---- lane 2: the reader suite ----------------------------------------------------------
 note "running the fln-olean suite (region reader + format contract)"
 set +e
-( cd "$ROOT" && CARGO_TARGET_DIR=target_local cargo test -q -p fln-olean ) \
+( cd "$ROOT" && CARGO_TARGET_DIR="$BUILD_TARGET" cargo test -q -p fln-olean ) \
   > "$ART_DIR/suite.log" 2>&1
 rc=$?
 set -e
@@ -70,13 +82,17 @@ emit suite passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"suite.lo
 
 # ---- build the walker driver -----------------------------------------------------------
 note "building walk_olean driver"
-( cd "$ROOT" && CARGO_TARGET_DIR=target_local cargo build -q --locked -p fln-olean --example walk_olean ) \
+( cd "$ROOT" && CARGO_TARGET_DIR="$BUILD_TARGET" cargo build -q --locked -p fln-olean --example walk_olean ) \
   > "$ART_DIR/build.log" 2>&1
-WALKER="$ROOT/target_local/debug/examples/walk_olean"
+WALKER="$BUILD_TARGET/debug/examples/walk_olean"
 
 # ---- lane 3: resurrect the C3 fixtures -------------------------------------------------
 set +e
-"$WALKER" "$C3"/*.olean > "$ART_DIR/fixture_walk.tsv" 2>>"$ART_DIR/fixture_walk.err"
+(
+  cd "$C3"
+  "$WALKER" --imports-tsv "$ART_DIR/fixture_imports.tsv" \
+    Init.olean Init.BinderNameHint.olean Init.SizeOfLemmas.olean
+) > "$ART_DIR/fixture_walk.tsv" 2>>"$ART_DIR/fixture_walk.err"
 rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
@@ -86,8 +102,36 @@ if [ "$rc" -ne 0 ]; then
 fi
 emit fixture_walk passed "\"files\":3,\"artifact\":\"fixture_walk.tsv\""
 
+# Every decoded Lean.Import row is compared with an independently recorded
+# oracle manifest extracted from the pinned source declarations that produced
+# these immutable Reference artifacts. This catches dropped/defaulted/inverted
+# flags and preserves ordered duplicates, not merely import counts.
+set +e
+diff -u "$C3/IMPORTS.tsv" "$ART_DIR/fixture_imports.tsv" > "$ART_DIR/fixture_imports.diff"
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  emit fixture_imports failed "\"related_bead\":\"fln-20n.1\",\"expected\":\"tribunal/fixtures/c3/IMPORTS.tsv\",\"actual\":\"fixture_imports.tsv\",\"first_divergence\":\"fixture_imports.diff\",\"contract_epoch\":\"$PIN_TAG\",\"contract_commit\":\"$PIN_COMMIT\",\"final_state\":\"mismatch_rejected\""
+  note "FAIL: decoded Import rows differ from the pinned oracle manifest"
+  exit 1
+fi
+
+import_rows=0
+while IFS=$'\t' read -r fixture index module import_all is_exported is_meta; do
+  case "$fixture" in \#*|"") continue ;; esac
+  import_rows=$((import_rows + 1))
+  fixture_sha="$(sha256sum "$C3/$fixture" | cut -d' ' -f1)"
+  emit import_row passed "\"related_bead\":\"fln-20n.1\",\"claim\":\"FL-INV-04\",\"gate\":\"G1\",\"parity_ledger_row\":\"olean.import.$fixture.$index\",\"fixture\":\"$fixture\",\"fixture_sha256\":\"$fixture_sha\",\"import_index\":$index,\"expected\":{\"module\":\"$module\",\"import_all\":$import_all,\"is_exported\":$is_exported,\"is_meta\":$is_meta},\"actual\":{\"module\":\"$module\",\"import_all\":$import_all,\"is_exported\":$is_exported,\"is_meta\":$is_meta},\"contract_epoch\":\"$PIN_TAG\",\"contract_commit\":\"$PIN_COMMIT\",\"budget_max_objects\":20000000,\"outcome\":\"match\",\"first_divergence\":null,\"artifact\":\"fixture_imports.tsv\",\"final_state\":\"decoded\""
+done < "$ART_DIR/fixture_imports.tsv"
+emit fixture_imports passed "\"related_bead\":\"fln-20n.1\",\"rows\":$import_rows,\"expected\":\"tribunal/fixtures/c3/IMPORTS.tsv\",\"actual\":\"fixture_imports.tsv\",\"diff\":\"fixture_imports.diff\",\"contract_epoch\":\"$PIN_TAG\",\"contract_commit\":\"$PIN_COMMIT\",\"final_state\":\"all_rows_match\""
+
+if [ "$MODE" = "imports-only" ]; then
+  emit run_end passed "\"mode\":\"imports-only\",\"cleanup_status\":\"retained_by_policy\",\"artifact_dir\":\"target/e2e/$RUN_ID\",\"final_state\":\"import_contract_verified\""
+  note "PASS: import-contract lanes green (artifacts in target/e2e/$RUN_ID)"
+  exit 0
+fi
+
 # ---- lane 4: resurrect the ENTIRE pinned toolchain library -----------------------------
-PIN_TAG="$(sed -E 's/.*tag=([^ ]+).*/\1/' <<<"$(grep -E '^reference ' "$ROOT/SUITE.lock")")"
 LIB="$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG/lib/lean"
 if [ -d "$LIB" ]; then
   note "resurrecting the full pinned stdlib library from $LIB"
