@@ -177,6 +177,159 @@ fn mk_lam_locals(locals: &[Local], body: Expr) -> KResult<Expr> {
     Ok(acc)
 }
 
+/// Lift every loose bvar of `e` by `amount` (the substitutes of
+/// [`subst_loose_bvars`] cross binders on the way in). Range-pruned.
+fn lift_loose_bvars(e: &Expr, cutoff: u32, amount: u32, depth: u32) -> KResult<Expr> {
+    depth_guard(depth)?;
+    if amount == 0 || e.loose_bvar_range() <= cutoff {
+        return Ok(e.clone());
+    }
+    Ok(match e.node() {
+        ExprNode::BVar { idx } => {
+            if *idx >= cutoff {
+                Expr::bvar(idx + amount).map_err(|_| {
+                    Stop::Reject(
+                        RejectClass::BlockMismatch,
+                        "nested translation lifted a bound variable out of range".into(),
+                    )
+                })?
+            } else {
+                e.clone()
+            }
+        }
+        ExprNode::App { f, a } => Expr::app(
+            lift_loose_bvars(f, cutoff, amount, depth + 1)?,
+            lift_loose_bvars(a, cutoff, amount, depth + 1)?,
+        ),
+        ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::lam(
+            binder_name.clone(),
+            lift_loose_bvars(binder_type, cutoff, amount, depth + 1)?,
+            lift_loose_bvars(body, cutoff + 1, amount, depth + 1)?,
+            *binder_info,
+        ),
+        ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::forall_e(
+            binder_name.clone(),
+            lift_loose_bvars(binder_type, cutoff, amount, depth + 1)?,
+            lift_loose_bvars(body, cutoff + 1, amount, depth + 1)?,
+            *binder_info,
+        ),
+        ExprNode::LetE {
+            decl_name,
+            type_,
+            value,
+            body,
+            non_dep,
+        } => Expr::let_e(
+            decl_name.clone(),
+            lift_loose_bvars(type_, cutoff, amount, depth + 1)?,
+            lift_loose_bvars(value, cutoff, amount, depth + 1)?,
+            lift_loose_bvars(body, cutoff + 1, amount, depth + 1)?,
+            *non_dep,
+        ),
+        ExprNode::MData { data, expr } => Expr::mdata(
+            data.clone(),
+            lift_loose_bvars(expr, cutoff, amount, depth + 1)?,
+        ),
+        ExprNode::Proj {
+            struct_name,
+            idx,
+            expr,
+        } => Expr::proj(
+            struct_name.clone(),
+            *idx,
+            lift_loose_bvars(expr, cutoff, amount, depth + 1)?,
+        ),
+        _ => e.clone(),
+    })
+}
+
+/// Simultaneous substitution of the outermost `substs.len()` loose bvars:
+/// `bvar (k + j)` becomes `substs[substs.len()-1-j]` lifted by `k` — the
+/// restore step instantiates the translation's param-canonical templates at
+/// occurrence sites whose arguments are themselves open terms, which the
+/// closed-substitute [`TypeChecker::instantiate`] deliberately cannot do.
+fn subst_loose_bvars(e: &Expr, k: u32, substs: &[Expr], depth: u32) -> KResult<Expr> {
+    depth_guard(depth)?;
+    let n = substs.len() as u32;
+    if n == 0 || e.loose_bvar_range() <= k {
+        return Ok(e.clone());
+    }
+    Ok(match e.node() {
+        ExprNode::BVar { idx } => {
+            if *idx >= k && *idx < k + n {
+                let j = (idx - k) as usize;
+                lift_loose_bvars(&substs[substs.len() - 1 - j], 0, k, depth + 1)?
+            } else if *idx >= k + n {
+                Expr::bvar(idx - n).unwrap_or_else(|_| e.clone())
+            } else {
+                e.clone()
+            }
+        }
+        ExprNode::App { f, a } => Expr::app(
+            subst_loose_bvars(f, k, substs, depth + 1)?,
+            subst_loose_bvars(a, k, substs, depth + 1)?,
+        ),
+        ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::lam(
+            binder_name.clone(),
+            subst_loose_bvars(binder_type, k, substs, depth + 1)?,
+            subst_loose_bvars(body, k + 1, substs, depth + 1)?,
+            *binder_info,
+        ),
+        ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::forall_e(
+            binder_name.clone(),
+            subst_loose_bvars(binder_type, k, substs, depth + 1)?,
+            subst_loose_bvars(body, k + 1, substs, depth + 1)?,
+            *binder_info,
+        ),
+        ExprNode::LetE {
+            decl_name,
+            type_,
+            value,
+            body,
+            non_dep,
+        } => Expr::let_e(
+            decl_name.clone(),
+            subst_loose_bvars(type_, k, substs, depth + 1)?,
+            subst_loose_bvars(value, k, substs, depth + 1)?,
+            subst_loose_bvars(body, k + 1, substs, depth + 1)?,
+            *non_dep,
+        ),
+        ExprNode::MData { data, expr } => {
+            Expr::mdata(data.clone(), subst_loose_bvars(expr, k, substs, depth + 1)?)
+        }
+        ExprNode::Proj {
+            struct_name,
+            idx,
+            expr,
+        } => Expr::proj(
+            struct_name.clone(),
+            *idx,
+            subst_loose_bvars(expr, k, substs, depth + 1)?,
+        ),
+        _ => e.clone(),
+    })
+}
+
 /// Does `bvar idx` occur loose in `e`? Range-pruned.
 fn has_loose_bvar(e: &Expr, idx: u32, depth: u32) -> KResult<bool> {
     depth_guard(depth)?;
@@ -408,6 +561,11 @@ fn strip_prefix(n: &Name, prefix: &Name) -> Name {
 /// scratch environment, the telescope, and the budget meter.
 struct Engine<'a> {
     env: Environment,
+    /// The environment as it stood BEFORE this block's declarations entered
+    /// the scratch env — the nested-inductive translation checks its
+    /// synthesized auxiliary block against this baseline (pin
+    /// `add_inductive`, inductive.cpp:1116-1120).
+    base_env: Environment,
     block: &'a InductiveBlock,
     lparams: Vec<Name>,
     levels: Vec<Level>,
@@ -444,6 +602,7 @@ impl<'a> Engine<'a> {
         let levels: Vec<Level> = lparams.iter().cloned().map(Level::param).collect();
         Ok(Engine {
             env: env.clone(),
+            base_env: env.clone(),
             block,
             lparams,
             levels,
@@ -1447,55 +1606,887 @@ impl<'a> Engine<'a> {
                 })?;
         }
         if nested {
-            return self.check_nested_partial();
+            return self.check_nested_full();
         }
         self.init_elim_level()?;
         self.init_k_target();
         self.check_recursors()
     }
 
-    /// The documented nested-partial ruleset: recursor types and rule
-    /// right-hand sides must TYPECHECK against the block (with the decoded
-    /// recursors admitted for the mutual references), but neither positivity
-    /// nor regeneration runs — both live behind the pin's `_nested.*`
-    /// translation (follow-up slice; see the module doc).
-    fn check_nested_partial(&mut self) -> KResult<()> {
-        for rec in &self.block.recursors {
+    /// The synthesized-block driver: identical to [`Engine::run`] except that
+    /// the decoded-row cross-checks (`all` lists, recursivity flags, recursor
+    /// comparison) are meaningless — every row was minted by the translation
+    /// itself — so the run returns the regenerated recursors and the computed
+    /// flags for the CALLER to compare against the decoded originals.
+    fn run_synthesized(&mut self) -> KResult<(Vec<RecursorVal>, bool, bool)> {
+        self.check_inductive_types()?;
+        let is_rec = self.compute_is_rec()?;
+        let is_reflexive = self.compute_is_reflexive()?;
+        for ind in &self.block.types {
             self.env = self
                 .env
-                .add_decl(ConstantInfo::Rec(rec.clone()))
+                .add_decl(ConstantInfo::Induct(ind.clone()))
                 .map_err(|_| {
                     Stop::Reject(
                         RejectClass::AlreadyDeclared,
                         format!(
                             "`{}` is already declared",
-                            rec.base.name.to_display_string()
+                            ind.base.name.to_display_string()
                         ),
                     )
                 })?;
         }
-        for rec in &self.block.recursors.to_vec() {
-            let lparams = rec.base.level_params.clone();
-            let type_ = rec.base.type_.clone();
-            let remaining = self.remaining();
-            let mut tc = TypeChecker::new(&self.env, &lparams, remaining);
-            let outcome = tc.infer(&type_, 0);
-            let consumption = tc.consumption();
-            drop(tc);
-            self.charge(consumption)?;
-            outcome?;
-            for rule in &rec.rules {
-                let rhs = rule.rhs.clone();
-                let remaining = self.remaining();
-                let mut tc = TypeChecker::new(&self.env, &lparams, remaining);
-                let outcome = tc.infer(&rhs, 0);
-                let consumption = tc.consumption();
-                drop(tc);
-                self.charge(consumption)?;
-                outcome?;
+        self.check_constructors(true)?;
+        for ctor in &self.block.ctors {
+            self.env = self
+                .env
+                .add_decl(ConstantInfo::Ctor(ctor.clone()))
+                .map_err(|_| {
+                    Stop::Reject(
+                        RejectClass::AlreadyDeclared,
+                        format!(
+                            "`{}` is already declared",
+                            ctor.base.name.to_display_string()
+                        ),
+                    )
+                })?;
+        }
+        self.init_elim_level()?;
+        self.init_k_target();
+        let recursors = self.generate_recursors()?;
+        Ok((recursors, is_rec, is_reflexive))
+    }
+
+    // ---- the nested-inductive auxiliary translation (KR-608) ---------------------------
+    //
+    // Pin `elim_nested_inductive_fn` (inductive.cpp:882-1077), `restore`
+    // (795-873), `mk_aux_rec_name_map` (1088-1114), and the `add_inductive`
+    // driver (1116-1182), reconstructed over the DECODED (post-restore) rows:
+    // nested occurrences in constructor fields are replaced by auxiliary
+    // types copied whole-block from the environment with their parameters
+    // instantiated at the occurrence; the synthesized mutual block passes the
+    // FULL ordinary ruleset — strict positivity included — against the
+    // pre-block environment; its regenerated recursors are renamed
+    // (`main.rec`, `main.rec_1`, …) and translated back; and the result must
+    // match the decoded rows byte-exactly. Auxiliary names never survive the
+    // restore, so their exact spelling is kernel-internal (the pin's
+    // `_nested.*` uniquifier collides against ITS environment, which the
+    // artifact does not carry).
+
+    /// The full nested ruleset: translate, check the auxiliary block under
+    /// every ordinary rule, regenerate, restore, and compare.
+    fn check_nested_full(&mut self) -> KResult<()> {
+        // 1. Forward translation (pin worklist order: main constructors
+        //    first, then each minted auxiliary's constructors in creation
+        //    order — recursor numbering depends on it).
+        let mut st = NestedState::default();
+        let mut main_types = self.block.types.to_vec();
+        let mut main_ctors = self.block.ctors.to_vec();
+        for ctor in &mut main_ctors {
+            let translated = self.nested_replace_ctor(&ctor.base.type_.clone(), &mut st)?;
+            ctor.base.type_ = translated;
+        }
+        let mut next = 0usize;
+        while next < st.aux_ctors.len() {
+            let untranslated = st.aux_ctors[next].base.type_.clone();
+            let translated = self.nested_replace_ctor(&untranslated, &mut st)?;
+            st.aux_ctors[next].base.type_ = translated;
+            next += 1;
+        }
+        if st.auxes.is_empty() {
+            return reject(
+                RejectClass::BlockMismatch,
+                "decoded num_nested is nonzero but no nested occurrence exists",
+            );
+        }
+        // The translated `all` list: main types then auxiliaries.
+        let all: Vec<Name> = main_types
+            .iter()
+            .map(|t| t.base.name.clone())
+            .chain(st.aux_types.iter().map(|t| t.base.name.clone()))
+            .collect();
+        for t in main_types.iter_mut().chain(st.aux_types.iter_mut()) {
+            t.all = all.clone();
+            t.num_nested = 0;
+        }
+        let aux_count = st.auxes.len() as u32;
+        let main_count = main_types.len();
+        let mut types = main_types;
+        types.append(&mut st.aux_types);
+        let mut ctors = main_ctors;
+        ctors.append(&mut st.aux_ctors);
+        let translated_block = InductiveBlock {
+            types,
+            ctors,
+            recursors: Vec::new(),
+        };
+
+        // 2. The FULL ordinary ruleset over the synthesized block, against
+        //    the pre-block environment (pin add_inductive → add_inductive_fn).
+        let mut aux_engine = Engine::new(&self.base_env, &translated_block, self.remaining())?;
+        let outcome = aux_engine.run_synthesized();
+        let spent = aux_engine.used;
+        drop(aux_engine);
+        self.charge(spent)?;
+        let (generated, comp_is_rec, comp_is_reflexive) = outcome?;
+
+        // 3. Decoded observables against the translation (pin restore keeps
+        //    the CHECKER-computed flags, so the decoded rows must carry them;
+        //    the decoded num_nested counts the minted auxiliaries).
+        for ind in &self.block.types {
+            if ind.num_nested != aux_count {
+                return reject(
+                    RejectClass::BlockMismatch,
+                    format!(
+                        "decoded num_nested {} at `{}` vs {} translated auxiliaries",
+                        ind.num_nested,
+                        ind.base.name.to_display_string(),
+                        aux_count
+                    ),
+                );
+            }
+            if ind.is_rec != comp_is_rec || ind.is_reflexive != comp_is_reflexive {
+                return reject(
+                    RejectClass::BlockMismatch,
+                    format!(
+                        "decoded recursivity flags mismatch at `{}` (is_rec {} vs {}, is_reflexive {} vs {})",
+                        ind.base.name.to_display_string(),
+                        ind.is_rec,
+                        comp_is_rec,
+                        ind.is_reflexive,
+                        comp_is_reflexive
+                    ),
+                );
             }
         }
+
+        // 4. Restore: rename the auxiliary recursors (`main.rec_i`), map the
+        //    auxiliary constants back to their original instantiated forms,
+        //    and compare byte-exactly against the decoded rows — matched BY
+        //    NAME (the artifact's row order is module order, not block order).
+        let mut rec_rename: Vec<(Name, Name)> = Vec::new();
+        let base_rec = mk_rec_name(&self.block.types[0].base.name);
+        for (i, g) in generated.iter().enumerate().skip(main_count) {
+            rec_rename.push((
+                g.base.name.clone(),
+                append_after(&base_rec, &format!("_{}", i - main_count + 1)),
+            ));
+        }
+        let main_names: Vec<Name> = self
+            .block
+            .types
+            .iter()
+            .map(|t| t.base.name.clone())
+            .collect();
+        if self.block.recursors.len() != generated.len() {
+            return reject(
+                RejectClass::BlockMismatch,
+                format!(
+                    "block declares {} recursors, expected {} (main + auxiliary)",
+                    self.block.recursors.len(),
+                    generated.len()
+                ),
+            );
+        }
+        for (i, g) in generated.iter().enumerate() {
+            let restored_name = if i < main_count {
+                g.base.name.clone()
+            } else {
+                rec_rename[i - main_count].1.clone()
+            };
+            let restored_ty = self.restore_expr(&g.base.type_, &st, &rec_rename, 0)?;
+            let mut restored_rules = Vec::with_capacity(g.rules.len());
+            for rule in &g.rules {
+                restored_rules.push(RecursorRule {
+                    ctor: st.restore_ctor_name(&rule.ctor),
+                    nfields: rule.nfields,
+                    rhs: self.restore_expr(&rule.rhs, &st, &rec_rename, 0)?,
+                });
+            }
+            let restored = RecursorVal {
+                base: fln_env::constants::ConstantVal {
+                    name: restored_name.clone(),
+                    level_params: g.base.level_params.clone(),
+                    type_: restored_ty,
+                },
+                all: main_names.clone(),
+                num_params: g.num_params,
+                num_indices: g.num_indices,
+                num_motives: g.num_motives,
+                num_minors: g.num_minors,
+                rules: restored_rules,
+                k: g.k,
+                is_unsafe: g.is_unsafe,
+            };
+            let Some(decoded) = self
+                .block
+                .recursors
+                .iter()
+                .find(|r| r.base.name == restored_name)
+            else {
+                return reject(
+                    RejectClass::BlockMismatch,
+                    format!(
+                        "decoded block lacks recursor `{}`",
+                        restored_name.to_display_string()
+                    ),
+                );
+            };
+            compare_recursors(&restored, decoded)?;
+        }
         Ok(())
+    }
+
+    /// Translate one closed constructor type: the leading `nparams` binders
+    /// (the block's parameters) are carried verbatim — the pin re-abstracts
+    /// them and never translates inside them — and the field region is
+    /// rewritten by [`Engine::nested_replace`].
+    fn nested_replace_ctor(&mut self, closed: &Expr, st: &mut NestedState) -> KResult<Expr> {
+        let mut binders: Vec<(Name, Expr, BinderInfo)> = Vec::new();
+        let mut t = closed.clone();
+        for _ in 0..self.nparams {
+            let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } = t.node()
+            else {
+                return reject(
+                    RejectClass::BlockMismatch,
+                    "constructor type is shorter than the block's parameter telescope",
+                );
+            };
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            t = body.clone();
+        }
+        let mut rebuilt = self.nested_replace(&t, 0, 0, st)?;
+        for (name, ty, info) in binders.into_iter().rev() {
+            rebuilt = Expr::forall_e(name, ty, rebuilt, info);
+        }
+        Ok(rebuilt)
+    }
+
+    /// The pin's `replace_all_nested`/`replace_if_nested` over a closed field
+    /// region: `inner` counts binders below the parameter telescope, so a
+    /// parameter `j` reads `bvar (inner + nparams - 1 - j)`.
+    fn nested_replace(
+        &mut self,
+        e: &Expr,
+        inner: u32,
+        depth: u32,
+        st: &mut NestedState,
+    ) -> KResult<Expr> {
+        depth_guard(depth)?;
+        // Decompose an application spine.
+        let mut args: Vec<Expr> = Vec::new();
+        let mut head = e.clone();
+        while let ExprNode::App { f, a } = head.node() {
+            args.push(a.clone());
+            let next = f.clone();
+            head = next;
+        }
+        args.reverse();
+        if let ExprNode::Const { name, levels } = head.node()
+            && !args.is_empty()
+            && !st.is_aux_name(name)
+            && !self.block.types.iter().any(|t| &t.base.name == name)
+        {
+            let head_row = self.base_env.find(name).cloned();
+            if let Some(ConstantInfo::Induct(iv)) = head_row {
+                let np = iv.num_params as usize;
+                let mut mentions = false;
+                for a in args.iter().take(np) {
+                    if self.mentions_block_type(a, st)? {
+                        mentions = true;
+                        break;
+                    }
+                }
+                if mentions {
+                    if args.len() < np {
+                        return reject(
+                            RejectClass::BlockMismatch,
+                            format!(
+                                "nested occurrence of `{}` is under-applied",
+                                name.to_display_string()
+                            ),
+                        );
+                    }
+                    // Canonicalize the parametric prefix (pin replace_params;
+                    // loose non-parameter variables are the pin's hard error).
+                    let mut canonical: Vec<Expr> = Vec::with_capacity(np);
+                    for arg in args.iter().take(np) {
+                        canonical.push(self.lower_to_param_canonical(arg, inner, 0)?);
+                    }
+                    let key = fold_app(
+                        Expr::const_(name.clone(), levels.clone()),
+                        canonical.iter().cloned(),
+                    );
+                    let aux_name = match st.lookup_aux(&key) {
+                        Some(found) => found,
+                        None => self.nested_mint(&iv, levels.clone(), &canonical, &key, st)?,
+                    };
+                    // `auxI params trailing…` at this site.
+                    let mut replacement = Expr::const_(aux_name, self.levels.clone());
+                    for j in 0..self.nparams {
+                        replacement = Expr::app(
+                            replacement,
+                            Expr::bvar(inner + (self.nparams - 1 - j) as u32).map_err(|_| {
+                                Stop::Reject(
+                                    RejectClass::BlockMismatch,
+                                    "nested translation parameter reference out of range".into(),
+                                )
+                            })?,
+                        );
+                    }
+                    for trailing in &args[np..] {
+                        replacement = Expr::app(
+                            replacement,
+                            self.nested_replace(trailing, inner, depth + 1, st)?,
+                        );
+                    }
+                    return Ok(replacement);
+                }
+            }
+        }
+        // Not a nested application: rebuild structurally.
+        if !args.is_empty() {
+            let mut rebuilt = self.nested_replace(&head, inner, depth + 1, st)?;
+            for a in &args {
+                rebuilt = Expr::app(rebuilt, self.nested_replace(a, inner, depth + 1, st)?);
+            }
+            return Ok(rebuilt);
+        }
+        Ok(match e.node() {
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => Expr::lam(
+                binder_name.clone(),
+                self.nested_replace(binder_type, inner, depth + 1, st)?,
+                self.nested_replace(body, inner + 1, depth + 1, st)?,
+                *binder_info,
+            ),
+            ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => Expr::forall_e(
+                binder_name.clone(),
+                self.nested_replace(binder_type, inner, depth + 1, st)?,
+                self.nested_replace(body, inner + 1, depth + 1, st)?,
+                *binder_info,
+            ),
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                non_dep,
+            } => Expr::let_e(
+                decl_name.clone(),
+                self.nested_replace(type_, inner, depth + 1, st)?,
+                self.nested_replace(value, inner, depth + 1, st)?,
+                self.nested_replace(body, inner + 1, depth + 1, st)?,
+                *non_dep,
+            ),
+            ExprNode::MData { data, expr } => Expr::mdata(
+                data.clone(),
+                self.nested_replace(expr, inner, depth + 1, st)?,
+            ),
+            ExprNode::Proj {
+                struct_name,
+                idx,
+                expr,
+            } => Expr::proj(
+                struct_name.clone(),
+                *idx,
+                self.nested_replace(expr, inner, depth + 1, st)?,
+            ),
+            _ => e.clone(),
+        })
+    }
+
+    /// Does the expression mention a type of the (translated) block?
+    fn mentions_block_type(&mut self, e: &Expr, st: &NestedState) -> KResult<bool> {
+        let mut stack = vec![e.clone()];
+        let mut visited = 0u64;
+        while let Some(x) = stack.pop() {
+            visited += 1;
+            if visited > 100_000 {
+                return Err(Stop::Exhausted(ExhaustionReason::Steps));
+            }
+            match x.node() {
+                ExprNode::Const { name, .. } => {
+                    if st.is_aux_name(name) || self.block.types.iter().any(|t| &t.base.name == name)
+                    {
+                        return Ok(true);
+                    }
+                }
+                ExprNode::App { f, a } => {
+                    stack.push(f.clone());
+                    stack.push(a.clone());
+                }
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    stack.push(binder_type.clone());
+                    stack.push(body.clone());
+                }
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => {
+                    stack.push(type_.clone());
+                    stack.push(value.clone());
+                    stack.push(body.clone());
+                }
+                ExprNode::MData { expr, .. } => stack.push(expr.clone()),
+                ExprNode::Proj { expr, .. } => stack.push(expr.clone()),
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
+    /// Shift a parametric argument into param-canonical space (parameters at
+    /// `bvar (nparams-1-j)`): every loose bvar must reach INTO the parameter
+    /// telescope — the pin rejects nested parameters that capture local
+    /// variables (inductive.cpp:949).
+    fn lower_to_param_canonical(&self, e: &Expr, inner: u32, depth: u32) -> KResult<Expr> {
+        depth_guard(depth)?;
+        if e.loose_bvar_range() == 0 {
+            return Ok(e.clone());
+        }
+        Ok(match e.node() {
+            ExprNode::BVar { idx } => {
+                if *idx < inner {
+                    return reject(
+                        RejectClass::BlockMismatch,
+                        "nested inductive datatype parameters cannot contain local variables",
+                    );
+                }
+                let lowered = idx - inner;
+                if lowered as usize >= self.nparams {
+                    return reject(
+                        RejectClass::BlockMismatch,
+                        "nested occurrence parameter reference escapes the telescope",
+                    );
+                }
+                Expr::bvar(lowered).unwrap_or_else(|_| e.clone())
+            }
+            ExprNode::App { f, a } => Expr::app(
+                self.lower_to_param_canonical(f, inner, depth + 1)?,
+                self.lower_to_param_canonical(a, inner, depth + 1)?,
+            ),
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => Expr::lam(
+                binder_name.clone(),
+                self.lower_to_param_canonical(binder_type, inner, depth + 1)?,
+                self.lower_to_param_canonical(body, inner + 1, depth + 1)?,
+                *binder_info,
+            ),
+            ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => Expr::forall_e(
+                binder_name.clone(),
+                self.lower_to_param_canonical(binder_type, inner, depth + 1)?,
+                self.lower_to_param_canonical(body, inner + 1, depth + 1)?,
+                *binder_info,
+            ),
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                non_dep,
+            } => Expr::let_e(
+                decl_name.clone(),
+                self.lower_to_param_canonical(type_, inner, depth + 1)?,
+                self.lower_to_param_canonical(value, inner, depth + 1)?,
+                self.lower_to_param_canonical(body, inner + 1, depth + 1)?,
+                *non_dep,
+            ),
+            ExprNode::MData { data, expr } => Expr::mdata(
+                data.clone(),
+                self.lower_to_param_canonical(expr, inner, depth + 1)?,
+            ),
+            ExprNode::Proj {
+                struct_name,
+                idx,
+                expr,
+            } => Expr::proj(
+                struct_name.clone(),
+                *idx,
+                self.lower_to_param_canonical(expr, inner, depth + 1)?,
+            ),
+            _ => e.clone(),
+        })
+    }
+
+    /// Mint auxiliaries for the WHOLE mutual block of a nested head (pin
+    /// 993-1027): every type `J` in `head.all` is copied with its own
+    /// parameters instantiated at the occurrence and re-abstracted over this
+    /// block's parameters. Returns the auxiliary standing for `head` itself.
+    fn nested_mint(
+        &mut self,
+        head: &InductiveVal,
+        site_levels: Vec<Level>,
+        canonical_args: &[Expr],
+        _key: &Expr,
+        st: &mut NestedState,
+    ) -> KResult<Name> {
+        let block_all = head.all.clone();
+        let base_idx = st.auxes.len();
+        // Register names + dedup keys for the whole copied block FIRST, so
+        // self- and sibling references resolve during the copy.
+        for (off, jn) in block_all.iter().enumerate() {
+            let aux_name = Name::num(
+                Name::str(
+                    Name::str(Name::anonymous(), "_nested"),
+                    jn.to_display_string(),
+                ),
+                (base_idx + off + 1) as u64,
+            );
+            let key_j = fold_app(
+                Expr::const_(jn.clone(), site_levels.clone()),
+                canonical_args.iter().cloned(),
+            );
+            st.aux_apps.push((key_j, aux_name));
+        }
+        // The site arguments in fvar space (canonical bvars → param fvars),
+        // legal substitutes for the budgeted closed-substitution walk.
+        let param_fvars: Vec<Expr> = self.params.iter().map(Local::fvar).collect();
+        let mut result: Option<Name> = None;
+        for (off, jn) in block_all.iter().enumerate() {
+            let aux_name = st.aux_apps[base_idx + off].1.clone();
+            if jn == &head.base.name {
+                result = Some(aux_name.clone());
+            }
+            let Some(ConstantInfo::Induct(jv)) = self.base_env.find(jn).cloned() else {
+                return reject(
+                    RejectClass::BlockMismatch,
+                    format!(
+                        "nested head block member `{}` is not an inductive in the environment",
+                        jn.to_display_string()
+                    ),
+                );
+            };
+            let np_j = jv.num_params as usize;
+            if canonical_args.len() != np_j {
+                return reject(
+                    RejectClass::BlockMismatch,
+                    format!(
+                        "nested occurrence instantiates {} of `{}`'s {} parameters",
+                        canonical_args.len(),
+                        jn.to_display_string(),
+                        np_j
+                    ),
+                );
+            }
+            let args_fvar: Vec<Expr> = canonical_args
+                .iter()
+                .map(|a| subst_loose_bvars(a, 0, &param_fvars, 0))
+                .collect::<KResult<_>>()?;
+            // The copied type: J's levels at the site, J's parameters at the
+            // instantiated arguments, re-abstracted over this block's params.
+            let j_lparams = jv.base.level_params.clone();
+            let mut jt = self.with_tc(|tc| {
+                tc.instantiate_lparams(&jv.base.type_, &j_lparams, &site_levels, 0)
+            })?;
+            for arg in &args_fvar {
+                let ExprNode::ForallE { body, .. } = jt.node() else {
+                    return reject(
+                        RejectClass::BlockMismatch,
+                        format!(
+                            "nested head `{}` type is shorter than its parameter count",
+                            jn.to_display_string()
+                        ),
+                    );
+                };
+                let body = body.clone();
+                jt = self.with_tc(|tc| tc.instantiate(&body, 0, arg, 0))?;
+            }
+            let aux_ty = mk_pi_locals(&self.params.clone(), jt)?;
+            let mut aux_ctor_names: Vec<Name> = Vec::new();
+            let mut ctor_names: Vec<(Name, Name)> = Vec::new();
+            for cn in &jv.ctors {
+                let Some(ConstantInfo::Ctor(cv)) = self.base_env.find(cn).cloned() else {
+                    return reject(
+                        RejectClass::BlockMismatch,
+                        format!(
+                            "nested head constructor `{}` is absent from the environment",
+                            cn.to_display_string()
+                        ),
+                    );
+                };
+                let mut ct = self.with_tc(|tc| {
+                    tc.instantiate_lparams(&cv.base.type_, &j_lparams, &site_levels, 0)
+                })?;
+                for arg in &args_fvar {
+                    let ExprNode::ForallE { body, .. } = ct.node() else {
+                        return reject(
+                            RejectClass::BlockMismatch,
+                            format!(
+                                "nested head constructor `{}` is shorter than its parameter count",
+                                cn.to_display_string()
+                            ),
+                        );
+                    };
+                    let body = body.clone();
+                    ct = self.with_tc(|tc| tc.instantiate(&body, 0, arg, 0))?;
+                }
+                let closed = mk_pi_locals(&self.params.clone(), ct)?;
+                let aux_ctor_name =
+                    Name::str(aux_name.clone(), strip_prefix(cn, jn).to_display_string());
+                aux_ctor_names.push(aux_ctor_name.clone());
+                ctor_names.push((aux_ctor_name.clone(), cn.clone()));
+                st.aux_ctors.push(ConstructorVal {
+                    base: fln_env::constants::ConstantVal {
+                        name: aux_ctor_name,
+                        level_params: self.lparams.clone(),
+                        type_: closed,
+                    },
+                    induct: aux_name.clone(),
+                    cidx: cv.cidx,
+                    num_params: self.nparams as u32,
+                    num_fields: cv.num_fields,
+                    is_unsafe: cv.is_unsafe,
+                });
+            }
+            st.aux_types.push(InductiveVal {
+                base: fln_env::constants::ConstantVal {
+                    name: aux_name.clone(),
+                    level_params: self.lparams.clone(),
+                    type_: aux_ty,
+                },
+                num_params: self.nparams as u32,
+                num_indices: jv.num_indices,
+                all: Vec::new(),
+                ctors: aux_ctor_names,
+                num_nested: 0,
+                is_rec: false,
+                is_unsafe: self.is_unsafe,
+                is_reflexive: false,
+            });
+            st.auxes.push(NestedAux {
+                aux_name,
+                orig_app: st.aux_apps[base_idx + off].0.clone(),
+                site_levels: site_levels.clone(),
+                inst_args: canonical_args.to_vec(),
+                ctor_names,
+            });
+        }
+        result.ok_or_else(|| {
+            Stop::Reject(
+                RejectClass::BlockMismatch,
+                "nested head is absent from its own mutual block".into(),
+            )
+        })
+    }
+
+    /// The pin's `restore_nested` (inductive.cpp:828-872) on closed terms:
+    /// renamed auxiliary recursors, auxiliary type applications mapped back
+    /// to the original instantiated occurrence, auxiliary constructor
+    /// applications mapped back to the original constructor.
+    fn restore_expr(
+        &self,
+        e: &Expr,
+        st: &NestedState,
+        rec_rename: &[(Name, Name)],
+        depth: u32,
+    ) -> KResult<Expr> {
+        depth_guard(depth)?;
+        let mut args: Vec<Expr> = Vec::new();
+        let mut head = e.clone();
+        while let ExprNode::App { f, a } = head.node() {
+            args.push(a.clone());
+            let next = f.clone();
+            head = next;
+        }
+        args.reverse();
+        if let ExprNode::Const { name, levels } = head.node() {
+            let mut restored_args = Vec::with_capacity(args.len());
+            for a in &args {
+                restored_args.push(self.restore_expr(a, st, rec_rename, depth + 1)?);
+            }
+            if let Some((_, renamed)) = rec_rename.iter().find(|(g, _)| g == name) {
+                return Ok(fold_app(
+                    Expr::const_(renamed.clone(), levels.clone()),
+                    restored_args.into_iter(),
+                ));
+            }
+            if let Some(aux) = st.auxes.iter().find(|a| &a.aux_name == name) {
+                // `auxJ params… trailing…` → the original occurrence with the
+                // canonical template instantiated at THIS site's parameters.
+                if restored_args.len() < self.nparams {
+                    return reject(
+                        RejectClass::BlockMismatch,
+                        "auxiliary type application is under-applied in a generated recursor",
+                    );
+                }
+                let site_params = &restored_args[..self.nparams];
+                let body = subst_loose_bvars(&aux.orig_app, 0, site_params, depth + 1)?;
+                return Ok(fold_app(
+                    body,
+                    restored_args[self.nparams..].iter().cloned(),
+                ));
+            }
+            if let Some((aux, orig_ctor)) = st.find_aux_ctor(name) {
+                if restored_args.len() < self.nparams {
+                    return reject(
+                        RejectClass::BlockMismatch,
+                        "auxiliary constructor application is under-applied in a generated recursor",
+                    );
+                }
+                let template = fold_app(
+                    Expr::const_(orig_ctor.clone(), aux.site_levels.clone()),
+                    aux.inst_args.iter().cloned(),
+                );
+                let site_params = &restored_args[..self.nparams];
+                let body = subst_loose_bvars(&template, 0, site_params, depth + 1)?;
+                return Ok(fold_app(
+                    body,
+                    restored_args[self.nparams..].iter().cloned(),
+                ));
+            }
+            return Ok(fold_app(head.clone(), restored_args.into_iter()));
+        }
+        if !args.is_empty() {
+            let restored_head = self.restore_expr(&head, st, rec_rename, depth + 1)?;
+            let mut out = restored_head;
+            for a in &args {
+                out = Expr::app(out, self.restore_expr(a, st, rec_rename, depth + 1)?);
+            }
+            return Ok(out);
+        }
+        Ok(match e.node() {
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => Expr::lam(
+                binder_name.clone(),
+                self.restore_expr(binder_type, st, rec_rename, depth + 1)?,
+                self.restore_expr(body, st, rec_rename, depth + 1)?,
+                *binder_info,
+            ),
+            ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => Expr::forall_e(
+                binder_name.clone(),
+                self.restore_expr(binder_type, st, rec_rename, depth + 1)?,
+                self.restore_expr(body, st, rec_rename, depth + 1)?,
+                *binder_info,
+            ),
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                non_dep,
+            } => Expr::let_e(
+                decl_name.clone(),
+                self.restore_expr(type_, st, rec_rename, depth + 1)?,
+                self.restore_expr(value, st, rec_rename, depth + 1)?,
+                self.restore_expr(body, st, rec_rename, depth + 1)?,
+                *non_dep,
+            ),
+            ExprNode::MData { data, expr } => Expr::mdata(
+                data.clone(),
+                self.restore_expr(expr, st, rec_rename, depth + 1)?,
+            ),
+            ExprNode::Proj {
+                struct_name,
+                idx,
+                expr,
+            } => Expr::proj(
+                struct_name.clone(),
+                *idx,
+                self.restore_expr(expr, st, rec_rename, depth + 1)?,
+            ),
+            _ => e.clone(),
+        })
+    }
+}
+
+/// Left fold of applications.
+fn fold_app(head: Expr, args: impl Iterator<Item = Expr>) -> Expr {
+    let mut out = head;
+    for a in args {
+        out = Expr::app(out, a);
+    }
+    out
+}
+
+/// One auxiliary type minted by the nested translation, with everything the
+/// restore step inverts.
+struct NestedAux {
+    aux_name: Name,
+    /// The original occurrence in param-canonical form (`Const(head, site
+    /// levels)` applied to the instantiated parameter args, this block's
+    /// parameters as the outermost bvars).
+    orig_app: Expr,
+    site_levels: Vec<Level>,
+    inst_args: Vec<Expr>,
+    /// auxiliary ctor name → original ctor name, in `cidx` order.
+    ctor_names: Vec<(Name, Name)>,
+}
+
+/// The forward translation's accumulating state.
+#[derive(Default)]
+struct NestedState {
+    /// Dedup registry (pin `m_nested_aux`): normalized original application →
+    /// auxiliary type name.
+    aux_apps: Vec<(Expr, Name)>,
+    auxes: Vec<NestedAux>,
+    aux_types: Vec<InductiveVal>,
+    aux_ctors: Vec<ConstructorVal>,
+}
+
+impl NestedState {
+    fn is_aux_name(&self, n: &Name) -> bool {
+        self.aux_types.iter().any(|t| &t.base.name == n)
+    }
+
+    fn lookup_aux(&self, key: &Expr) -> Option<Name> {
+        self.aux_apps
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, n)| n.clone())
+    }
+
+    fn find_aux_ctor(&self, n: &Name) -> Option<(&NestedAux, &Name)> {
+        for aux in &self.auxes {
+            for (aux_ctor, orig_ctor) in &aux.ctor_names {
+                if aux_ctor == n {
+                    return Some((aux, orig_ctor));
+                }
+            }
+        }
+        None
+    }
+
+    fn restore_ctor_name(&self, n: &Name) -> Name {
+        self.find_aux_ctor(n)
+            .map(|(_, orig)| orig.clone())
+            .unwrap_or_else(|| n.clone())
     }
 }
 
