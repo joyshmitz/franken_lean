@@ -21,6 +21,9 @@
 //! * `FLN-STRUCT-022` unsafe-boundary export violates fail-closed D3 law (b)
 //! * `FLN-STRUCT-023` dependency path does not resolve to its acknowledged package
 //! * `FLN-STRUCT-024` reviewed graph weakens a constitutional baseline rule
+//! * `FLN-STRUCT-025` expansion covenant violation (macro-using boundary crate whose
+//!   fully expanded surface exports, synthesizes an unsafe allowance, or cannot be
+//!   deterministically expanded — incl. feature-conditional unknowns)
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -937,9 +940,14 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         }
     }
 
-    // D3 law (b), fail-closed scaffold form. A type-aware public-API reachability
-    // classifier will eventually admit only membrane-safe outputs; until it exists, an
-    // unsafe crate exports nothing externally, which soundly prevents laundering.
+    // D3 law (b), no-admission export covenant (bead fln-lld, replacing the fln-8mj
+    // fail-closed scaffold). Textual layer: a boundary crate has no bare-`pub` item,
+    // no symbol-export attribute, no macro definition, and no source escape.
+    // Expansion layer: if the crate INVOKES macros (D1 closes the macro universe to
+    // std's own), the fully expanded crate — every compiled cfg — must still satisfy
+    // the same export rules and must not synthesize `allow(unsafe_code)` beyond the
+    // ledgered source sites. Anything that cannot be verified (expansion failure,
+    // feature-conditional cfg unknowns) fails closed as FLN-STRUCT-025.
     for c in &discovered {
         let is_boundary = g
             .crates
@@ -954,16 +962,24 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         }
         let mut exports = Vec::new();
         ledger::scan_external_exports(&src, &format!("{}/src", c.rel), &mut exports)?;
+        let textual_export_findings = !exports.is_empty();
         for site in exports {
             findings.push(Finding {
                 code: "FLN-STRUCT-022",
                 path: format!("{}:{}", site.path, site.line),
                 detail: format!(
-                    "{} in unsafe boundary `{}` is forbidden until a type-aware no-admission export covenant exists (D3 law b)",
+                    "{} in unsafe boundary `{}` is forbidden (D3 law b no-admission covenant)",
                     site.detail, c.name
                 ),
             });
         }
+        // Expansion covenant trigger: any macro invocation in the crate's sources.
+        // Skipped when textual export findings already fail the crate (the source
+        // fix comes first, and the expansion would fail on the same surface).
+        if textual_export_findings {
+            continue;
+        }
+        findings.extend(expansion_covenant(root, c)?);
     }
 
     // ---- line-count covenants ----------------------------------------------------------
@@ -1017,4 +1033,157 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         edge_count: actual_edges.len(),
         graph_digest,
     })
+}
+
+/// The expansion covenant (FLN-STRUCT-025, bead fln-lld). For a boundary
+/// crate whose sources invoke macros, verify the FULLY EXPANDED crate — once
+/// per compiled cfg (`--lib`, and `--lib --profile test` for the
+/// unit-test cfg) — still satisfies D3 law (b):
+///
+/// * no externally public item, symbol-export attribute, or `global_asm!`
+///   in the expanded surface;
+/// * no more `allow(unsafe_code)` attributes than the marker-carrying source
+///   sites (a macro cannot synthesize an unledgered allowance);
+/// * no feature axis at all (features make the compiled cfg set open-ended —
+///   a cfg-dependent unknown, rejected outright).
+///
+/// Soundness rests on D1: the closed dependency universe means the only
+/// macros a boundary crate can invoke are `std`'s own — after expansion,
+/// whatever they produced is literal text and textual scanning is exact.
+/// Every failure mode (including a failed expansion run) is a finding,
+/// never a skip.
+fn expansion_covenant(root: &Path, c: &DiscoveredCrate) -> Result<Vec<Finding>, String> {
+    let src = c.dir.join("src");
+    let mut sources = Vec::new();
+    collect_rs_files(&src, &mut sources)?;
+    sources.sort();
+    let mut invokes_macros = false;
+    let mut source_allow_count = 0usize;
+    let mut findings = Vec::new();
+    for path in &sources {
+        let text = fs::read_to_string(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if !ledger::macro_invocation_lines(&text).is_empty() {
+            invokes_macros = true;
+        }
+        source_allow_count += ledger::count_allow_unsafe_attributes(&text);
+        if text.contains("cfg(feature") || text.contains("cfg_attr(feature") {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            findings.push(Finding {
+                code: "FLN-STRUCT-025",
+                path: rel,
+                detail: format!(
+                    "feature-conditional code in boundary `{}` is a cfg-dependent unknown; the expansion covenant rejects open cfg axes",
+                    c.name
+                ),
+            });
+        }
+    }
+    if !invokes_macros {
+        return Ok(findings);
+    }
+    let manifest_path = c.dir.join("Cargo.toml");
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
+    if manifest_text.contains("[features]") {
+        findings.push(Finding {
+            code: "FLN-STRUCT-025",
+            path: format!("{}/Cargo.toml", c.rel),
+            detail: format!(
+                "boundary `{}` declares cargo features; the expansion covenant rejects open cfg axes",
+                c.name
+            ),
+        });
+    }
+    if !findings.is_empty() {
+        return Ok(findings);
+    }
+    for (label, test_cfg) in [("lib", false), ("lib+test-cfg", true)] {
+        match run_expansion(root, &c.name, test_cfg) {
+            Err(detail) => findings.push(Finding {
+                code: "FLN-STRUCT-025",
+                path: format!("{}/src", c.rel),
+                detail: format!(
+                    "cannot expand boundary `{}` ({label}) for the covenant; failing closed: {detail}",
+                    c.name
+                ),
+            }),
+            Ok(expanded) => {
+                // Export-surface scan applies to the shipped lib cfg only:
+                // the test harness itself synthesizes `pub` test descriptors
+                // (`#[rustc_test_marker]` items), and test targets never ship
+                // symbols — the laundering vector that remains live in test
+                // code is a synthesized unsafe allowance, which the count
+                // rule below still checks for every cfg.
+                if !test_cfg {
+                    for site in ledger::expanded_surface_violations(&expanded) {
+                        findings.push(Finding {
+                            code: "FLN-STRUCT-025",
+                            path: format!("{}/src (expanded:{label}:{})", c.rel, site.line),
+                            detail: format!(
+                                "{} of boundary `{}` (D3 law b, post-expansion)",
+                                site.detail, c.name
+                            ),
+                        });
+                    }
+                }
+                let expanded_allow_count = ledger::count_allow_unsafe_attributes(&expanded);
+                if expanded_allow_count > source_allow_count {
+                    findings.push(Finding {
+                        code: "FLN-STRUCT-025",
+                        path: format!("{}/src", c.rel),
+                        detail: format!(
+                            "expanded surface of boundary `{}` ({label}) carries {expanded_allow_count} allow(unsafe_code) attributes but only {source_allow_count} ledgered source sites exist — a macro synthesized an unsafe allowance",
+                            c.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(findings)
+}
+
+/// Run `cargo rustc -- -Zunpretty=expanded` for one cfg of a boundary crate.
+/// Deterministic for the pinned nightly; isolated target dir so concurrent
+/// builds never contend on the workspace's primary target directory.
+fn run_expansion(root: &Path, package: &str, test_cfg: bool) -> Result<String, String> {
+    let mut command = std::process::Command::new("cargo");
+    command
+        .current_dir(root)
+        .arg("rustc")
+        .arg("-q")
+        .arg("--locked")
+        .arg("-p")
+        .arg(package)
+        .arg("--lib");
+    if test_cfg {
+        command.arg("--profile").arg("test");
+    }
+    command
+        .arg("--target-dir")
+        .arg(root.join("target").join("structure-guard-expand"))
+        .arg("--")
+        .arg("-Zunpretty=expanded");
+    let output = command
+        .output()
+        .map_err(|error| format!("cargo rustc did not run: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: String = stderr
+            .lines()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(format!("cargo rustc exited {}: {tail}", output.status));
+    }
+    String::from_utf8(output.stdout).map_err(|_| "expanded output is not UTF-8".to_string())
 }

@@ -424,9 +424,13 @@ pub fn source_escape_sites(text: &str) -> Vec<ExportSite> {
     sites
 }
 
-/// Conservative scaffold rule for D3 law (b): until a type-aware export classifier exists,
-/// a boundary crate has no externally public Rust or symbol export at all. This is a strict
-/// subset of the final membrane and therefore cannot create an unsafe admission path.
+/// D3 law (b) export rule for boundary crates: no externally public Rust item
+/// and no symbol export of any kind. Macro DEFINITIONS are likewise banned
+/// outright (they mint expansion surface other crates could invoke). Macro
+/// INVOCATIONS are no longer flagged textually — textual scanning cannot see
+/// through expansion, so they are verified by the expansion covenant instead
+/// ([`expanded_surface_violations`] over `-Zunpretty=expanded` output for
+/// every compiled cfg; bead fln-lld, replacing the fln-8mj scaffold).
 pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
     let lexemes = rust_lexemes(text);
     let mut sites = source_escape_sites(text);
@@ -435,6 +439,26 @@ pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
             sites.push(ExportSite {
                 line: lexeme.line,
                 detail: "externally public item",
+            });
+        }
+        let declarative_definition = lexeme.text == "macro_rules"
+            && lexemes.get(idx + 1).is_some_and(|next| next.text == "!");
+        // Macros 2.0: `macro name { .. }` — `macro` here is a keyword only when
+        // NOT part of `macro_rules!` and not a path segment; the next lexeme is
+        // the macro's name (an identifier, never `!` or `_rules`).
+        let macro_two_definition = lexeme.text == "macro"
+            && lexemes.get(idx + 1).is_some_and(|next| {
+                next.text != "!"
+                    && next
+                        .text
+                        .chars()
+                        .next()
+                        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            });
+        if declarative_definition || macro_two_definition {
+            sites.push(ExportSite {
+                line: lexeme.line,
+                detail: "macro definition in a boundary crate",
             });
         }
     }
@@ -452,29 +476,76 @@ pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
             }
         }
     }
-    // Once another fail-closed export/source finding exists, macro-expansion risk cannot
-    // widen the accepted surface and a duplicate finding would only obscure diagnostics.
-    if sites.is_empty() {
-        for (idx, lexeme) in lexemes.iter().enumerate() {
-            let declarative_definition = lexeme.text == "macro_rules"
-                && lexemes.get(idx + 1).is_some_and(|next| next.text == "!");
-            let macro_invocation = lexeme.text == "!"
-                && idx > 0
-                && lexemes[idx - 1].text != "include"
-                && lexemes
-                    .get(idx + 1)
-                    .is_some_and(|next| matches!(next.text.as_str(), "(" | "[" | "{"))
-                && lexemes[idx - 1]
-                    .text
-                    .chars()
-                    .next()
-                    .is_some_and(|first| first.is_ascii_alphabetic() || first == '_');
-            let macro_two_definition =
-                lexeme.text == "macro" && lexemes.get(idx + 1).is_some_and(|next| next.text != "!");
-            if declarative_definition || macro_invocation || macro_two_definition {
+    sites.sort_by_key(|site| (site.line, site.detail));
+    sites.dedup_by_key(|site| (site.line, site.detail));
+    sites
+}
+
+/// Lines containing macro invocations (`name!(..)` / `name![..]` / `name!{..}`),
+/// excluding `include!` (a source-escape finding) and macro definitions (an
+/// export finding). Any such line makes the boundary crate subject to the
+/// expansion covenant.
+pub fn macro_invocation_lines(text: &str) -> Vec<usize> {
+    let lexemes = rust_lexemes(text);
+    let mut lines = Vec::new();
+    for (idx, lexeme) in lexemes.iter().enumerate() {
+        let macro_invocation = lexeme.text == "!"
+            && idx > 0
+            && lexemes[idx - 1].text != "include"
+            && lexemes[idx - 1].text != "macro_rules"
+            && lexemes
+                .get(idx + 1)
+                .is_some_and(|next| matches!(next.text.as_str(), "(" | "[" | "{"))
+            && lexemes[idx - 1]
+                .text
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_');
+        if macro_invocation {
+            lines.push(lexeme.line);
+        }
+    }
+    lines.dedup();
+    lines
+}
+
+/// The expansion covenant's surface scan (bead fln-lld): run over the FULLY
+/// EXPANDED crate text (`rustc -Zunpretty=expanded`, one run per compiled
+/// cfg), where nothing can hide behind a macro any more. In expanded form a
+/// boundary crate must still contain: no bare `pub` item, no
+/// `macro_export`/`no_mangle`/`export_name` attribute, and no
+/// `global_asm!` (which can define symbols below the attribute layer).
+/// D1 closes the macro universe to `std`'s own macros (no proc-macro or
+/// third-party macro can even be named), so post-expansion text scanning is
+/// sound: whatever a macro synthesized is literal text here.
+pub fn expanded_surface_violations(expanded: &str) -> Vec<ExportSite> {
+    let lexemes = rust_lexemes(expanded);
+    let mut sites = Vec::new();
+    for (idx, lexeme) in lexemes.iter().enumerate() {
+        if lexeme.text == "pub" && !lexemes.get(idx + 1).is_some_and(|next| next.text == "(") {
+            sites.push(ExportSite {
+                line: lexeme.line,
+                detail: "externally public item in expanded surface",
+            });
+        }
+        if lexeme.text == "global_asm" && lexemes.get(idx + 1).is_some_and(|next| next.text == "!")
+        {
+            sites.push(ExportSite {
+                line: lexeme.line,
+                detail: "global_asm in expanded surface",
+            });
+        }
+    }
+    for attribute in attributes(expanded) {
+        for (name, detail) in [
+            ("macro_export", "exported macro in expanded surface"),
+            ("no_mangle", "unmangled symbol export in expanded surface"),
+            ("export_name", "named symbol export in expanded surface"),
+        ] {
+            if attribute.lexemes.iter().any(|lexeme| lexeme.text == name) {
                 sites.push(ExportSite {
-                    line: lexeme.line,
-                    detail: "macro expansion can synthesize an unsafe allowance or external export",
+                    line: attribute.line,
+                    detail,
                 });
             }
         }
@@ -482,6 +553,17 @@ pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
     sites.sort_by_key(|site| (site.line, site.detail));
     sites.dedup_by_key(|site| (site.line, site.detail));
     sites
+}
+
+/// Count `allow(unsafe_code)` attributes in a text (source or expanded).
+/// The expansion covenant requires: expanded count <= ledgered source count —
+/// a macro that synthesized an extra allowance would push the expanded count
+/// above the number of marker-carrying source sites.
+pub fn count_allow_unsafe_attributes(text: &str) -> usize {
+    attributes(text)
+        .iter()
+        .filter(|attribute| attribute_sets_lint_directly(attribute, "allow", "unsafe_code"))
+        .count()
 }
 
 pub fn scan_external_exports(
@@ -696,13 +778,94 @@ fn two() {}
             external_export_sites("#[path = \"outside.rs\"] mod outside;\n").len(),
             1
         );
-        assert_eq!(
-            external_export_sites("hidden_policy!(allow, unsafe_code);\n").len(),
-            1
-        );
+        // Macro DEFINITIONS stay textually banned (they mint expansion surface)…
         assert_eq!(
             external_export_sites("macro_rules! hidden { () => {} }\n").len(),
             1
+        );
+        assert_eq!(
+            external_export_sites("macro hidden2 { () => {} }\n").len(),
+            1
+        );
+        // …but macro INVOCATIONS are the expansion covenant's job now
+        // (FLN-STRUCT-025), not a textual finding.
+        assert!(external_export_sites("hidden_policy!(allow, unsafe_code);\n").is_empty());
+        assert_eq!(
+            macro_invocation_lines("assert!(x);\nhidden_policy!(y);\n"),
+            vec![1, 2]
+        );
+        assert!(macro_invocation_lines("include!(\"f.rs\");\n").is_empty());
+        assert!(macro_invocation_lines("macro_rules! m { () => {} }\n").is_empty());
+    }
+
+    /// Seeded expansion-covenant defects (bead fln-lld): each laundering shape
+    /// a macro could synthesize must be caught by the post-expansion scan.
+    #[test]
+    fn expansion_covenant_kills_seeded_defects() {
+        // Macro-generated bare-pub export (incl. generic / associated-type
+        // shapes — visibility, not type structure, is the export axis).
+        assert_eq!(
+            expanded_surface_violations("pub fn launder() {}\n").len(),
+            1
+        );
+        assert_eq!(
+            expanded_surface_violations("pub fn generic<T: Trait>(x: T) -> T::Out { x.out() }\n")
+                .len(),
+            1
+        );
+        assert_eq!(
+            expanded_surface_violations("pub struct Laundered(pub(crate) u8);\n").len(),
+            1
+        );
+        // Macro-generated symbol exports.
+        assert_eq!(
+            expanded_surface_violations("#[no_mangle]\nextern \"C\" fn s() {}\n").len(),
+            1
+        );
+        assert_eq!(
+            expanded_surface_violations("#[unsafe(export_name = \"lean_x\")]\nfn s() {}\n").len(),
+            1
+        );
+        assert_eq!(
+            expanded_surface_violations("#[macro_export]\nmacro_rules! m { () => {} }\n").len(),
+            1
+        );
+        // Symbol definition below the attribute layer.
+        assert_eq!(
+            expanded_surface_violations("::core::arch::global_asm!(\".globl lean_x\");\n").len(),
+            1
+        );
+        // The clean expanded shape: restricted visibility, impls, expressions.
+        assert!(
+            expanded_surface_violations(
+                "pub(crate) fn f() {}\nimpl Drop for X { fn drop(&mut self) {} }\n"
+            )
+            .is_empty()
+        );
+    }
+
+    /// Seeded allowance-synthesis defect: a macro that expands to an extra
+    /// `#[allow(unsafe_code)]` pushes the expanded count above the ledgered
+    /// source count.
+    #[test]
+    fn expansion_covenant_counts_synthesized_allowances() {
+        let source = "// UNSAFE-LEDGER: FLN-UL-0001\n#[allow(unsafe_code)]\nfn site() {}\n";
+        assert_eq!(count_allow_unsafe_attributes(source), 1);
+        let expanded_honest = "#[allow(unsafe_code)]\nfn site() {}\n";
+        assert_eq!(count_allow_unsafe_attributes(expanded_honest), 1);
+        let expanded_laundered =
+            "#[allow(unsafe_code)]\nfn site() {}\n#[allow(unsafe_code)]\nfn synthesized() {}\n";
+        assert_eq!(count_allow_unsafe_attributes(expanded_laundered), 2);
+        // Umbrella allows count too — an inner attribute smuggled via expansion
+        // is still a count increase.
+        assert_eq!(
+            count_allow_unsafe_attributes("#![allow(unsafe_code)]\nfn f() {}\n"),
+            1
+        );
+        // Unrelated lints do not count.
+        assert_eq!(
+            count_allow_unsafe_attributes("#[allow(dead_code)]\nfn f() {}\n"),
+            0
         );
     }
 
