@@ -93,8 +93,86 @@ E2E_STEP_ORDERS = {
         "cancellation_recovery",
         "final_real_recheck",
     ],
+    "environment_collision": [
+        "collision_positive",
+        "collision_mutant",
+        "collision_recovery",
+    ],
 }
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+ENVIRONMENT_COLLISION_SCHEMA = "fln.e2e.environment-collision"
+ENVIRONMENT_COLLISION_VERSION = 2
+ENVIRONMENT_COLLISION_THREADS = (1, 8, 32)
+ENVIRONMENT_COLLISION_CARDINALITY = 96
+ENVIRONMENT_COLLISION_TEST = (
+    "pmap::tests::environment_collision_e2e_emits_detailed_real_path_evidence"
+)
+ENVIRONMENT_COLLISION_MUTANT_MARKER = (
+    "collision enumeration diverged: threads=1"
+)
+ENVIRONMENT_COLLISION_FIELDS = {
+    "schema",
+    "version",
+    "run_id",
+    "bead",
+    "claim_id",
+    "claim_type",
+    "invariant_id",
+    "invariant_relation",
+    "gate_id",
+    "gate_relation",
+    "parity_ledger_row",
+    "data_grade",
+    "epoch",
+    "mode",
+    "profile",
+    "platform",
+    "seed",
+    "cache_state",
+    "canonical_input_root",
+    "scenario",
+    "schedule_id",
+    "status",
+    "cwd",
+    "argv",
+    "stdout_artifact",
+    "stderr_artifact",
+    "collision_cardinality",
+    "collision_hash",
+    "threads",
+    "workers_built",
+    "distinct_insertion_orders",
+    "representative_insertion_order",
+    "worker_insertion_orders",
+    "expected_enumeration",
+    "actual_enumeration",
+    "worker_enumerations",
+    "expected_root",
+    "actual_root",
+    "worker_roots",
+    "enumeration_insert_operations",
+    "environment_insert_operations",
+    "environment_duplicate_checks",
+    "observed_enumeration_nodes",
+    "observed_environment_entries",
+    "theoretical_fresh_node_bound_per_insert",
+    "theoretical_replaced_node_bound_per_insert",
+    "operation_budget",
+    "bucket_policy",
+    "lookup_complexity",
+    "insert_complexity",
+    "resource_followup",
+    "monotonic_start_us",
+    "monotonic_end_us",
+    "duration_us",
+    "timing_used_as_gate",
+    "process_exit",
+    "signal",
+    "first_divergence",
+    "cleanup_status",
+    "final_state",
+}
 
 MAX_RECORD_BYTES = 1_048_576
 MAX_LOG_BYTES = 67_108_864
@@ -1534,6 +1612,483 @@ def validate_guard(
         "verdict": expected_verdict,
         "findings": actual_findings,
         "sha256": digest,
+    }
+
+
+def environment_collision_insertion_order(
+    cardinality: int, partitions: int, rotation: int
+) -> list[int]:
+    rows: list[list[int]] = []
+    for partition in range(partitions):
+        row = list(range(partition, cardinality, partitions))
+        if partition % 2 == 0:
+            row.reverse()
+        rows.append(row)
+    offset = rotation % partitions
+    rows = rows[offset:] + rows[:offset]
+    return [component for row in rows for component in row]
+
+
+def read_environment_collision_stream(
+    path: Path, artifact_root: Path, *, label: str
+) -> tuple[Path, bytes, str, str, str]:
+    root = lexical_absolute(artifact_root)
+    absolute = require_within(path, root, label=f"environment-collision {label}")
+    data, _size, digest = stable_file_facts(absolute, max_bytes=MAX_LOG_BYTES)
+    if data and not data.endswith(b"\n"):
+        raise EvidenceError(
+            f"environment-collision {label} is unterminated: {absolute}"
+        )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(
+            f"environment-collision {label} is not UTF-8: {absolute}"
+        ) from error
+    for number, raw_line in enumerate(data.splitlines(), 1):
+        if len(raw_line) > MAX_RECORD_BYTES:
+            raise EvidenceError(
+                f"{absolute}:{number}: environment-collision {label} line is too large"
+            )
+    relative = absolute.relative_to(root).as_posix()
+    return absolute, data, text, digest, relative
+
+
+def environment_collision_failure_material(text: str) -> bool:
+    failed_forms = {
+        f"{ENVIRONMENT_COLLISION_TEST} --- FAILED",
+        f"test {ENVIRONMENT_COLLISION_TEST} ... FAILED",
+    }
+    for line in text.splitlines():
+        stripped = line.strip()
+        if (
+            stripped in failed_forms
+            or stripped.startswith("test result: FAILED.")
+            or stripped.startswith("thread '")
+            and " panicked at " in stripped
+            or re.fullmatch(r"assertion .* failed(?:: .*)?", stripped) is not None
+            or stripped.startswith("error: test failed")
+        ):
+            return True
+    return False
+
+
+def validate_environment_collision(
+    stdout_path: Path,
+    stderr_path: Path,
+    phase: str,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+    expected_cwd: str | None = None,
+    expected_argv: str | None = None,
+    expected_cache_state: str | None = None,
+) -> dict[str, Any]:
+    if phase not in {"positive", "mutant", "recovery"}:
+        raise EvidenceError(f"unsupported environment-collision phase: {phase!r}")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", expected_run_id):
+        raise EvidenceError("environment-collision run id is malformed")
+    if not isinstance(observed_exit, int) or isinstance(observed_exit, bool):
+        raise EvidenceError("environment-collision observed exit is not an integer")
+    expected_exit = 101 if phase == "mutant" else 0
+    if observed_exit != expected_exit:
+        raise EvidenceError(
+            f"environment-collision {phase} exit {observed_exit}, expected {expected_exit}"
+        )
+
+    root = lexical_absolute(artifact_root)
+    stdout_path, stdout_data, stdout_text, stdout_digest, stdout_relative = (
+        read_environment_collision_stream(stdout_path, root, label="stdout")
+    )
+    stderr_path, stderr_data, stderr_text, stderr_digest, stderr_relative = (
+        read_environment_collision_stream(stderr_path, root, label="stderr")
+    )
+    if stdout_path == stderr_path:
+        raise EvidenceError("environment-collision stdout and stderr are not distinct")
+    for label, expected, actual in (
+        ("stdout", expected_stdout_artifact, stdout_relative),
+        ("stderr", expected_stderr_artifact, stderr_relative),
+    ):
+        expected_path = Path(expected)
+        if (
+            not expected
+            or expected_path.is_absolute()
+            or ".." in expected_path.parts
+            or expected in {"."}
+            or expected_path.as_posix() != expected
+        ):
+            raise EvidenceError(
+                f"environment-collision expected {label} artifact is not a canonical relative path"
+            )
+        if expected != actual:
+            raise EvidenceError(
+                f"environment-collision {label} path {actual!r}, expected {expected!r}"
+            )
+
+    records: list[dict[str, Any]] = []
+    schema_marker = ENVIRONMENT_COLLISION_SCHEMA.encode("ascii")
+    if schema_marker in stderr_data:
+        raise EvidenceError("environment-collision detail rows leaked into stderr")
+    for number, raw_line in enumerate(stdout_data.splitlines(), 1):
+        if schema_marker not in raw_line:
+            continue
+        object_start = raw_line.find(b"{")
+        if object_start < 0:
+            raise EvidenceError(
+                f"{stdout_path}:{number}: collision evidence is not a JSON object"
+            )
+        value = parse_json(
+            raw_line[object_start:].strip(), subject=f"{stdout_path}:{number}"
+        )
+        if not isinstance(value, dict):
+            raise EvidenceError(
+                f"{stdout_path}:{number}: collision evidence is not an object"
+            )
+        records.append(value)
+
+    if phase == "mutant":
+        if records:
+            raise EvidenceError("killed collision mutant emitted passing detail records")
+        failed_forms = {
+            f"{ENVIRONMENT_COLLISION_TEST} --- FAILED",
+            f"test {ENVIRONMENT_COLLISION_TEST} ... FAILED",
+        }
+        failed_lines = [
+            line.strip()
+            for line in stdout_text.splitlines()
+            if line.strip() in failed_forms
+        ]
+        if len(failed_lines) != 1:
+            raise EvidenceError(
+                "collision mutant stdout lacks exactly one named FAILED test result"
+            )
+        if any(line.strip() in failed_forms for line in stderr_text.splitlines()):
+            raise EvidenceError("collision mutant FAILED test result leaked into stderr")
+        if ENVIRONMENT_COLLISION_MUTANT_MARKER in stdout_text:
+            raise EvidenceError("collision mutant assertion marker leaked into stdout")
+        marker_lines = [
+            line.strip()
+            for line in stderr_text.splitlines()
+            if ENVIRONMENT_COLLISION_MUTANT_MARKER in line
+        ]
+        expected_marker_line = re.compile(
+            r"assertion .* failed: collision enumeration diverged: threads=1"
+        )
+        if (
+            stderr_text.count(ENVIRONMENT_COLLISION_MUTANT_MARKER) != 1
+            or len(marker_lines) != 1
+            or expected_marker_line.fullmatch(marker_lines[0]) is None
+        ):
+            raise EvidenceError(
+                "collision mutant stderr lacks exactly one intended enumeration assertion marker"
+            )
+        result_lines = [
+            line.strip()
+            for line in stdout_text.splitlines()
+            if line.strip().startswith("test result: FAILED.")
+        ]
+        if len(result_lines) != 1 or not re.match(
+            r"^test result: FAILED\. 0 passed; 1 failed;", result_lines[0]
+        ):
+            raise EvidenceError(
+                "collision mutant stdout lacks the exact one-test failure summary"
+            )
+        if any(
+            line.strip().startswith("test result: FAILED.")
+            for line in stderr_text.splitlines()
+        ):
+            raise EvidenceError("collision mutant failure summary leaked into stderr")
+        if any(
+            line.strip().startswith("test result: ok.")
+            for line in (*stdout_text.splitlines(), *stderr_text.splitlines())
+        ):
+            raise EvidenceError("collision mutant streams contain a passing summary")
+        return {
+            "schema": "fln.validation/1",
+            "validator": "environment-collision/1",
+            "subject": stdout_relative,
+            "valid": True,
+            "phase": phase,
+            "run_id": expected_run_id,
+            "observed_exit": observed_exit,
+            "records": 0,
+            "failed_test": ENVIRONMENT_COLLISION_TEST,
+            "assertion_marker": ENVIRONMENT_COLLISION_MUTANT_MARKER,
+            "stdout_artifact": stdout_relative,
+            "stderr_artifact": stderr_relative,
+            "stdout_sha256": stdout_digest,
+            "stderr_sha256": stderr_digest,
+        }
+
+    expected_identity = {
+        "schema": ENVIRONMENT_COLLISION_SCHEMA,
+        "bead": "fln-amv.10",
+        "claim_id": "fln-amv.10-collision-canonicality",
+        "claim_type": "bounded_model",
+        "invariant_id": "FL-INV-01",
+        "invariant_relation": "supports-local-pmap-slice",
+        "gate_id": "PG-5",
+        "gate_relation": "partial-component-evidence",
+        "parity_ledger_row": "not_applicable_internal_data_structure_determinism",
+        "data_grade": "verified",
+        "epoch": "lean-v4.32.0",
+        "mode": "sound",
+        "profile": "e2e",
+        "seed": "partition-rotation-v1",
+        "scenario": "full-hash-collision-schedule-matrix",
+        "status": "pass",
+        "bucket_policy": "PKey-Ord",
+        "lookup_complexity": "O(bucket)",
+        "insert_complexity": "O(log(bucket))-comparisons-plus-O(bucket)-clone-shift",
+        "resource_followup": "fln-amv.13",
+        "cleanup_status": "retained_by_policy",
+        "final_state": "canonical-enumeration-and-root-verified",
+    }
+    required_cli_values = {
+        "expected cwd": expected_cwd,
+        "expected argv": expected_argv,
+        "expected cache state": expected_cache_state,
+    }
+    missing_cli = sorted(
+        label for label, value in required_cli_values.items() if not isinstance(value, str) or not value
+    )
+    if missing_cli:
+        raise EvidenceError(
+            f"environment-collision {phase} validation lacks {missing_cli!r}"
+        )
+    if not Path(expected_cwd).is_absolute():
+        raise EvidenceError("environment-collision expected cwd is not absolute")
+    if len(records) != len(ENVIRONMENT_COLLISION_THREADS):
+        raise EvidenceError(
+            f"environment-collision {phase} emitted {len(records)} detail records, "
+            f"expected {len(ENVIRONMENT_COLLISION_THREADS)}"
+        )
+    if environment_collision_failure_material(stdout_text):
+        raise EvidenceError(
+            f"environment-collision {phase} stdout contains failure material"
+        )
+    if environment_collision_failure_material(stderr_text):
+        raise EvidenceError(
+            f"environment-collision {phase} stderr contains failure material"
+        )
+    pass_result_lines = [
+        line.strip()
+        for line in stdout_text.splitlines()
+        if line.strip().startswith("test result: ok.")
+    ]
+    if len(pass_result_lines) != 1 or not re.match(
+        r"^test result: ok\. 1 passed; 0 failed;", pass_result_lines[0]
+    ):
+        raise EvidenceError(
+            f"environment-collision {phase} log lacks the exact one-test pass summary"
+        )
+
+    def exact_integer(record: dict[str, Any], key: str, expected: int) -> None:
+        value = record.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value != expected:
+            raise EvidenceError(
+                f"environment-collision {key} {value!r}, expected integer {expected}"
+            )
+
+    def integer_vector(value: Any, label: str) -> list[int]:
+        if not isinstance(value, list) or any(
+            not isinstance(item, int) or isinstance(item, bool) for item in value
+        ):
+            raise EvidenceError(f"environment-collision {label} is not an integer array")
+        return value
+
+    def integer_matrix(value: Any, label: str) -> list[list[int]]:
+        if not isinstance(value, list):
+            raise EvidenceError(f"environment-collision {label} is not an array")
+        return [integer_vector(row, f"{label}[{index}]") for index, row in enumerate(value)]
+
+    canonical_order = list(range(ENVIRONMENT_COLLISION_CARDINALITY))
+    shared_input_root: str | None = None
+    shared_collision_hash: str | None = None
+    shared_environment_root: str | None = None
+    shared_platform: str | None = None
+    previous_end = -1
+    for record, threads in zip(records, ENVIRONMENT_COLLISION_THREADS, strict=True):
+        if set(record) != ENVIRONMENT_COLLISION_FIELDS:
+            missing = sorted(ENVIRONMENT_COLLISION_FIELDS - set(record))
+            extra = sorted(set(record) - ENVIRONMENT_COLLISION_FIELDS)
+            raise EvidenceError(
+                f"environment-collision v2 field mismatch: missing={missing!r} extra={extra!r}"
+            )
+        for key, expected in expected_identity.items():
+            if record.get(key) != expected:
+                raise EvidenceError(
+                    f"environment-collision {key} {record.get(key)!r}, expected {expected!r}"
+                )
+        exact_integer(record, "version", ENVIRONMENT_COLLISION_VERSION)
+        exact_integer(record, "collision_cardinality", ENVIRONMENT_COLLISION_CARDINALITY)
+        exact_integer(record, "threads", threads)
+        exact_integer(record, "workers_built", threads)
+        exact_integer(record, "distinct_insertion_orders", threads)
+        exact_integer(record, "enumeration_insert_operations", ENVIRONMENT_COLLISION_CARDINALITY * threads)
+        exact_integer(record, "environment_insert_operations", ENVIRONMENT_COLLISION_CARDINALITY * threads)
+        exact_integer(record, "environment_duplicate_checks", ENVIRONMENT_COLLISION_CARDINALITY * threads)
+        exact_integer(record, "theoretical_fresh_node_bound_per_insert", 28)
+        exact_integer(record, "theoretical_replaced_node_bound_per_insert", 14)
+        exact_integer(record, "process_exit", 0)
+        if record.get("run_id") != expected_run_id:
+            raise EvidenceError("environment-collision detail run id mismatch")
+        if record.get("cwd") != expected_cwd:
+            raise EvidenceError("environment-collision detail cwd mismatch")
+        if record.get("argv") != [expected_argv]:
+            raise EvidenceError("environment-collision detail argv mismatch")
+        if record.get("stdout_artifact") != expected_stdout_artifact or record.get(
+            "stderr_artifact"
+        ) != expected_stderr_artifact:
+            raise EvidenceError("environment-collision detail artifact identity mismatch")
+        if record.get("cache_state") != expected_cache_state:
+            raise EvidenceError("environment-collision detail cache-state mismatch")
+        platform_value = record.get("platform")
+        if not isinstance(platform_value, str) or not platform_value or "-" not in platform_value:
+            raise EvidenceError("environment-collision platform identity is malformed")
+        if shared_platform is None:
+            shared_platform = platform_value
+        elif platform_value != shared_platform:
+            raise EvidenceError("environment-collision platform changed across schedules")
+
+        input_root = record.get("canonical_input_root")
+        if not isinstance(input_root, str) or not re.fullmatch(
+            r"fln-fixture:[0-9a-f]{64}", input_root
+        ):
+            raise EvidenceError("environment-collision canonical input root is malformed")
+        if shared_input_root is None:
+            shared_input_root = input_root
+        elif input_root != shared_input_root:
+            raise EvidenceError("environment-collision input root changed across schedules")
+        collision_hash = record.get("collision_hash")
+        if not isinstance(collision_hash, str) or not re.fullmatch(
+            r"[0-9a-f]{16}", collision_hash
+        ):
+            raise EvidenceError("environment-collision hash is malformed")
+        if shared_collision_hash is None:
+            shared_collision_hash = collision_hash
+        elif collision_hash != shared_collision_hash:
+            raise EvidenceError("environment-collision hash changed across schedules")
+
+        expected_worker_orders = [
+            environment_collision_insertion_order(
+                ENVIRONMENT_COLLISION_CARDINALITY, threads, worker
+            )
+            for worker in range(threads)
+        ]
+        worker_orders = integer_matrix(
+            record.get("worker_insertion_orders"), "worker_insertion_orders"
+        )
+        if worker_orders != expected_worker_orders:
+            raise EvidenceError(
+                f"environment-collision worker insertion schedules differ for threads={threads}"
+            )
+        representative = integer_vector(
+            record.get("representative_insertion_order"),
+            "representative_insertion_order",
+        )
+        if representative != expected_worker_orders[0]:
+            raise EvidenceError(
+                f"environment-collision representative schedule differs for threads={threads}"
+            )
+        if record.get("schedule_id") != f"partitioned-{threads}":
+            raise EvidenceError("environment-collision schedule id mismatch")
+        if integer_vector(record.get("expected_enumeration"), "expected_enumeration") != canonical_order:
+            raise EvidenceError("environment-collision expected enumeration is not canonical")
+        if integer_vector(record.get("actual_enumeration"), "actual_enumeration") != canonical_order:
+            raise EvidenceError("environment-collision actual enumeration is not canonical")
+        worker_enumerations = integer_matrix(
+            record.get("worker_enumerations"), "worker_enumerations"
+        )
+        if worker_enumerations != [canonical_order] * threads:
+            raise EvidenceError(
+                f"environment-collision worker enumerations differ for threads={threads}"
+            )
+
+        expected_root = record.get("expected_root")
+        actual_root = record.get("actual_root")
+        worker_roots = record.get("worker_roots")
+        if not isinstance(expected_root, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", expected_root
+        ):
+            raise EvidenceError("environment-collision expected root is malformed")
+        if actual_root != expected_root:
+            raise EvidenceError("environment-collision actual root differs")
+        if not isinstance(worker_roots, list) or worker_roots != [expected_root] * threads:
+            raise EvidenceError("environment-collision worker roots differ")
+        if shared_environment_root is None:
+            shared_environment_root = expected_root
+        elif expected_root != shared_environment_root:
+            raise EvidenceError("environment-collision root changed across thread counts")
+        if integer_vector(
+            record.get("observed_enumeration_nodes"), "observed_enumeration_nodes"
+        ) != [1] * threads:
+            raise EvidenceError("environment-collision enumeration-node facts differ")
+        if integer_vector(
+            record.get("observed_environment_entries"), "observed_environment_entries"
+        ) != [ENVIRONMENT_COLLISION_CARDINALITY] * threads:
+            raise EvidenceError("environment-collision environment-entry facts differ")
+        budget = record.get("operation_budget")
+        if not isinstance(budget, dict) or set(budget) != {
+            "max_collision_cardinality",
+            "thread_matrix",
+        }:
+            raise EvidenceError("environment-collision operation budget is malformed")
+        budget_cardinality = budget.get("max_collision_cardinality")
+        if (
+            not isinstance(budget_cardinality, int)
+            or isinstance(budget_cardinality, bool)
+            or budget_cardinality != ENVIRONMENT_COLLISION_CARDINALITY
+        ):
+            raise EvidenceError("environment-collision cardinality budget differs")
+        if integer_vector(budget.get("thread_matrix"), "operation_budget.thread_matrix") != list(
+            ENVIRONMENT_COLLISION_THREADS
+        ):
+            raise EvidenceError("environment-collision thread budget differs")
+
+        start_us = record.get("monotonic_start_us")
+        end_us = record.get("monotonic_end_us")
+        duration_us = record.get("duration_us")
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (start_us, end_us, duration_us)
+        ):
+            raise EvidenceError("environment-collision timing facts are malformed")
+        if end_us - start_us != duration_us or start_us < previous_end:
+            raise EvidenceError("environment-collision timing facts are inconsistent")
+        previous_end = end_us
+        if record.get("timing_used_as_gate") is not False:
+            raise EvidenceError("environment-collision timing was promoted to a gate")
+        if record.get("signal") is not None or record.get("first_divergence") is not None:
+            raise EvidenceError("passing environment-collision detail claims a failure")
+
+    if (
+        shared_input_root is None
+        or shared_collision_hash is None
+        or shared_environment_root is None
+    ):
+        raise EvidenceError("environment-collision shared identity facts are incomplete")
+    return {
+        "schema": "fln.validation/1",
+        "validator": "environment-collision/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "phase": phase,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "records": len(records),
+        "thread_matrix": list(ENVIRONMENT_COLLISION_THREADS),
+        "collision_cardinality": ENVIRONMENT_COLLISION_CARDINALITY,
+        "canonical_input_root": shared_input_root,
+        "collision_hash": shared_collision_hash,
+        "environment_root": shared_environment_root,
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
     }
 
 
@@ -4209,6 +4764,39 @@ def cmd_validate_guard(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_validate_environment_collision(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    stdout_path = require_within(
+        Path(args.file), artifact_root, label="environment-collision log"
+    )
+    stderr_path = require_within(
+        Path(args.stderr_file), artifact_root, label="environment-collision stderr"
+    )
+    report = validate_environment_collision(
+        stdout_path,
+        stderr_path,
+        args.phase,
+        args.expected_run_id,
+        args.observed_exit,
+        artifact_root=artifact_root,
+        expected_stdout_artifact=args.expected_stdout_artifact,
+        expected_stderr_artifact=args.expected_stderr_artifact,
+        expected_cwd=args.expected_cwd,
+        expected_argv=args.expected_argv,
+        expected_cache_state=args.expected_cache_state,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output),
+            artifact_root,
+            label="environment-collision validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
 def cmd_validate_run(args: argparse.Namespace) -> int:
     report = validate_run(
         Path(args.file),
@@ -6164,6 +6752,421 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         raise EvidenceError("unterminated run was accepted")
     cases.append({"case": "malformed_evidence", "ok": True})
 
+    collision_validation_root = case_dir("environment_collision_validation")
+    collision_run_id = "collision-self-test"
+    collision_cwd = str(art_dir)
+    collision_argv = (
+        "cargo test --locked -q -p fln-env "
+        f"{ENVIRONMENT_COLLISION_TEST} -- --exact --nocapture"
+    )
+    collision_cache_state = "self-test-cache"
+    canonical_order = list(range(ENVIRONMENT_COLLISION_CARDINALITY))
+
+    def collision_detail_record(
+        threads: int,
+        start_us: int,
+        stdout_artifact: str,
+        stderr_artifact: str,
+    ) -> dict[str, Any]:
+        worker_orders = [
+            environment_collision_insertion_order(
+                ENVIRONMENT_COLLISION_CARDINALITY, threads, worker
+            )
+            for worker in range(threads)
+        ]
+        environment_root = "b" * 64
+        return {
+            "schema": ENVIRONMENT_COLLISION_SCHEMA,
+            "version": ENVIRONMENT_COLLISION_VERSION,
+            "run_id": collision_run_id,
+            "bead": "fln-amv.10",
+            "claim_id": "fln-amv.10-collision-canonicality",
+            "claim_type": "bounded_model",
+            "invariant_id": "FL-INV-01",
+            "invariant_relation": "supports-local-pmap-slice",
+            "gate_id": "PG-5",
+            "gate_relation": "partial-component-evidence",
+            "parity_ledger_row": "not_applicable_internal_data_structure_determinism",
+            "data_grade": "verified",
+            "epoch": "lean-v4.32.0",
+            "mode": "sound",
+            "profile": "e2e",
+            "platform": "linux-x86_64",
+            "seed": "partition-rotation-v1",
+            "cache_state": collision_cache_state,
+            "canonical_input_root": f"fln-fixture:{'a' * 64}",
+            "scenario": "full-hash-collision-schedule-matrix",
+            "schedule_id": f"partitioned-{threads}",
+            "status": "pass",
+            "cwd": collision_cwd,
+            "argv": [collision_argv],
+            "stdout_artifact": stdout_artifact,
+            "stderr_artifact": stderr_artifact,
+            "collision_cardinality": ENVIRONMENT_COLLISION_CARDINALITY,
+            "collision_hash": "c" * 16,
+            "threads": threads,
+            "workers_built": threads,
+            "distinct_insertion_orders": threads,
+            "representative_insertion_order": worker_orders[0],
+            "worker_insertion_orders": worker_orders,
+            "expected_enumeration": canonical_order,
+            "actual_enumeration": canonical_order,
+            "worker_enumerations": [canonical_order for _ in range(threads)],
+            "expected_root": environment_root,
+            "actual_root": environment_root,
+            "worker_roots": [environment_root for _ in range(threads)],
+            "enumeration_insert_operations": ENVIRONMENT_COLLISION_CARDINALITY
+            * threads,
+            "environment_insert_operations": ENVIRONMENT_COLLISION_CARDINALITY
+            * threads,
+            "environment_duplicate_checks": ENVIRONMENT_COLLISION_CARDINALITY
+            * threads,
+            "observed_enumeration_nodes": [1 for _ in range(threads)],
+            "observed_environment_entries": [
+                ENVIRONMENT_COLLISION_CARDINALITY for _ in range(threads)
+            ],
+            "theoretical_fresh_node_bound_per_insert": 28,
+            "theoretical_replaced_node_bound_per_insert": 14,
+            "operation_budget": {
+                "max_collision_cardinality": ENVIRONMENT_COLLISION_CARDINALITY,
+                "thread_matrix": list(ENVIRONMENT_COLLISION_THREADS),
+            },
+            "bucket_policy": "PKey-Ord",
+            "lookup_complexity": "O(bucket)",
+            "insert_complexity": "O(log(bucket))-comparisons-plus-O(bucket)-clone-shift",
+            "resource_followup": "fln-amv.13",
+            "monotonic_start_us": start_us,
+            "monotonic_end_us": start_us + 5,
+            "duration_us": 5,
+            "timing_used_as_gate": False,
+            "process_exit": 0,
+            "signal": None,
+            "first_divergence": None,
+            "cleanup_status": "retained_by_policy",
+            "final_state": "canonical-enumeration-and-root-verified",
+        }
+
+    def collision_records_for(
+        stdout_artifact: str, stderr_artifact: str
+    ) -> list[dict[str, Any]]:
+        return [
+            collision_detail_record(
+                threads,
+                index * 10,
+                stdout_artifact,
+                stderr_artifact,
+            )
+            for index, threads in enumerate(ENVIRONMENT_COLLISION_THREADS)
+        ]
+
+    def collision_pass_log(records: list[dict[str, Any]]) -> bytes:
+        return (
+            b"running 1 test\n"
+            + b"".join(canonical_json(record) for record in records)
+            + b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured\n"
+        )
+
+    def collision_validate(
+        stdout_path: Path,
+        stderr_path: Path,
+        phase: str,
+        observed_exit: int,
+        stdout_artifact: str,
+        stderr_artifact: str,
+    ) -> dict[str, Any]:
+        return validate_environment_collision(
+            stdout_path,
+            stderr_path,
+            phase,
+            collision_run_id,
+            observed_exit,
+            artifact_root=collision_validation_root,
+            expected_stdout_artifact=stdout_artifact,
+            expected_stderr_artifact=stderr_artifact,
+            expected_cwd=collision_cwd,
+            expected_argv=collision_argv,
+            expected_cache_state=collision_cache_state,
+        )
+
+    def expect_collision_rejection(
+        label: str,
+        stdout_path: Path,
+        stderr_path: Path,
+        phase: str,
+        observed_exit: int,
+        stdout_artifact: str,
+        stderr_artifact: str,
+        *,
+        expected_message: str | None = None,
+    ) -> None:
+        try:
+            collision_validate(
+                stdout_path,
+                stderr_path,
+                phase,
+                observed_exit,
+                stdout_artifact,
+                stderr_artifact,
+            )
+        except (EvidenceError, OSError) as error:
+            if expected_message is not None:
+                require(
+                    expected_message in str(error),
+                    f"{label} rejected for the wrong reason: {error}",
+                )
+        else:
+            raise EvidenceError(f"{label} was accepted")
+
+    collision_positive_stdout = "collision_positive.out"
+    collision_positive_stderr = "collision_positive.err"
+    collision_positive_records = collision_records_for(
+        collision_positive_stdout, collision_positive_stderr
+    )
+    collision_positive_bytes = collision_pass_log(collision_positive_records)
+    collision_positive = collision_validation_root / collision_positive_stdout
+    collision_positive_err = collision_validation_root / collision_positive_stderr
+    write_new(collision_positive, collision_positive_bytes)
+    write_new(collision_positive_err, b"")
+    collision_report = collision_validate(
+        collision_positive,
+        collision_positive_err,
+        "positive",
+        0,
+        collision_positive_stdout,
+        collision_positive_stderr,
+    )
+    require(
+        collision_report["records"] == len(ENVIRONMENT_COLLISION_THREADS),
+        "valid collision evidence lost schedule records",
+    )
+    require(
+        hmac.compare_digest(
+            collision_report["stdout_sha256"],
+            hashlib.sha256(collision_positive_bytes).hexdigest(),
+        )
+        and hmac.compare_digest(
+            collision_report["stderr_sha256"], hashlib.sha256(b"").hexdigest()
+        ),
+        "valid collision evidence lost its split-stream digests",
+    )
+
+    collision_recovery_stdout = "collision_recovery.out"
+    collision_recovery_stderr = "collision_recovery.err"
+    collision_recovery_records = collision_records_for(
+        collision_recovery_stdout, collision_recovery_stderr
+    )
+    collision_recovery = collision_validation_root / collision_recovery_stdout
+    collision_recovery_err = collision_validation_root / collision_recovery_stderr
+    write_new(collision_recovery, collision_pass_log(collision_recovery_records))
+    write_new(collision_recovery_err, b"warning: benign recovery diagnostic\n")
+    collision_recovery_report = collision_validate(
+        collision_recovery,
+        collision_recovery_err,
+        "recovery",
+        0,
+        collision_recovery_stdout,
+        collision_recovery_stderr,
+    )
+    require(
+        collision_recovery_report["phase"] == "recovery",
+        "valid collision recovery evidence lost its phase identity",
+    )
+
+    collision_tampered_stdout = "collision_tampered.out"
+    collision_tampered_stderr = "collision_tampered.err"
+    tampered_records = parse_json(
+        json.dumps(
+            collision_records_for(
+                collision_tampered_stdout, collision_tampered_stderr
+            )
+        ),
+        subject="collision self-test copy",
+    )
+    tampered_records[1]["worker_insertion_orders"][0][0] = 999
+    collision_tampered = collision_validation_root / "collision_tampered.out"
+    collision_tampered_err = collision_validation_root / "collision_tampered.err"
+    write_new(
+        collision_tampered,
+        collision_pass_log(tampered_records),
+    )
+    write_new(collision_tampered_err, b"")
+    expect_collision_rejection(
+        "tampered collision insertion schedule",
+        collision_tampered,
+        collision_tampered_err,
+        "recovery",
+        0,
+        collision_tampered_stdout,
+        collision_tampered_stderr,
+        expected_message="worker insertion schedules differ",
+    )
+
+    collision_renamed = collision_validation_root / "collision_positive_renamed.out"
+    write_new(collision_renamed, collision_positive_bytes)
+    expect_collision_rejection(
+        "renamed collision stdout",
+        collision_renamed,
+        collision_positive_err,
+        "positive",
+        0,
+        collision_positive_stdout,
+        collision_positive_stderr,
+        expected_message="stdout path",
+    )
+    expect_collision_rejection(
+        "swapped collision streams",
+        collision_positive_err,
+        collision_positive,
+        "positive",
+        0,
+        collision_positive_stderr,
+        collision_positive_stdout,
+        expected_message="detail rows leaked into stderr",
+    )
+    expect_collision_rejection(
+        "missing collision stderr",
+        collision_positive,
+        collision_validation_root / "collision_missing.err",
+        "positive",
+        0,
+        collision_positive_stdout,
+        "collision_missing.err",
+    )
+
+    collision_failure_stdout = "collision_positive_failure.out"
+    collision_failure_stderr = "collision_positive_failure.err"
+    collision_failure_out = collision_validation_root / collision_failure_stdout
+    collision_failure_err = collision_validation_root / collision_failure_stderr
+    write_new(
+        collision_failure_out,
+        collision_pass_log(
+            collision_records_for(
+                collision_failure_stdout, collision_failure_stderr
+            )
+        ),
+    )
+    write_new(
+        collision_failure_err,
+        b"test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured\n",
+    )
+    expect_collision_rejection(
+        "passing collision stderr with failure material",
+        collision_failure_out,
+        collision_failure_err,
+        "positive",
+        0,
+        collision_failure_stdout,
+        collision_failure_stderr,
+        expected_message="stderr contains failure material",
+    )
+
+    collision_mutant_stdout = "collision_mutant.out"
+    collision_mutant_stderr = "collision_mutant.err"
+    collision_mutant = collision_validation_root / collision_mutant_stdout
+    collision_mutant_err = collision_validation_root / collision_mutant_stderr
+    mutant_stdout_bytes = (
+        "running 1 test\n"
+        f"{ENVIRONMENT_COLLISION_TEST} --- FAILED\n\n"
+        "failures:\n"
+        f"    {ENVIRONMENT_COLLISION_TEST}\n\n"
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured\n"
+    ).encode()
+    mutant_stderr_bytes = (
+        "thread 'pmap::tests::environment_collision_e2e_emits_detailed_real_path_evidence' "
+        "panicked at crates/fln-env/src/pmap.rs:1:1:\n"
+        "assertion `left == right` failed: "
+        f"{ENVIRONMENT_COLLISION_MUTANT_MARKER}\n"
+        "  left: [95, 94, 93]\n"
+        " right: [0, 1, 2]\n"
+        "error: test failed, to rerun pass `-p fln-env --lib`\n"
+    ).encode()
+    write_new(collision_mutant, mutant_stdout_bytes)
+    write_new(collision_mutant_err, mutant_stderr_bytes)
+    mutant_report = collision_validate(
+        collision_mutant,
+        collision_mutant_err,
+        "mutant",
+        101,
+        collision_mutant_stdout,
+        collision_mutant_stderr,
+    )
+    require(
+        mutant_report["failed_test"] == ENVIRONMENT_COLLISION_TEST,
+        "collision mutant validation lost the failed test identity",
+    )
+    require(
+        hmac.compare_digest(
+            mutant_report["stdout_sha256"],
+            hashlib.sha256(mutant_stdout_bytes).hexdigest(),
+        )
+        and hmac.compare_digest(
+            mutant_report["stderr_sha256"],
+            hashlib.sha256(mutant_stderr_bytes).hexdigest(),
+        ),
+        "collision mutant validation lost its split-stream digests",
+    )
+
+    collision_wrong_assertion = collision_validation_root / "collision_wrong_assertion.err"
+    write_new(
+        collision_wrong_assertion,
+        mutant_stderr_bytes.replace(
+            ENVIRONMENT_COLLISION_MUTANT_MARKER.encode(), b"threads=1"
+        ),
+    )
+    expect_collision_rejection(
+        "wrong same-test collision assertion",
+        collision_mutant,
+        collision_wrong_assertion,
+        "mutant",
+        101,
+        collision_mutant_stdout,
+        "collision_wrong_assertion.err",
+        expected_message="intended enumeration assertion marker",
+    )
+
+    collision_false_kill_stdout = "collision_false_kill.out"
+    collision_false_kill_stderr = "collision_false_kill.err"
+    collision_false_kill = collision_validation_root / collision_false_kill_stdout
+    collision_false_kill_err = collision_validation_root / collision_false_kill_stderr
+    write_new(collision_false_kill, b"running 0 tests\n")
+    write_new(collision_false_kill_err, b"error: could not compile `fln-env`\n")
+    expect_collision_rejection(
+        "unrelated split-stream collision failure",
+        collision_false_kill,
+        collision_false_kill_err,
+        "mutant",
+        101,
+        collision_false_kill_stdout,
+        collision_false_kill_stderr,
+        expected_message="named FAILED test result",
+    )
+
+    collision_merged_stdout = "collision_mutant_merged.out"
+    collision_merged_stderr = "collision_mutant_merged.err"
+    collision_merged = collision_validation_root / collision_merged_stdout
+    collision_merged_err = collision_validation_root / collision_merged_stderr
+    write_new(collision_merged, mutant_stdout_bytes + mutant_stderr_bytes)
+    write_new(collision_merged_err, b"")
+    expect_collision_rejection(
+        "merged collision mutant streams",
+        collision_merged,
+        collision_merged_err,
+        "mutant",
+        101,
+        collision_merged_stdout,
+        collision_merged_stderr,
+        expected_message="assertion marker leaked into stdout",
+    )
+    cases.append(
+        {
+            "case": "environment_collision_validation",
+            "ok": True,
+            "positive": str(collision_positive),
+            "mutant": str(collision_mutant),
+            "mutant_stderr": str(collision_mutant_err),
+        }
+    )
+
     hash_root = case_dir("canonical_hash")
     write_new(hash_root / "a", b"alpha")
     write_new(hash_root / "b", b"beta")
@@ -6524,6 +7527,26 @@ def build_parser() -> argparse.ArgumentParser:
     guard_parser.add_argument("--finding", action="append")
     guard_parser.add_argument("--output")
     guard_parser.set_defaults(func=cmd_validate_guard)
+
+    collision_parser = subparsers.add_parser(
+        "validate-environment-collision",
+        help="validate fln-amv.10 collision detail or mutant evidence",
+    )
+    collision_parser.add_argument("--file", required=True)
+    collision_parser.add_argument("--stderr-file", required=True)
+    collision_parser.add_argument(
+        "--phase", required=True, choices=("positive", "mutant", "recovery")
+    )
+    collision_parser.add_argument("--expected-run-id", required=True)
+    collision_parser.add_argument("--observed-exit", type=int, required=True)
+    collision_parser.add_argument("--expected-cwd")
+    collision_parser.add_argument("--expected-argv")
+    collision_parser.add_argument("--expected-stdout-artifact", required=True)
+    collision_parser.add_argument("--expected-stderr-artifact", required=True)
+    collision_parser.add_argument("--expected-cache-state")
+    collision_parser.add_argument("--artifact-root", required=True)
+    collision_parser.add_argument("--output")
+    collision_parser.set_defaults(func=cmd_validate_environment_collision)
 
     run_validation = subparsers.add_parser(
         "validate-run", help="validate a check/E2E run envelope"
