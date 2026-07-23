@@ -1304,9 +1304,10 @@ impl<'a> Engine<'a> {
         Ok(rules)
     }
 
-    /// KR-802 + the ap6 cross-check: regenerate every recursor and compare it
-    /// field-by-field against the DECODED rows.
-    fn check_recursors(&mut self) -> KResult<()> {
+    /// KR-802: regenerate every recursor of the block from its declaration
+    /// alone — the block's decoded recursor rows are never consulted. One
+    /// `RecursorVal` per datatype, in block order.
+    fn generate_recursors(&mut self) -> KResult<Vec<RecursorVal>> {
         let infos = self.mk_rec_infos()?;
         let cs: Vec<Local> = infos.iter().map(|i| i.motive.clone()).collect();
         let minors: Vec<Local> = infos.iter().flat_map(|i| i.minors.clone()).collect();
@@ -1314,16 +1315,7 @@ impl<'a> Engine<'a> {
         let nmotives = cs.len() as u32;
         let all = self.block_names();
         let mut minor_idx = 0usize;
-        if self.block.recursors.len() != self.block.types.len() {
-            return reject(
-                RejectClass::BlockMismatch,
-                format!(
-                    "block declares {} recursors, expected {}",
-                    self.block.recursors.len(),
-                    self.block.types.len()
-                ),
-            );
-        }
+        let mut generated = Vec::with_capacity(infos.len());
         for (d_idx, info) in infos.iter().enumerate() {
             let mut c_app = info.motive.fvar();
             for index in &info.indices {
@@ -1338,7 +1330,7 @@ impl<'a> Engine<'a> {
             rec_ty = infer_implicit_strict(&rec_ty, 0)?;
             let rules = self.mk_rec_rules(&infos, &cs, &minors, d_idx, &mut minor_idx)?;
             let rec_name = mk_rec_name(&self.block.types[d_idx].base.name);
-            let generated = RecursorVal {
+            generated.push(RecursorVal {
                 base: fln_env::constants::ConstantVal {
                     name: rec_name.clone(),
                     level_params: self.rec_lparams(),
@@ -1352,9 +1344,28 @@ impl<'a> Engine<'a> {
                 rules,
                 k: self.k_target,
                 is_unsafe: self.is_unsafe,
-            };
+            });
+        }
+        Ok(generated)
+    }
+
+    /// KR-802 + the ap6 cross-check: regenerate every recursor and compare it
+    /// field-by-field against the DECODED rows.
+    fn check_recursors(&mut self) -> KResult<()> {
+        if self.block.recursors.len() != self.block.types.len() {
+            return reject(
+                RejectClass::BlockMismatch,
+                format!(
+                    "block declares {} recursors, expected {}",
+                    self.block.recursors.len(),
+                    self.block.types.len()
+                ),
+            );
+        }
+        let generated = self.generate_recursors()?;
+        for (d_idx, generated) in generated.iter().enumerate() {
             let decoded = &self.block.recursors[d_idx];
-            compare_recursors(&generated, decoded)?;
+            compare_recursors(generated, decoded)?;
         }
         Ok(())
     }

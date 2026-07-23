@@ -243,8 +243,10 @@ impl<'a> TypeChecker<'a> {
     }
 
     /// Substitute declared level parameters by concrete levels throughout a type
-    /// (KR-105). Flag-pruned on has-level-param.
-    fn instantiate_lparams(
+    /// (KR-105). Flag-pruned on has-level-param. `pub(crate)`: the nested-inductive
+    /// translation (admit.rs, KR-608) instantiates copied specs at the nested
+    /// occurrence's levels with the same budgeted walk.
+    pub(crate) fn instantiate_lparams(
         &mut self,
         e: &Expr,
         params: &[Name],

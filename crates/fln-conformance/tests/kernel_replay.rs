@@ -82,8 +82,20 @@ fn shape(e: &Expr, fuel: usize) -> String {
             out.push(')');
             out
         }
-        ExprNode::Lam { body, .. } => format!("(fun _ => {})", shape(body, fuel - 1)),
-        ExprNode::ForallE { body, .. } => format!("(forall _, {})", shape(body, fuel - 1)),
+        ExprNode::Lam {
+            binder_type, body, ..
+        } => format!(
+            "(fun (_ : {}) => {})",
+            shape(binder_type, fuel - 1),
+            shape(body, fuel - 1)
+        ),
+        ExprNode::ForallE {
+            binder_type, body, ..
+        } => format!(
+            "(forall (_ : {}), {})",
+            shape(binder_type, fuel - 1),
+            shape(body, fuel - 1)
+        ),
         ExprNode::LetE { body, .. } => format!("(let _ := ..; {})", shape(body, fuel - 1)),
         ExprNode::MData { expr, .. } => shape(expr, fuel),
         ExprNode::Proj {
@@ -1012,6 +1024,109 @@ fn prelude_replays_through_the_kernel() {
         eprintln!("  ctor max_fields={max_fields}");
         eprintln!("  non-safe defs by safety={def_safety:?} names={def_names:?}");
         eprintln!("  quots={quots:?}");
+        // Nested-block deep probe (bead franken_lean-8ce): the exact decoded
+        // shapes the _nested.* auxiliary translation must reconstruct — the
+        // nested block's ctor field types (where `Array Syntax`-class
+        // occurrences live), its multi-motive recursor telescope and rule
+        // RHSes, and the environment specs of the nested heads the pin would
+        // copy (their own params/ctors, instantiated during translation).
+        for (i, _) in infos.iter().enumerate() {
+            let ConstantInfo::Induct(ind) = &infos[i] else {
+                continue;
+            };
+            if ind.num_nested == 0 {
+                continue;
+            }
+            eprintln!(
+                "  NESTED BLOCK {}: num_nested={} num_params={} num_indices={} lparams={:?}",
+                ind.base.name.to_display_string(),
+                ind.num_nested,
+                ind.num_params,
+                ind.num_indices,
+                ind.base.level_params
+            );
+            eprintln!("    type = {}", shape(&ind.base.type_, 8));
+            let mut nested_heads: HashSet<Name> = HashSet::new();
+            for ctor_name in &ind.ctors {
+                let Some(ConstantInfo::Ctor(c)) = module_by_name.get(ctor_name) else {
+                    continue;
+                };
+                eprintln!(
+                    "    ctor {} (fields={}) = {}",
+                    c.base.name.to_display_string(),
+                    c.num_fields,
+                    shape(&c.base.type_, 10)
+                );
+                let mut refs = HashSet::new();
+                const_refs(&c.base.type_, &mut refs);
+                for r in refs {
+                    if r != ind.base.name {
+                        nested_heads.insert(r);
+                    }
+                }
+            }
+            for (j, info_j) in infos.iter().enumerate() {
+                let ConstantInfo::Rec(r) = info_j else {
+                    continue;
+                };
+                if r.all.first() != Some(&ind.base.name) {
+                    continue;
+                }
+                let _ = j;
+                eprintln!(
+                    "    recursor {} motives={} minors={} params={} indices={} k={} lparams={:?}",
+                    r.base.name.to_display_string(),
+                    r.num_motives,
+                    r.num_minors,
+                    r.num_params,
+                    r.num_indices,
+                    r.k,
+                    r.base.level_params
+                );
+                eprintln!("      type = {}", shape(&r.base.type_, 12));
+                for rule in &r.rules {
+                    eprintln!(
+                        "      rule {} nfields={} rhs={}",
+                        rule.ctor.to_display_string(),
+                        rule.nfields,
+                        shape(&rule.rhs, 10)
+                    );
+                }
+            }
+            let mut heads: Vec<String> = nested_heads.iter().map(Name::to_display_string).collect();
+            heads.sort();
+            eprintln!("    ctor-referenced heads = {heads:?}");
+            for head in &nested_heads {
+                if let Some(ConstantInfo::Induct(h)) = module_by_name.get(head) {
+                    eprintln!(
+                        "    head spec {}: params={} indices={} all={:?} ctors={:?} lparams={:?} type={}",
+                        h.base.name.to_display_string(),
+                        h.num_params,
+                        h.num_indices,
+                        h.all
+                            .iter()
+                            .map(Name::to_display_string)
+                            .collect::<Vec<_>>(),
+                        h.ctors
+                            .iter()
+                            .map(Name::to_display_string)
+                            .collect::<Vec<_>>(),
+                        h.base.level_params,
+                        shape(&h.base.type_, 6)
+                    );
+                    for cn in &h.ctors {
+                        if let Some(ConstantInfo::Ctor(hc)) = module_by_name.get(cn) {
+                            eprintln!(
+                                "      head ctor {} (fields={}) = {}",
+                                hc.base.name.to_display_string(),
+                                hc.num_fields,
+                                shape(&hc.base.type_, 10)
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let prep = prepare_replay(&infos);
