@@ -1771,6 +1771,64 @@ mod tests {
     }
 
     #[test]
+    fn collision_avl_rebalancing_covers_all_four_rotation_shapes() {
+        let cases = [
+            ("left-left", [3, 2, 1]),
+            ("right-right", [1, 2, 3]),
+            ("left-right", [3, 1, 2]),
+            ("right-left", [1, 3, 2]),
+        ];
+
+        for (case, [first, second, third]) in cases {
+            let mut facts = MutationFacts::default();
+            let mut root = collision_node(
+                CollisionEntry {
+                    key: CollKey(first),
+                    value: first,
+                    expanded_weight: 1,
+                },
+                None,
+                None,
+                &mut facts,
+            );
+            for key in [second, third] {
+                let (next, added) = collision_insert_node(
+                    &root,
+                    CollisionEntry {
+                        key: CollKey(key),
+                        value: key,
+                        expanded_weight: 1,
+                    },
+                    &mut facts,
+                );
+                assert!(added, "{case}: distinct key must increase cardinality");
+                root = next;
+            }
+
+            assert_eq!(root.entry.key, CollKey(2), "{case}: balanced root");
+            assert_eq!(
+                root.left.as_ref().map(|node| node.entry.key.0),
+                Some(1),
+                "{case}: balanced left child"
+            );
+            assert_eq!(
+                root.right.as_ref().map(|node| node.entry.key.0),
+                Some(3),
+                "{case}: balanced right child"
+            );
+            assert_eq!(
+                collision_collect(&root)
+                    .into_iter()
+                    .map(|entry| entry.key.0)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3],
+                "{case}: canonical in-order traversal"
+            );
+            assert_collision_tree_invariants(&root);
+        }
+    }
+
+    #[test]
     fn collision_tier_promotes_overwrites_and_demotes_by_cardinality() {
         let mut map = PMap::new();
         for key in 0..INLINE_COLLISION_MAX as u64 {
