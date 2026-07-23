@@ -9,6 +9,13 @@ canonical inventory, so they cannot disagree by construction:
   contracts/abi_inventory.json   — the canonical intermediate (schema fln-abi-contract/1)
   ABI_CONTRACT.md                — the human contract, per-field provenance
   crates/fln-rt/src/abi.rs       — the Rust constants module Marrow compiles against
+  crates/fln-unsafe-abi/src/contract.rs
+                                 — the layout partition re-rendered `pub(crate)` for the
+                                   boundary crate (bead fln-lld): strict downward layering
+                                   (rank 2 cannot import fln-rt at rank 3) and the D3
+                                   no-export scaffold both forbid sharing fln-rt's copy,
+                                   so the same inventory is rendered twice — same digest,
+                                   same provenance, drift-checked together
 
 The upstream header is parsed as DATA (Oracle-Only Law D8: fixture/census mine);
 nothing from it executes. Extraction is offline, read-only over vendor/lean4-src,
@@ -37,6 +44,7 @@ SUITE_LOCK = ROOT / "SUITE.lock"
 INVENTORY_PATH = ROOT / "contracts" / "abi_inventory.json"
 CONTRACT_PATH = ROOT / "ABI_CONTRACT.md"
 RUST_PATH = ROOT / "crates" / "fln-rt" / "src" / "abi.rs"
+BOUNDARY_RUST_PATH = ROOT / "crates" / "fln-unsafe-abi" / "src" / "contract.rs"
 
 SCHEMA = "fln-abi-contract/1"
 SRC_REL = "vendor/lean4-src/src/include/lean/lean.h"
@@ -572,6 +580,101 @@ def render_rust(inv: dict, digest: str) -> str:
     return "\n".join(w) + "\n"
 
 
+def render_rust_boundary(inv: dict, digest: str) -> str:
+    """The layout partition of the contract, re-rendered for `fln-unsafe-abi`.
+
+    Everything is `pub(crate)`: the D3 scaffold guard (FLN-STRUCT-022) rejects
+    bare `pub` items in boundary crates until the no-admission export covenant
+    exists, and strict downward layering (FLN-STRUCT-007) forbids rank 2 from
+    importing `fln-rt`'s rendering at rank 3. The function census is NOT
+    re-rendered here — the boundary crate compiles against layouts, not the
+    symbol census; the census stays single-sourced in `fln-rt::abi`.
+    """
+    pin = inv["pin"]
+    src = inv["source"]
+    w = []
+    w.append("//! Marrow boundary-crate layout contract — **@generated** by `scripts/extract/gen_abi_contract.py`. DO NOT EDIT.")
+    w.append("//!")
+    w.append(f"//! Extracted from the pinned Reference header `{src['path']}`")
+    w.append(f"//! ({pin['repo']} {pin['tag']}, commit {pin['commit']}).")
+    w.append("//! Layout partition only (tags, layout constants, struct field tables);")
+    w.append("//! the function census is single-sourced in `fln-rt::abi`. Rendered")
+    w.append("//! `pub(crate)` for the D3 boundary crate; same inventory, same digest,")
+    w.append("//! drift-checked together with the other three artifacts.")
+    w.append("")
+    w.append("// Generated tables are referenced from tests and layout asserts; items that")
+    w.append("// are provenance-only (pin binding) may be unused in some build profiles.")
+    w.append("#![allow(dead_code)]")
+    w.append("")
+    w.append("/// SHA-256 of `contracts/abi_inventory.json` this module was rendered from.")
+    w.append(f'pub(crate) const INVENTORY_DIGEST: &str = "{digest}";')
+    w.append("/// The Reference pin this contract is extracted from.")
+    w.append(f'pub(crate) const PIN_TAG: &str = "{pin["tag"]}";')
+    w.append(f'pub(crate) const PIN_COMMIT: &str = "{pin["commit"]}";')
+    w.append("/// SHA-256 of the pinned `lean.h` these constants were derived from.")
+    w.append(f'pub(crate) const LEAN_H_SHA256: &str = "{src["sha256"]}";')
+    w.append("")
+    w.append("// ---- object tags (lean.h tag block) ------------------------------------")
+    for t in inv["tags"]:
+        w.append(f"/// `#define {t['name']} {t['value']}` — {src['path']}:{t['line']}")
+        w.append(f"pub(crate) const {const_name(t['name'])}: u8 = {t['value']};")
+    w.append("")
+    w.append("// ---- layout constants ---------------------------------------------------")
+    for d in inv["layout"]:
+        if "value" in d:
+            w.append(f"/// `#define {d['name']}` — {src['path']}:{d['line']}")
+            w.append(f"pub(crate) const {d['name'].removeprefix('LEAN_')}: usize = {d['value']};")
+        else:
+            w.append(f"/// `#define {d['name']} {d['expr']}` — {src['path']}:{d['line']} (expression; platform-dependent width)")
+            w.append(f'pub(crate) const {d["name"].removeprefix("LEAN_")}_EXPR: &str = "{d["expr"]}";')
+    w.append("")
+    w.append("// ---- object layout tables ----------------------------------------------")
+    w.append("/// One C struct field of the object model, with provenance.")
+    w.append("#[derive(Debug, Clone, Copy, PartialEq, Eq)]")
+    w.append("pub(crate) struct FieldSpec {")
+    w.append("    pub(crate) name: &'static str,")
+    w.append("    pub(crate) c_type: &'static str,")
+    w.append("    /// bit width when the field is a C bitfield")
+    w.append("    pub(crate) bits: Option<u8>,")
+    w.append("    /// `Some(\"[]\")`/`Some(\"[N]\")` for array fields (flexible arrays are `[]`)")
+    w.append("    pub(crate) array: Option<&'static str>,")
+    w.append(f"    /// 1-based line in `{src['path']}`")
+    w.append("    pub(crate) line: u32,")
+    w.append("}")
+    w.append("")
+    w.append("#[derive(Debug, Clone, Copy, PartialEq, Eq)]")
+    w.append("pub(crate) struct StructSpec {")
+    w.append("    pub(crate) name: &'static str,")
+    w.append("    pub(crate) fields: &'static [FieldSpec],")
+    w.append(f"    /// 1-based start line in `{src['path']}`")
+    w.append("    pub(crate) line: u32,")
+    w.append("}")
+    w.append("")
+    for s in inv["structs"]:
+        ident = s["name"].upper()
+        w.append(f"/// `{s['name']}` — {src['path']}:{s['line_start']}-{s['line_end']}")
+        w.append(f"pub(crate) const {ident}_FIELDS: &[FieldSpec] = &[")
+        for f in s["fields"]:
+            bits = f"Some({f['bits']})" if f["bits"] is not None else "None"
+            arr = f"Some(\"{f['array']}\")" if f["array"] else "None"
+            w.append(
+                f'    FieldSpec {{ name: "{f["name"]}", c_type: "{f["c_type"]}", '
+                f"bits: {bits}, array: {arr}, line: {f['line']} }},"
+            )
+        w.append("];")
+    w.append("")
+    w.append("/// Every object-model struct, in contract order.")
+    w.append("pub(crate) const OBJECT_STRUCTS: &[StructSpec] = &[")
+    for s in inv["structs"]:
+        w.append(
+            f'    StructSpec {{ name: "{s["name"]}", fields: {s["name"].upper()}_FIELDS, '
+            f"line: {s['line_start']} }},"
+        )
+    w.append("];")
+    w.append("")
+    return "\n".join(w) + "\n"
+
+
 def render_markdown(inv: dict, digest: str) -> str:
     pin = inv["pin"]
     src = inv["source"]
@@ -585,6 +688,7 @@ def render_markdown(inv: dict, digest: str) -> str:
     w.append(f"> source: `{src['path']}` ({src['lines']} lines, sha256 `{src['sha256']}`)")
     w.append(f"> inventory: `contracts/abi_inventory.json` sha256 `{digest}`")
     w.append(f"> rust: `crates/fln-rt/src/abi.rs` (rendered from the same inventory)")
+    w.append(f"> rust (boundary): `crates/fln-unsafe-abi/src/contract.rs` (layout partition, `pub(crate)`, same inventory)")
     w.append("")
     w.append("Scope of this slice (bead franken_lean-53v): object tags, layout constants,")
     w.append("object-header and object-struct field layouts, ownership conventions, and the")
@@ -665,6 +769,7 @@ def main() -> int:
         (INVENTORY_PATH, inventory_text),
         (CONTRACT_PATH, render_markdown(inv, digest)),
         (RUST_PATH, render_rust(inv, digest)),
+        (BOUNDARY_RUST_PATH, render_rust_boundary(inv, digest)),
     ]
     if check:
         for path, want in outputs:

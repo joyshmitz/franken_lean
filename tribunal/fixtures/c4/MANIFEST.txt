@@ -1,0 +1,29 @@
+# tribunal/fixtures/c4 — native-ABI probes, both directions (corpus family C4, plan §18)
+# Seeded by bead fln-lld (Marrow object model + tri-state RC, slice 1).
+#
+# probe_reference.c
+#   Direction A: C program compiled by the D2 system C compiler (test apparatus
+#   only, §6.6) against the PINNED toolchain's lean.h and linked to the real
+#   Reference runtime (libleanshared, leanprover/lean4 v4.32.0). Emits 96
+#   layout/behavior facts as NDJSON (schema fln-c4-abi-probe/1).
+#   Kept in lockstep with crates/fln-unsafe-abi/src/tests.rs::collect_c4_facts
+#   (Direction B) — key set and operation scripts must match exactly.
+#
+# facts_reference_v4.32.0.ndjson
+#   Frozen snapshot of Direction A's output on x86_64-linux at the pin —
+#   informational baseline for offline triage. The e2e scenario
+#   (scripts/e2e/marrow_abi_probes.sh) always regenerates live when the
+#   toolchain and a C compiler are present; a live run outranks this snapshot.
+#
+# Fact families: sizeof/offsetof for all 13 contract structs (header bitfield
+# offsets derived behaviorally — offsetof is illegal on C bitfields); tagged
+# scalar boxing; ctor header + scalar packing + the padded-word zero law;
+# string size/capacity/length/NUL semantics; array/sarray/closure headers
+# (big-path m_cs_sz = 0 under the pin's LEAN_MIMALLOC config); tri-state RC
+# transitions (ST counts, persistent zeroing, MT negation + atomic lanes).
+#
+# Coverage boundary (typed, honest): the implemented subset — no cross-heap
+# pointer passing (dlopen doors are beads franken_lean-sno / franken_lean-83r),
+# no task scheduling (fln-3gv), no thunk forcing or closure application
+# (franken_lean-7xe), no mpz facts (mpz_object is private to the upstream
+# runtime; layout evidence is G0-1, tribunal/fixtures/c3/FINDINGS.md item 9).

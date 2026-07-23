@@ -7,6 +7,7 @@
 > source: `vendor/lean4-src/src/include/lean/lean.h` (3352 lines, sha256 `22eed50aa703c4403010fabc12a7231ffa34dc979bd59ca1bfbac13c29a1dad2`)
 > inventory: `contracts/abi_inventory.json` sha256 `f61654c61c404f3c34bfefbe695269dafaffadd146643083ffca3e73340e2254`
 > rust: `crates/fln-rt/src/abi.rs` (rendered from the same inventory)
+> rust (boundary): `crates/fln-unsafe-abi/src/contract.rs` (layout partition, `pub(crate)`, same inventory)
 
 Scope of this slice (bead franken_lean-53v): object tags, layout constants,
 object-header and object-struct field layouts, ownership conventions, and the
