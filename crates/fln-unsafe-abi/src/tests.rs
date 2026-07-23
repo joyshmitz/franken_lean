@@ -754,3 +754,254 @@ fn collect_c4_facts() -> Vec<(String, i64)> {
 
     f
 }
+
+// ================================================================ the C export surface (bead franken_lean-83r)
+// Parity of the exported census-signatured wrappers against the internal
+// twins, the size-prefixed small heap, and the pin's UTF-8 quirk vectors.
+// Panic-message printing is disabled around the panic_fn cases so the suite
+// output stays clean; the process-exit behaviors live in the gauntlet lane
+// (scripts/e2e/marrow_stage0_gauntlet.sh), not here.
+
+#[test]
+fn export_small_heap_prefix_roundtrip() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_alloc_small, export_lean_free_small, export_lean_small_mem_size,
+        export_mi_free, export_mi_malloc_small,
+    };
+    // mi twin: size preserved through the prefix, pointer 8-aligned.
+    let p = export_mi_malloc_small(24);
+    assert!(!p.is_null());
+    assert_eq!(p.addr() % 8, 0, "objects are 8-aligned");
+    assert_eq!(export_lean_small_mem_size(p), 24);
+    export_mi_free(p);
+    // free(NULL) is a no-op, exactly like free.
+    export_mi_free(core::ptr::null_mut());
+    // malloc(0): unique releasable block.
+    let z = export_mi_malloc_small(0);
+    assert!(!z.is_null());
+    export_mi_free(z);
+    // SMALL_ALLOCATOR surface: aligned size + slot-idx law.
+    let q = export_lean_alloc_small(32, 3);
+    assert!(!q.is_null());
+    assert_eq!(export_lean_small_mem_size(q), 32);
+    export_lean_free_small(q);
+}
+
+#[test]
+fn export_alloc_object_marks_big_path_and_frees() {
+    let _g = lock();
+    use crate::export::{export_lean_alloc_object, export_lean_free_object};
+    let o = export_lean_alloc_object(64);
+    assert!(!o.is_null());
+    // Header init through the internal twin, then release through the
+    // exported category dispatch.
+    // UNSAFE-LEDGER: FLN-UL-0103
+    #[allow(unsafe_code)]
+    unsafe {
+        assert_eq!(
+            (&raw const (*o).m_cs_sz).read(),
+            0,
+            "big path marks cs_sz=0"
+        );
+        crate::rc::init_st_header(o, contract::TAG_SCALAR_ARRAY, 1);
+        let a = o.cast::<LeanSarrayObject>();
+        (&raw mut (*a).m_size).write(0);
+        (&raw mut (*a).m_capacity).write(64 - size_of::<LeanSarrayObject>());
+    }
+    export_lean_free_object(o);
+}
+
+#[test]
+fn export_string_constructors_match_pin_semantics() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_dec_ref_cold, export_lean_mk_ascii_string_unchecked, export_lean_mk_string,
+        export_lean_mk_string_from_bytes, export_lean_object_byte_size,
+        export_lean_object_data_byte_size, export_lean_string_eq_cold,
+    };
+    // UNSAFE-LEDGER: FLN-UL-0104
+    #[allow(unsafe_code)]
+    unsafe {
+        // Valid UTF-8: codepoints counted, NUL appended, size = bytes + 1.
+        let s = export_lean_mk_string(c"h\u{e9}llo".as_ptr());
+        let (size, cap, len, bytes) = crate::object::string_fields(s);
+        assert_eq!((size, cap, len), (7, 7, 5), "é is two bytes, five chars");
+        assert_eq!(&bytes[..6], "héllo".as_bytes());
+        assert_eq!(bytes[6], 0);
+        assert_eq!(
+            export_lean_object_byte_size(s),
+            size_of::<LeanStringObject>() + 7
+        );
+        assert_eq!(
+            export_lean_object_data_byte_size(s),
+            size_of::<LeanStringObject>() + 7
+        );
+        // eq_cold: equal bytes true, same-size different bytes false.
+        let t = export_lean_mk_string(c"h\u{e9}llo".as_ptr());
+        let u = export_lean_mk_string(c"h\u{e9}llp".as_ptr());
+        assert!(export_lean_string_eq_cold(s, t));
+        assert!(!export_lean_string_eq_cold(s, u));
+        // ASCII unchecked: byte count is the codepoint count by fiat.
+        let a = export_lean_mk_ascii_string_unchecked(c"abc".as_ptr());
+        let (asize, _, alen, _) = crate::object::string_fields(a);
+        assert_eq!((asize, alen), (4, 3));
+        for o in [s, t, u, a] {
+            export_lean_dec_ref_cold(o);
+        }
+        // Lossy recovery vectors (object.cpp:1989-2012 semantics):
+        // one invalid byte mid-string -> U+FFFD, count includes it.
+        let v1 = b"ab\xFFcd";
+        let r1 = export_lean_mk_string_from_bytes(v1.as_ptr().cast(), v1.len());
+        let (_, _, l1, b1) = crate::object::string_fields(r1);
+        assert_eq!(&b1[..b1.len() - 1], "ab\u{FFFD}cd".as_bytes());
+        assert_eq!(l1, 5);
+        // stray continuation at the start.
+        let v2 = b"\x80abc";
+        let r2 = export_lean_mk_string_from_bytes(v2.as_ptr().cast(), v2.len());
+        let (_, _, l2, b2) = crate::object::string_fields(r2);
+        assert_eq!(&b2[..b2.len() - 1], "\u{FFFD}abc".as_bytes());
+        assert_eq!(l2, 4);
+        // truncated 4-byte sequence: continuations are skipped as one char.
+        let v3 = b"\xF0\x9F\x92";
+        let r3 = export_lean_mk_string_from_bytes(v3.as_ptr().cast(), v3.len());
+        let (_, _, l3, b3) = crate::object::string_fields(r3);
+        assert_eq!(&b3[..b3.len() - 1], "\u{FFFD}".as_bytes());
+        assert_eq!(l3, 1);
+        for o in [r1, r2, r3] {
+            export_lean_dec_ref_cold(o);
+        }
+    }
+}
+
+#[test]
+fn export_utf8_strlen_quirks_are_bug_compatible() {
+    let _g = lock();
+    use crate::export::{export_lean_utf8_n_strlen, export_lean_utf8_strlen};
+    // Valid text: codepoints.
+    assert_eq!(export_lean_utf8_strlen(c"h\u{e9}llo".as_ptr()), 5);
+    assert_eq!(export_lean_utf8_strlen(c"".as_ptr()), 0);
+    // The pin's quirk (utf8.cpp:29-32): 0xFF is size 1, so garbage counts.
+    let g1 = b"\xFFabc";
+    assert_eq!(export_lean_utf8_n_strlen(g1.as_ptr().cast(), g1.len()), 4);
+    // A lead byte overstating its size jumps the cursor PAST the buffer end
+    // and the walk still terminates with the partial count (bounded variant).
+    let g2 = b"a\xC3";
+    assert_eq!(export_lean_utf8_n_strlen(g2.as_ptr().cast(), g2.len()), 2);
+    let g3 = b"ab\xE2\x82";
+    assert_eq!(export_lean_utf8_n_strlen(g3.as_ptr().cast(), g3.len()), 3);
+}
+
+#[test]
+fn export_panic_fn_balances_ownership_and_returns_default() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_dec_ref_cold, export_lean_mk_string, export_lean_panic_fn,
+        export_lean_panic_fn_borrowed, export_lean_set_panic_messages,
+    };
+    // Quiet: the message plane is exercised by the gauntlet lane with real
+    // process boundaries; here we assert the ownership contract only.
+    export_lean_set_panic_messages(false);
+    // UNSAFE-LEDGER: FLN-UL-0105
+    #[allow(unsafe_code)]
+    unsafe {
+        let default_val = crate::object::alloc_ctor(0, 0, 0);
+        let msg = export_lean_mk_string(c"boom".as_ptr());
+        // Consuming form: msg is freed, default passes through untouched.
+        let out = export_lean_panic_fn(default_val, msg);
+        assert_eq!(out, default_val);
+        assert_eq!(crate::rc::read_header(default_val).rc, 1);
+        // Borrowed form: default retained before delegation.
+        let msg2 = export_lean_mk_string(c"boom2".as_ptr());
+        let out2 = export_lean_panic_fn_borrowed(default_val, msg2);
+        assert_eq!(out2, default_val);
+        assert_eq!(crate::rc::read_header(default_val).rc, 2);
+        crate::rc::dec_ref(default_val);
+        export_lean_dec_ref_cold(default_val);
+    }
+    export_lean_set_panic_messages(true);
+}
+
+#[test]
+fn export_heartbeat_is_thread_local_counting() {
+    let _g = lock();
+    use crate::export::{export_lean_inc_heartbeat, heartbeat_value};
+    let before = heartbeat_value();
+    for _ in 0..5 {
+        export_lean_inc_heartbeat();
+    }
+    assert_eq!(heartbeat_value(), before + 5);
+    // A fresh thread starts its own counter (LEAN_THREAD_VALUE semantics).
+    std::thread::spawn(|| {
+        assert_eq!(heartbeat_value(), 0);
+        export_lean_inc_heartbeat();
+        assert_eq!(heartbeat_value(), 1);
+    })
+    .join()
+    .expect("heartbeat thread");
+}
+
+#[test]
+fn export_dec_ref_cold_tears_down_graphs() {
+    let _g = lock();
+    use crate::export::export_lean_dec_ref_cold;
+    // UNSAFE-LEDGER: FLN-UL-0106
+    #[allow(unsafe_code)]
+    unsafe {
+        // ctor(ctor(string), string) torn down through the exported cold path.
+        let inner_s = crate::object::mk_string_unchecked(b"leaf", 4);
+        let inner = crate::object::alloc_ctor(1, 1, 0);
+        crate::object::ctor_set(inner, 0, inner_s);
+        let outer_s = crate::object::mk_string_unchecked(b"leaf2", 5);
+        let outer = crate::object::alloc_ctor(0, 2, 0);
+        crate::object::ctor_set(outer, 0, inner);
+        crate::object::ctor_set(outer, 1, outer_s);
+        export_lean_dec_ref_cold(outer);
+    }
+}
+
+#[test]
+fn export_mark_persistent_via_c_surface() {
+    let _g = lock();
+    use crate::export::export_lean_mark_persistent;
+    // UNSAFE-LEDGER: FLN-UL-0107
+    #[allow(unsafe_code)]
+    unsafe {
+        let s = crate::object::mk_string_unchecked(b"p", 1);
+        let o = crate::object::alloc_ctor(0, 1, 0);
+        crate::object::ctor_set(o, 0, s);
+        export_lean_mark_persistent(o);
+        assert_eq!(crate::rc::read_header(o).rc, 0);
+        assert_eq!(crate::rc::read_header(s).rc, 0);
+        // Persistent objects are never freed; the blocks leak by design here
+        // exactly as compact-region residents would.
+    }
+}
+
+#[test]
+fn export_platform_and_byte_array_roundtrip() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_dec_ref_cold, export_lean_mk_string, export_lean_string_from_utf8_unchecked,
+        export_lean_string_to_utf8, export_lean_system_platform_nbits,
+    };
+    assert_eq!(
+        tagged::unbox(export_lean_system_platform_nbits(tagged::boxi(0))),
+        64
+    );
+    // UNSAFE-LEDGER: FLN-UL-0112
+    #[allow(unsafe_code)]
+    unsafe {
+        // String -> ByteArray (borrowed) -> String (consuming) roundtrip.
+        let s = export_lean_mk_string(c"h\u{e9}llo".as_ptr());
+        let ba = export_lean_string_to_utf8(s);
+        let (elem, size, _cap, _) = crate::object::sarray_fields(ba);
+        assert_eq!((elem, size), (1, 6), "content bytes only, no NUL");
+        let s2 = export_lean_string_from_utf8_unchecked(ba);
+        let (sz2, _, len2, bytes2) = crate::object::string_fields(s2);
+        assert_eq!((sz2, len2), (7, 5));
+        assert_eq!(&bytes2[..6], "héllo".as_bytes());
+        export_lean_dec_ref_cold(s);
+        export_lean_dec_ref_cold(s2);
+    }
+}

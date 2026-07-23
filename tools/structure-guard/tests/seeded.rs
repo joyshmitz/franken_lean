@@ -847,3 +847,195 @@ fn repository_cargo_config_cannot_bypass_the_reviewed_compilation_contract() {
         );
     }
 }
+
+// ================================================================ FLN-STRUCT-026
+// The C-ABI export covenant (bead franken_lean-83r): census ⇄ status-row ⇄
+// export-site join, all directions seeded and killed.
+
+fn census_fixture() -> &'static str {
+    // The stable one-AbiFn-per-line rendering the covenant's extractor reads.
+    "pub static FUNCTION_CENSUS: &[AbiFn] = &[\n\
+     \x20   AbiFn { name: \"lean_alloc_object\", linkage: Linkage::Export, line: 503 },\n\
+     \x20   AbiFn { name: \"lean_apply_1\", linkage: Linkage::Export, line: 827 },\n\
+     \x20   AbiFn { name: \"lean_align\", linkage: Linkage::Inline, line: 390 },\n\
+     ];\n"
+}
+
+fn status_fixture(alloc_status: &str, with_apply_row: bool, with_support: bool) -> String {
+    let mut s = String::from("schema fln-abi-export-status/1\n");
+    s.push_str(&format!(
+        "row lean_alloc_object | {alloc_status} | crates/fln-unsafe-abi/src/lib.rs | suite | membrane\n"
+    ));
+    if with_apply_row {
+        s.push_str(
+            "row lean_apply_1 | Unsupported | franken_lean-7xe | census | apply machinery\n",
+        );
+    }
+    if with_support {
+        s.push_str(
+            "support mi_free | RawPlatform | crates/fln-unsafe-abi/src/lib.rs | suite | mimalloc twin\n",
+        );
+    }
+    s
+}
+
+const EXPORTING_LIB: &str = "//! boundary stub\n#![deny(unsafe_code)]\n\n\
+    #[unsafe(export_name = \"lean_alloc_object\")]\n\
+    extern \"C\" fn export_alloc() {}\n";
+
+#[test]
+fn c_export_covenant_clean_join_passes() {
+    let ws = TempWs::new("cexport-clean");
+    base(&ws);
+    ws.write("crates/fln-rt/src/abi.rs", census_fixture());
+    ws.write(
+        "ci/ABI_EXPORT_STATUS.txt",
+        &status_fixture("CompatWrapper", true, false),
+    );
+    ws.write("crates/fln-unsafe-abi/src/lib.rs", EXPORTING_LIB);
+    let out = ws.run();
+    assert!(out.findings.is_empty(), "unexpected: {:?}", out.findings);
+}
+
+#[test]
+fn export_site_without_status_file_is_flagged() {
+    let ws = TempWs::new("cexport-nofile");
+    base(&ws);
+    ws.write("crates/fln-rt/src/abi.rs", census_fixture());
+    ws.write("crates/fln-unsafe-abi/src/lib.rs", EXPORTING_LIB);
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-026"]);
+}
+
+#[test]
+fn export_site_outside_the_exporting_crate_is_flagged() {
+    let ws = TempWs::new("cexport-wrongcrate");
+    base(&ws);
+    ws.write("crates/fln-rt/src/abi.rs", census_fixture());
+    ws.write(
+        "ci/ABI_EXPORT_STATUS.txt",
+        &status_fixture("CompatWrapper", true, false),
+    );
+    ws.write("crates/fln-unsafe-abi/src/lib.rs", EXPORTING_LIB);
+    ws.write(
+        "crates/fln-unsafe-region/src/lib.rs",
+        "//! boundary stub\n#![deny(unsafe_code)]\n\n\
+         #[unsafe(export_name = \"lean_free_small\")]\n\
+         extern \"C\" fn smuggled() {}\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-026"]);
+}
+
+#[test]
+fn unclassified_census_symbol_is_flagged() {
+    let ws = TempWs::new("cexport-unclassified");
+    base(&ws);
+    ws.write("crates/fln-rt/src/abi.rs", census_fixture());
+    // lean_apply_1 has no row: §6.5's "no unclassified symbol" fails.
+    ws.write(
+        "ci/ABI_EXPORT_STATUS.txt",
+        &status_fixture("CompatWrapper", false, false),
+    );
+    ws.write("crates/fln-unsafe-abi/src/lib.rs", EXPORTING_LIB);
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-026"]);
+}
+
+#[test]
+fn unsupported_row_with_live_site_is_flagged() {
+    let ws = TempWs::new("cexport-lie");
+    base(&ws);
+    ws.write("crates/fln-rt/src/abi.rs", census_fixture());
+    ws.write(
+        "ci/ABI_EXPORT_STATUS.txt",
+        &status_fixture("Unsupported", true, false),
+    );
+    ws.write("crates/fln-unsafe-abi/src/lib.rs", EXPORTING_LIB);
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-026"]);
+}
+
+#[test]
+fn stale_implemented_row_without_site_is_flagged() {
+    let ws = TempWs::new("cexport-stale");
+    base(&ws);
+    ws.write("crates/fln-rt/src/abi.rs", census_fixture());
+    ws.write(
+        "ci/ABI_EXPORT_STATUS.txt",
+        &status_fixture("CompatWrapper", true, false),
+    );
+    // Boundary crate carries no site: the CompatWrapper claim is stale.
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-026"]);
+}
+
+#[test]
+fn unknown_row_symbol_and_shadowing_support_row_are_flagged() {
+    let ws = TempWs::new("cexport-unknown");
+    base(&ws);
+    ws.write("crates/fln-rt/src/abi.rs", census_fixture());
+    // (duplicate symbols are rejected at the parser layer — export_status
+    // unit tests cover that; here every row symbol is unique.)
+    let mut status = status_fixture("CompatWrapper", false, false);
+    status.push_str("row lean_not_in_census | Unsupported | somewhere | census | ghost\n");
+    status.push_str(
+        "support lean_apply_1 | RawPlatform | crates/fln-unsafe-abi/src/lib.rs | suite | shadow\n",
+    );
+    ws.write("ci/ABI_EXPORT_STATUS.txt", &status);
+    ws.write("crates/fln-unsafe-abi/src/lib.rs", EXPORTING_LIB);
+    // Three findings, one defect family: the unknown row symbol, the support
+    // row shadowing a census symbol, and that implemented support row having
+    // no export site (stale claim).
+    let out = ws.run();
+    assert_eq!(out.findings.len(), 3, "unexpected: {:?}", out.findings);
+    assert!(out.findings.iter().all(|f| f.code == "FLN-STRUCT-026"));
+}
+
+#[test]
+fn no_mangle_stays_banned_and_split_symbol_fails_closed() {
+    let ws = TempWs::new("cexport-nomangle");
+    base(&ws);
+    ws.write("crates/fln-rt/src/abi.rs", census_fixture());
+    ws.write(
+        "ci/ABI_EXPORT_STATUS.txt",
+        &status_fixture("CompatWrapper", true, false),
+    );
+    ws.write(
+        "crates/fln-unsafe-abi/src/lib.rs",
+        "//! boundary stub\n#![deny(unsafe_code)]\n\n\
+         #[unsafe(export_name = \"lean_alloc_object\")]\n\
+         extern \"C\" fn export_alloc() {}\n\n\
+         #[unsafe(no_mangle)]\n\
+         extern \"C\" fn lean_smuggled() {}\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-022"]);
+
+    // A symbol string the extractor cannot recover exactly fails closed.
+    let ws2 = TempWs::new("cexport-split");
+    base(&ws2);
+    ws2.write("crates/fln-rt/src/abi.rs", census_fixture());
+    ws2.write(
+        "ci/ABI_EXPORT_STATUS.txt",
+        &status_fixture("CompatWrapper", true, false),
+    );
+    ws2.write(
+        "crates/fln-unsafe-abi/src/lib.rs",
+        "//! boundary stub\n#![deny(unsafe_code)]\n\n\
+         #[unsafe(export_name =\n\"lean_alloc_object\")]\n\
+         extern \"C\" fn export_alloc() {}\n",
+    );
+    // The unextractable site fails closed AND the implemented row goes stale
+    // (no joined site) — two findings, one defect.
+    let out = ws2.run();
+    assert_eq!(out.findings.len(), 2, "unexpected: {:?}", out.findings);
+    assert!(out.findings.iter().all(|f| f.code == "FLN-STRUCT-026"));
+}
+
+#[test]
+fn missing_census_fails_closed_when_status_exists() {
+    let ws = TempWs::new("cexport-nocensus");
+    base(&ws);
+    // Status file present, census absent: the join cannot be verified.
+    ws.write(
+        "ci/ABI_EXPORT_STATUS.txt",
+        &status_fixture("CompatWrapper", true, false),
+    );
+    ws.write("crates/fln-unsafe-abi/src/lib.rs", EXPORTING_LIB);
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-026"]);
+}

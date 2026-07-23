@@ -311,7 +311,7 @@ unsafe fn del_core(o: *mut LeanObject, todo: &mut Vec<*mut LeanObject>) {
 /// has already observed `m_rc == 1 || m_rc < 0`.
 // UNSAFE-LEDGER: FLN-UL-0043
 #[allow(unsafe_code)]
-unsafe fn dec_ref_cold(o: *mut LeanObject) {
+pub(crate) unsafe fn dec_ref_cold(o: *mut LeanObject) {
     // SAFETY: mirrors the upstream cold path exactly; the AcqRel fetch_add
     // pairs MT decrements so exactly one thread observes -1 and frees.
     unsafe {

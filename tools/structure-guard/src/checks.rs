@@ -24,19 +24,24 @@
 //! * `FLN-STRUCT-025` expansion covenant violation (macro-using boundary crate whose
 //!   fully expanded surface exports, synthesizes an unsafe allowance, or cannot be
 //!   deterministically expanded — incl. feature-conditional unknowns)
+//! * `FLN-STRUCT-026` C-ABI export covenant violation (§6.5, bead franken_lean-83r):
+//!   the census ⇄ `ci/ABI_EXPORT_STATUS.txt` ⇄ `export_name`-site join is broken —
+//!   an unclassified symbol, a stale or lying status row, an export outside
+//!   `fln-unsafe-abi`, or an unextractable symbol string (fail closed)
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::boundary_api;
+use crate::export_status;
 use crate::graph::{self, CrateKind, GraphFile};
 use crate::ledger::{self, AllowSite};
 use crate::manifest::{self, Manifest};
 use crate::report::fnv1a64;
 use crate::{
-    ALLOWLIST_FILE, BOUNDARY_API_FILE, GRAPH_FILE, LEDGER_FILE, LOCK_FILE, SUITE_LOCK_FILE,
-    TOOLCHAIN_FILE,
+    ABI_CENSUS_FILE, ALLOWLIST_FILE, BOUNDARY_API_FILE, EXPORT_STATUS_FILE, EXPORTING_CRATE,
+    GRAPH_FILE, LEDGER_FILE, LOCK_FILE, SUITE_LOCK_FILE, TOOLCHAIN_FILE,
 };
 
 #[derive(Debug)]
@@ -968,6 +973,33 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             Vec::new()
         }
     };
+    // The C-ABI export covenant's inputs (FLN-STRUCT-026, bead franken_lean-83r):
+    // the reviewed per-symbol status ledger, loaded once, and every
+    // `export_name` site found while walking the boundary crates below.
+    let export_rows = match export_status::load(root, EXPORT_STATUS_FILE) {
+        Ok(rows) => rows,
+        Err(detail) => {
+            findings.push(Finding {
+                code: "FLN-STRUCT-026",
+                path: EXPORT_STATUS_FILE.to_string(),
+                detail,
+            });
+            None
+        }
+    };
+    let implemented_exports: BTreeSet<String> = export_rows
+        .as_ref()
+        .map(|status| {
+            status
+                .rows
+                .iter()
+                .filter(|row| row.implemented())
+                .map(|row| row.symbol.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let no_exports: BTreeSet<String> = BTreeSet::new();
+    let mut abi_export_sites: Vec<(String, usize, Option<String>)> = Vec::new();
     let mut used_api_rows: BTreeSet<&str> = BTreeSet::new();
     for c in &discovered {
         let is_boundary = g
@@ -1014,6 +1046,23 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                     detail: format!("{} in unsafe boundary `{}` (D3 law b)", site.detail, c.name),
                 });
             }
+            // C-ABI export sites (FLN-STRUCT-026): only the one designated
+            // exporting crate may carry them; its sites join the status
+            // ledger after the walk. Everything else fails here.
+            for site in ledger::export_name_attr_sites(&text) {
+                if c.name == EXPORTING_CRATE {
+                    abi_export_sites.push((rel.clone(), site.line, site.symbol.clone()));
+                } else {
+                    findings.push(Finding {
+                        code: "FLN-STRUCT-026",
+                        path: format!("{rel}:{}", site.line),
+                        detail: format!(
+                            "export_name site in `{}`; only `{EXPORTING_CRATE}` may export C symbols (D3, §21.2)",
+                            c.name
+                        ),
+                    });
+                }
+            }
             for item in ledger::public_item_sites(&text) {
                 if item.kind == "unknown" {
                     findings.push(Finding {
@@ -1051,7 +1100,12 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         if findings.len() > findings_before {
             continue;
         }
-        findings.extend(expansion_covenant(root, c, &source_pub)?);
+        let allowed_exports = if c.name == EXPORTING_CRATE {
+            &implemented_exports
+        } else {
+            &no_exports
+        };
+        findings.extend(expansion_covenant(root, c, &source_pub, allowed_exports)?);
     }
     for row in &boundary_rows {
         if !used_api_rows.contains(row.id.as_str()) {
@@ -1065,6 +1119,11 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             });
         }
     }
+    findings.extend(c_export_covenant(
+        root,
+        export_rows.as_ref(),
+        &abi_export_sites,
+    ));
 
     // ---- line-count covenants ----------------------------------------------------------
     for (crate_name, limit) in &g.covenants {
@@ -1140,6 +1199,7 @@ fn expansion_covenant(
     root: &Path,
     c: &DiscoveredCrate,
     source_pub: &BTreeSet<(String, String)>,
+    allowed_exports: &BTreeSet<String>,
 ) -> Result<Vec<Finding>, String> {
     let src = c.dir.join("src");
     let mut sources = Vec::new();
@@ -1208,7 +1268,7 @@ fn expansion_covenant(
                 // that remains live in test code is a synthesized unsafe
                 // allowance, which the count rule below checks for every cfg.
                 if !test_cfg {
-                    for site in ledger::expanded_surface_violations(&expanded) {
+                    for site in ledger::expanded_surface_violations(&expanded, allowed_exports) {
                         findings.push(Finding {
                             code: "FLN-STRUCT-025",
                             path: format!("{}/src (expanded:{label}:{})", c.rel, site.line),
@@ -1260,6 +1320,176 @@ fn expansion_covenant(
         }
     }
     Ok(findings)
+}
+
+/// The generated census's `Linkage::Export` symbol set, extracted from the
+/// stable one-`AbiFn`-per-line rendering of `crates/fln-rt/src/abi.rs`.
+/// Zero matches (missing file, format drift) fails closed — the covenant
+/// cannot verify a join against an unreadable census.
+fn census_export_symbols(root: &Path) -> Result<BTreeSet<String>, String> {
+    let path = root.join(ABI_CENSUS_FILE);
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {ABI_CENSUS_FILE}: {error}"))?;
+    let mut out = BTreeSet::new();
+    for line in text.lines() {
+        if !line.contains("Linkage::Export") {
+            continue;
+        }
+        let Some(idx) = line.find("name: \"") else {
+            continue;
+        };
+        let rest = &line[idx + 7..];
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        out.insert(rest[..end].to_string());
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "{ABI_CENSUS_FILE}: no Linkage::Export census entries found (format drift?); the export covenant fails closed"
+        ));
+    }
+    Ok(out)
+}
+
+/// FLN-STRUCT-026 — the C-ABI export covenant join (plan §6.5, bead
+/// franken_lean-83r). Laws, all fail-closed:
+///
+/// * **census totality** — every `Linkage::Export` census symbol has exactly
+///   one status row; a row naming a symbol outside the census is unknown;
+///   `support` rows must NOT shadow census symbols (they exist for the
+///   non-census link demands of the pin's `LEAN_MIMALLOC` inlines).
+/// * **site⇄row equality** — every `export_name` site in the exporting crate
+///   names a row with an implemented status (an `Unsupported` row with a
+///   live site is a lie; a site without a row is unclassified), and every
+///   implemented row has exactly one site (zero = stale claim, two = a
+///   duplicate symbol definition the linker would reject anyway).
+/// * **extractability** — a site whose symbol string cannot be recovered
+///   exactly is a finding, never a skip.
+fn c_export_covenant(
+    root: &Path,
+    status: Option<&export_status::ExportStatus>,
+    sites: &[(String, usize, Option<String>)],
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let Some(status) = status else {
+        if !sites.is_empty() {
+            findings.push(Finding {
+                code: "FLN-STRUCT-026",
+                path: EXPORT_STATUS_FILE.to_string(),
+                detail: format!(
+                    "{} export_name site(s) exist but {EXPORT_STATUS_FILE} is absent — every exported symbol needs a reviewed §6.5 status row",
+                    sites.len()
+                ),
+            });
+        }
+        return findings;
+    };
+    let census = match census_export_symbols(root) {
+        Ok(census) => census,
+        Err(detail) => {
+            findings.push(Finding {
+                code: "FLN-STRUCT-026",
+                path: ABI_CENSUS_FILE.to_string(),
+                detail,
+            });
+            return findings;
+        }
+    };
+    let rows: std::collections::BTreeMap<&str, &export_status::StatusRow> = status
+        .rows
+        .iter()
+        .map(|row| (row.symbol.as_str(), row))
+        .collect();
+    for symbol in &census {
+        if !rows.contains_key(symbol.as_str()) {
+            findings.push(Finding {
+                code: "FLN-STRUCT-026",
+                path: EXPORT_STATUS_FILE.to_string(),
+                detail: format!(
+                    "census export symbol `{symbol}` has no status row — there is no unclassified symbol (§6.5)"
+                ),
+            });
+        }
+    }
+    for row in &status.rows {
+        if row.support || row.extern_row {
+            if census.contains(&row.symbol) {
+                findings.push(Finding {
+                    code: "FLN-STRUCT-026",
+                    path: EXPORT_STATUS_FILE.to_string(),
+                    detail: format!(
+                        "{} row `{}` shadows a lean.h census export symbol — census symbols use `row`",
+                        if row.support { "support" } else { "extern" },
+                        row.symbol
+                    ),
+                });
+            }
+        } else if !census.contains(&row.symbol) {
+            findings.push(Finding {
+                code: "FLN-STRUCT-026",
+                path: EXPORT_STATUS_FILE.to_string(),
+                detail: format!(
+                    "row `{}` names a symbol absent from the census export set (stale or misspelled)",
+                    row.symbol
+                ),
+            });
+        }
+    }
+    let mut site_symbols: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for (path, line, symbol) in sites {
+        match symbol {
+            None => findings.push(Finding {
+                code: "FLN-STRUCT-026",
+                path: format!("{path}:{line}"),
+                detail: "export_name site whose symbol string cannot be extracted exactly; failing closed".to_string(),
+            }),
+            Some(symbol) => {
+                *site_symbols.entry(symbol.clone()).or_insert(0) += 1;
+                match rows.get(symbol.as_str()) {
+                    None => findings.push(Finding {
+                        code: "FLN-STRUCT-026",
+                        path: format!("{path}:{line}"),
+                        detail: format!(
+                            "exported symbol `{symbol}` has no row in {EXPORT_STATUS_FILE} — unclassified export"
+                        ),
+                    }),
+                    Some(row) if !row.implemented() => findings.push(Finding {
+                        code: "FLN-STRUCT-026",
+                        path: format!("{path}:{line}"),
+                        detail: format!(
+                            "exported symbol `{symbol}` is rowed `{}` — an Unsupported row with a live export site is a lie",
+                            row.status
+                        ),
+                    }),
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    for (symbol, count) in &site_symbols {
+        if *count > 1 {
+            findings.push(Finding {
+                code: "FLN-STRUCT-026",
+                path: EXPORT_STATUS_FILE.to_string(),
+                detail: format!("symbol `{symbol}` has {count} export sites — one site per symbol"),
+            });
+        }
+    }
+    for row in &status.rows {
+        if row.implemented() && !site_symbols.contains_key(&row.symbol) {
+            findings.push(Finding {
+                code: "FLN-STRUCT-026",
+                path: EXPORT_STATUS_FILE.to_string(),
+                detail: format!(
+                    "row `{}` claims status `{}` but no export site exists (stale claim)",
+                    row.symbol, row.status
+                ),
+            });
+        }
+    }
+    findings
 }
 
 /// Run `cargo rustc -- -Zunpretty=expanded` for one cfg of a boundary crate.

@@ -462,7 +462,6 @@ pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
         for (name, detail) in [
             ("macro_export", "exported macro"),
             ("no_mangle", "unmangled symbol export"),
-            ("export_name", "named symbol export"),
         ] {
             if attribute.lexemes.iter().any(|lexeme| lexeme.text == name) {
                 sites.push(ExportSite {
@@ -475,6 +474,69 @@ pub fn external_export_sites(text: &str) -> Vec<ExportSite> {
     sites.sort_by_key(|site| (site.line, site.detail));
     sites.dedup_by_key(|site| (site.line, site.detail));
     sites
+}
+
+/// One `export_name` attribute site. Since bead franken_lean-83r these are no
+/// longer unconditionally forbidden: they are the C-ABI export covenant's
+/// subject (FLN-STRUCT-026) — admissible only in `fln-unsafe-abi`, only with
+/// a parseable symbol string, and only when that symbol has an implemented
+/// row in `ci/ABI_EXPORT_STATUS.txt`. `no_mangle` stays forbidden outright:
+/// every export must name its symbol explicitly so the covenant can join it.
+#[derive(Debug)]
+pub struct ExportNameSite {
+    pub line: usize,
+    /// The symbol string, when it can be extracted exactly from the site's
+    /// source line. `None` fails closed at the covenant layer.
+    pub symbol: Option<String>,
+}
+
+/// Extract `export_name = "<symbol>"` from one source line. The main lexer
+/// deliberately drops string literals (so strings can never authorize
+/// anything), so the symbol is recovered by a targeted scan of the
+/// attribute's own line; anything unextractable stays `None` (fail closed).
+fn extract_export_symbol(line: &str) -> Option<String> {
+    let idx = line.find("export_name")?;
+    let rest = line[idx + "export_name".len()..].trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let symbol = &rest[..end];
+    let valid = !symbol.is_empty()
+        && symbol
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && symbol
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then(|| symbol.to_string())
+}
+
+/// Every attribute carrying an `export_name` lexeme, with its symbol when
+/// exactly one is recoverable from the attribute's line. Works on source and
+/// on `-Zunpretty=expanded` output (doc comments cannot leak in: the lexer
+/// drops string literals, so `export_name` inside a `#[doc = "…"]` body is
+/// never a lexeme).
+pub fn export_name_attr_sites(text: &str) -> Vec<ExportNameSite> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for attribute in attributes(text) {
+        if attribute
+            .lexemes
+            .iter()
+            .any(|lexeme| lexeme.text == "export_name")
+        {
+            let symbol = lines
+                .get(attribute.line.saturating_sub(1))
+                .copied()
+                .and_then(extract_export_symbol);
+            out.push(ExportNameSite {
+                line: attribute.line,
+                symbol,
+            });
+        }
+    }
+    out
 }
 
 /// Lines containing macro invocations (`name!(..)` / `name![..]` / `name!{..}`),
@@ -508,15 +570,20 @@ pub fn macro_invocation_lines(text: &str) -> Vec<usize> {
 /// The expansion covenant's surface scan (bead fln-lld): run over the FULLY
 /// EXPANDED crate text (`rustc -Zunpretty=expanded`, one run per compiled
 /// cfg), where nothing can hide behind a macro any more. In expanded form a
-/// boundary crate must still contain no
-/// `macro_export`/`no_mangle`/`export_name` attribute and no `global_asm!`
-/// (which can define symbols below the attribute layer). Bare-`pub` items in
-/// the expanded surface are checked separately by the subset rule
-/// ([`expanded_public_items`] ⊆ declared source items, `checks.rs`).
-/// D1 closes the macro universe to `std`'s own macros (no proc-macro or
-/// third-party macro can even be named), so post-expansion text scanning is
-/// sound: whatever a macro synthesized is literal text here.
-pub fn expanded_surface_violations(expanded: &str) -> Vec<ExportSite> {
+/// boundary crate must still contain no `macro_export`/`no_mangle` attribute
+/// and no `global_asm!` (which can define symbols below the attribute
+/// layer); an `export_name` attribute is admissible only when its symbol is
+/// in `allowed_exports` — the declared, status-rowed C export set (bead
+/// franken_lean-83r) — so a macro cannot synthesize an undeclared symbol
+/// export. Bare-`pub` items in the expanded surface are checked separately
+/// by the subset rule ([`expanded_public_items`] ⊆ declared source items,
+/// `checks.rs`). D1 closes the macro universe to `std`'s own macros (no
+/// proc-macro or third-party macro can even be named), so post-expansion
+/// text scanning is sound: whatever a macro synthesized is literal text here.
+pub fn expanded_surface_violations(
+    expanded: &str,
+    allowed_exports: &std::collections::BTreeSet<String>,
+) -> Vec<ExportSite> {
     let lexemes = rust_lexemes(expanded);
     let mut sites = Vec::new();
     for (idx, lexeme) in lexemes.iter().enumerate() {
@@ -532,7 +599,6 @@ pub fn expanded_surface_violations(expanded: &str) -> Vec<ExportSite> {
         for (name, detail) in [
             ("macro_export", "exported macro in expanded surface"),
             ("no_mangle", "unmangled symbol export in expanded surface"),
-            ("export_name", "named symbol export in expanded surface"),
         ] {
             if attribute.lexemes.iter().any(|lexeme| lexeme.text == name) {
                 sites.push(ExportSite {
@@ -540,6 +606,18 @@ pub fn expanded_surface_violations(expanded: &str) -> Vec<ExportSite> {
                     detail,
                 });
             }
+        }
+    }
+    for site in export_name_attr_sites(expanded) {
+        let admitted = site
+            .symbol
+            .as_ref()
+            .is_some_and(|symbol| allowed_exports.contains(symbol));
+        if !admitted {
+            sites.push(ExportSite {
+                line: site.line,
+                detail: "export_name in expanded surface outside the declared C export set",
+            });
         }
     }
     sites.sort_by_key(|site| (site.line, site.detail));
@@ -1029,30 +1107,69 @@ fn two() {}
         assert_eq!(admission_token_sites("type T = CheckedExpr;\n").len(), 1);
         assert!(admission_token_sites("fn clean() {}\n").is_empty());
         // Macro-generated symbol exports.
+        let none: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let lean_x: std::collections::BTreeSet<String> =
+            std::iter::once("lean_x".to_string()).collect();
         assert_eq!(
-            expanded_surface_violations("#[no_mangle]\nextern \"C\" fn s() {}\n").len(),
+            expanded_surface_violations("#[no_mangle]\nextern \"C\" fn s() {}\n", &none).len(),
+            1
+        );
+        // export_name: undeclared symbol fails; a declared symbol is admitted
+        // (the C export covenant, FLN-STRUCT-026); a declared symbol under a
+        // no_mangle attr still fails (exports must name their symbol).
+        assert_eq!(
+            expanded_surface_violations("#[unsafe(export_name = \"lean_x\")]\nfn s() {}\n", &none)
+                .len(),
+            1
+        );
+        assert!(
+            expanded_surface_violations(
+                "#[unsafe(export_name = \"lean_x\")]\nfn s() {}\n",
+                &lean_x
+            )
+            .is_empty()
+        );
+        // Unextractable symbol (split across lines) fails closed even when
+        // some symbol is declared.
+        assert_eq!(
+            expanded_surface_violations(
+                "#[unsafe(export_name =\n\"lean_x\")]\nfn s() {}\n",
+                &lean_x
+            )
+            .len(),
             1
         );
         assert_eq!(
-            expanded_surface_violations("#[unsafe(export_name = \"lean_x\")]\nfn s() {}\n").len(),
-            1
-        );
-        assert_eq!(
-            expanded_surface_violations("#[macro_export]\nmacro_rules! m { () => {} }\n").len(),
+            expanded_surface_violations("#[macro_export]\nmacro_rules! m { () => {} }\n", &none)
+                .len(),
             1
         );
         // Symbol definition below the attribute layer.
         assert_eq!(
-            expanded_surface_violations("::core::arch::global_asm!(\".globl lean_x\");\n").len(),
+            expanded_surface_violations("::core::arch::global_asm!(\".globl lean_x\");\n", &none)
+                .len(),
             1
         );
         // The clean expanded shape: restricted visibility, impls, expressions.
         assert!(
             expanded_surface_violations(
-                "pub(crate) fn f() {}\nimpl Drop for X { fn drop(&mut self) {} }\n"
+                "pub(crate) fn f() {}\nimpl Drop for X { fn drop(&mut self) {} }\n",
+                &none
             )
             .is_empty()
         );
+        // A doc string mentioning export_name never counts (strings are
+        // dropped by the lexer), and the extractor parses real sites.
+        assert!(
+            expanded_surface_violations(
+                "#[doc = \"use export_name = \\\"x\\\" here\"]\nfn d() {}\n",
+                &none
+            )
+            .is_empty()
+        );
+        let sites = export_name_attr_sites("#[unsafe(export_name = \"lean_y\")]\nfn s() {}\n");
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].symbol.as_deref(), Some("lean_y"));
     }
 
     /// Seeded allowance-synthesis defect: a macro that expands to an extra

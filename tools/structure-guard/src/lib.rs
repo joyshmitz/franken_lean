@@ -24,6 +24,7 @@
 
 pub mod boundary_api;
 pub mod checks;
+pub mod export_status;
 pub mod graph;
 pub mod ledger;
 pub mod lockfile;
@@ -36,6 +37,12 @@ pub const GRAPH_FILE: &str = "ci/WORKSPACE_GRAPH.txt";
 pub const LEDGER_FILE: &str = "ci/UNSAFE_LEDGER.txt";
 /// Workspace-relative path of the reviewed boundary-crate public-API allowlist.
 pub const BOUNDARY_API_FILE: &str = "ci/BOUNDARY_API.txt";
+/// Workspace-relative path of the reviewed per-symbol C-export status ledger (§6.5).
+pub const EXPORT_STATUS_FILE: &str = "ci/ABI_EXPORT_STATUS.txt";
+/// Workspace-relative path of the generated ABI census the export covenant joins.
+pub const ABI_CENSUS_FILE: &str = "crates/fln-rt/src/abi.rs";
+/// The one crate allowed to carry `#[unsafe(export_name)]` sites (D3, §21.2).
+pub const EXPORTING_CRATE: &str = "fln-unsafe-abi";
 /// Workspace-relative path of the governed dependency-closure allowlist (D1).
 pub const ALLOWLIST_FILE: &str = "ci/CLOSURE_ALLOWLIST.txt";
 /// Workspace-relative path of the one-ceremony pin file.

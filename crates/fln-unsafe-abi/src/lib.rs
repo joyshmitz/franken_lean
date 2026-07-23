@@ -19,9 +19,14 @@
 //! a reviewed row in `ci/BOUNDARY_API.txt` — the type-aware half of the D3
 //! no-admission export covenant, enforced both directions plus post-expansion
 //! by `tools/structure-guard` (FLN-STRUCT-022/025). The raw membrane
-//! (`membrane`/`object`/`tagged`/`contract`) stays crate-internal; the
-//! exported `lean_*` C symbol surface is a later slice (per-symbol census
-//! join, beads franken_lean-sno / franken_lean-83r).
+//! (`membrane`/`object`/`tagged`/`contract`) stays crate-internal. Bead
+//! franken_lean-83r (slice 1) opens the exported `lean_*` C symbol surface
+//! ([`export`]): census-signatured `#[unsafe(export_name)]` wrappers over
+//! the membrane/object/rc twins, per-symbol status rows in
+//! `ci/ABI_EXPORT_STATUS.txt` (§6.5 taxonomy, no unclassified symbol,
+//! guard-enforced both directions), and the size-prefixed small heap that
+//! serves the pin's sizeless `mi_free` shape. The remaining doors (`dlopen`,
+//! outbound linking artifacts) stay with beads franken_lean-sno / fln-kok.
 //!
 //! Slice-1 typed restrictions (tracked, never silent):
 //! * scheduled tasks/promises (`m_imp != NULL`) — bead fln-3gv (effects on
@@ -43,6 +48,7 @@ compile_error!(
 );
 
 mod contract;
+mod export;
 pub mod handle;
 mod layout;
 mod membrane;

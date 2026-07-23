@@ -1,0 +1,242 @@
+# ABI_EXPORT_STATUS.txt — the per-symbol status taxonomy of the exported
+# lean_* C surface (plan §6.5; bead franken_lean-83r slice 1, completing the
+# fln-lld census join).
+#
+# One `row` per Linkage::Export symbol of the generated census
+# (fln-rt::abi::FUNCTION_CENSUS, extracted from the pinned lean.h): there is
+# no unclassified symbol. `support` rows cover non-census symbols the pin's
+# LEAN_MIMALLOC lean.h inlines link-demand from generated C (mimalloc.h twins).
+# tools/structure-guard (FLN-STRUCT-026) enforces the join in BOTH directions:
+#   * every census Export symbol has exactly one row; stale/unknown rows fail;
+#   * every #[unsafe(export_name)] site in fln-unsafe-abi names a row with an
+#     implemented status; an implemented row without a site is stale; an
+#     Unsupported row with a site is a lie; export attrs anywhere else fail.
+#
+# Row grammar (five '|'-separated fields, all non-empty):
+#   row <symbol> | <status> | <site-or-owner> | <evidence> | <notes>
+#   support <symbol> | <status> | <site> | <evidence> | <notes>
+#   extern <symbol> | <status> | <site-or-owner> | <evidence> | <notes>
+# `extern` rows are runtime symbols OUTSIDE lean.h that generated C declares
+# itself (the contracts/extern_census.tsv universe, surfaced by the stage0
+# demand audit); they join export sites exactly like `row`s.
+# status ∈ NativeSafe | RawPlatform | CompatWrapper | ReferenceSemanticAdapter
+#          | Unsupported   (§6.5; Unsupported rows carry the owning bead)
+
+schema fln-abi-export-status/1
+
+row lean_alloc_object | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | membrane big path (object.cpp:355-376); OOM = INTERNAL PANIC like the pin
+row lean_alloc_small | RawPlatform | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | raw prefixed small heap; slot-idx law asserted (lean.h:394-400)
+row lean_apply_1 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_10 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_11 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_12 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_13 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_14 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_15 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_16 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_2 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_3 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_4 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_5 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_6 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_7 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_8 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_9 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_m | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_apply_n | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
+row lean_array_get_panic | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_array_mk | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_array_push | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_array_set_panic | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_array_to_list | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_big_int64_to_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_big_int_to_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_big_int_to_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_big_size_t_to_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_big_uint64_to_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_big_usize_to_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_byte_array_data | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_byte_array_hash | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_byte_array_mk | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_byte_array_push | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_copy_byte_array | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_copy_expand_array | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_copy_expand_array_nonlinear | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_copy_float_array | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_cstr_to_int | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_cstr_to_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_dbg_sleep | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_dbg_trace | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_dbg_trace_if_shared | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_dec_ref_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | death test + iterative deletion worklist (object.cpp:443-457)
+row lean_decode_io_error | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_decode_uv_error | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_finalize_task_manager | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_float32_frexp | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float32_isfinite | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float32_isinf | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float32_isnan | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float32_of_bits | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float32_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_float32_scaleb | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float32_to_bits | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float32_to_string | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float_array_data | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float_array_mk | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float_array_push | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float_frexp | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float_isfinite | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float_isinf | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float_isnan | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float_of_bits | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_float_scaleb | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float_to_bits | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_float_to_string | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_free_object | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | category-dispatched release incl. mpz limb drop (object.cpp:271-280)
+row lean_free_small | RawPlatform | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | sizeless release via the size prefix (lean.h:425-429 discipline)
+row lean_inc_heartbeat | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | thread-local counting twin; calibrated heartbeat LAW is fln-8w8/G0-6
+row lean_init_task_manager | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_init_task_manager_using | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_int16_of_big_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int32_of_big_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int64_of_big_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int8_of_big_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_add | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_div | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_div_exact | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_ediv | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_emod | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_eq | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_le | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_lt | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_mod | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_mul | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_neg | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_nonneg | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_int_big_sub | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_internal_panic | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | panic-path Lean-buffered stderr + backtrace stay with fln-3gv; messages go to the process stderr
+row lean_internal_panic_out_of_memory | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | panic-path Lean-buffered stderr + backtrace stay with fln-3gv; messages go to the process stderr
+row lean_internal_panic_overflow | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | panic-path Lean-buffered stderr + backtrace stay with fln-3gv; messages go to the process stderr
+row lean_internal_panic_rc_overflow | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | panic-path Lean-buffered stderr + backtrace stay with fln-3gv; messages go to the process stderr
+row lean_internal_panic_unreachable | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | panic-path Lean-buffered stderr + backtrace stay with fln-3gv; messages go to the process stderr
+row lean_io_cancel_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_io_check_canceled_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_io_get_task_state_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_io_mark_end_initialization | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_io_result_show_error | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_io_wait_any_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_isize_of_big_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_mark_mt | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | iterative graph walk; external traversal restriction tracked (7xe)
+row lean_mark_persistent | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | iterative graph walk; external traversal restriction tracked (7xe)
+row lean_mk_array | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_ascii_string_unchecked | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | object.cpp:2022-2025
+row lean_mk_io_error_already_exists | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_already_exists_file | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_eof | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_hardware_fault | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_illegal_operation | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_inappropriate_type | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_inappropriate_type_file | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_interrupted | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_invalid_argument | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_invalid_argument_file | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_no_file_or_directory | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_no_such_thing | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_no_such_thing_file | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_other_error | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_permission_denied | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_permission_denied_file | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_protocol_error | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_resource_busy | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_resource_exhausted | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_resource_exhausted_file | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_resource_vanished | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_time_expired | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_unsatisfied_constraints | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_error_unsupported_operation | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_io_user_error | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_mk_string | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | validate + lossy U+FFFD recovery, exact utf8.cpp semantics
+row lean_mk_string_from_bytes | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | validate + lossy U+FFFD recovery, exact utf8.cpp semantics
+row lean_mk_string_from_bytes_unchecked | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | utf8_n_strlen count, bug-compatible garbage stepping
+row lean_mk_string_unchecked | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | object.cpp:1981-1987
+row lean_name_eq | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_nat_big_add | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_div | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_div_exact | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_eq | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_land | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_le | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_lor | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_lt | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_mod | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_mul | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_shiftr | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_sub | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_succ | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_big_xor | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_gcd | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_log2 | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_overflow_mul | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_nat_pow | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_nat_shiftl | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_obj_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_object_byte_size | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | object.cpp:242-259 branch structure kept literally
+row lean_object_data_byte_size | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | object.cpp:237-259 branch structure kept literally
+row lean_panic | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | panic-path Lean-buffered stderr + backtrace stay with fln-3gv; messages go to the process stderr
+row lean_panic_fn | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | panic-path Lean-buffered stderr + backtrace stay with fln-3gv; messages go to the process stderr
+row lean_panic_fn_borrowed | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | panic-path Lean-buffered stderr + backtrace stay with fln-3gv; messages go to the process stderr
+row lean_register_external_class | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_run_main | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_sarray_eq_cold | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_set_exit_on_panic | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | panic-path Lean-buffered stderr + backtrace stay with fln-3gv; messages go to the process stderr
+row lean_set_panic_messages | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | panic-path Lean-buffered stderr + backtrace stay with fln-3gv; messages go to the process stderr
+row lean_slice_dec_lt | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_slice_hash | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_small_mem_size | RawPlatform | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | prefix word readback
+row lean_st_mk_ref | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_st_ref_get | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_st_ref_reset | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_st_ref_set | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_st_ref_swap | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_append | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_compare | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_data | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_eq_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | byte compare over m_size bytes
+row lean_string_hash | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_lt | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_memcmp | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_mk | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_of_usize | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_push | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_utf8_extract | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_utf8_get | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_utf8_get_fast_cold | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_utf8_next | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_utf8_next_fast_cold | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_utf8_prev | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_utf8_set | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_task_bind_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_task_get | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_task_map_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_task_pure | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_task_spawn_core | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_thunk_get_core | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_uint16_of_big_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_uint16_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_uint32_of_big_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_uint32_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_uint64_of_big_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_uint64_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_uint8_of_big_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_uint8_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_usize_of_big_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
+row lean_usize_once_cold | Unsupported | fln-3gv | census (fln-rt::abi) | task/IO/once runtime plane on asupersync effects
+row lean_utf8_n_strlen | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | bug-compatible get_utf8_size stepping (utf8.cpp:49-58)
+row lean_utf8_strlen | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | bug-compatible get_utf8_size stepping (utf8.cpp:16-43)
+support mi_free | RawPlatform | crates/fln-unsafe-abi/src/export.rs | small-heap prefix suite; gauntlet link lane | LEAN_MIMALLOC inline link demand (lean.h:436-441, 490-497); size-prefixed, mi_free null-safe
+support mi_malloc_small | RawPlatform | crates/fln-unsafe-abi/src/export.rs | small-heap prefix suite; gauntlet link lane | LEAN_MIMALLOC inline link demand (lean.h:436-441, 490-497); size-prefixed, mi_free null-safe
+extern lean_sorry | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | gauntlet panic lane; stage0 demand audit | INTERNAL PANIC per the pin; never fabricates a value (object.cpp:208-211)
+extern lean_system_platform_nbits | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export platform test; gauntlet differential | boxed 64 on the certified targets (platform.cpp:12-18)
+extern lean_string_from_utf8_unchecked | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export byte-array roundtrip test; gauntlet differential | consumes the byte array; bug-compatible utf8_n_strlen count
+extern lean_string_to_utf8 | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export byte-array roundtrip test; gauntlet differential | borrowed string to fresh sarray of m_size-1 bytes
