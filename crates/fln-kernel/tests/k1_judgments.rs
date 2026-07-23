@@ -2780,3 +2780,132 @@ fn kr302_binder_congruence_discovered_by_delta() {
         "re-run congruence must stay sound"
     );
 }
+
+// ---- structure eta + unit-like eta in defeq (KR-903/KR-315; bead fln-d4x) -----------
+
+#[test]
+fn kr903_structure_eta_in_defeq_both_directions() {
+    // `s ≟ mk (s.0) (s.1)` for an opaque s of a one-constructor, index-free,
+    // non-recursive structure — and the mirror orientation. The negative
+    // guards soundness: a DIFFERENT opaque value's projections must not close
+    // the equation.
+    let env = add_info(
+        &Environment::new(),
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("D"),
+                level_params: vec![],
+                type_: sort1(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let d = || Expr::const_(n("D"), vec![]);
+    let env = add_structure(&env, "S", "mk", sort1(), &[d(), d()]);
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("s"),
+                level_params: vec![],
+                type_: Expr::const_(n("S"), vec![]),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("s2"),
+                level_params: vec![],
+                type_: Expr::const_(n("S"), vec![]),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let s = || Expr::const_(n("s"), vec![]);
+    let eta_of = |of: Expr| {
+        Expr::app(
+            Expr::app(
+                Expr::const_(n("mk"), vec![]),
+                Expr::proj(n("S"), 0, of.clone()),
+            ),
+            Expr::proj(n("S"), 1, of),
+        )
+    };
+    assert!(
+        check_def_eq(&env, &[], &s(), &eta_of(s()), Budget::DEFAULT).is_accepted(),
+        "s ≟ mk s.0 s.1 (structure eta)"
+    );
+    assert!(
+        check_def_eq(&env, &[], &eta_of(s()), &s(), Budget::DEFAULT).is_accepted(),
+        "mk s.0 s.1 ≟ s (mirror orientation)"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &Expr::const_(n("s2"), vec![]),
+            &eta_of(s()),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "s2 ≟ mk s.0 s.1 must fail — eta must compare the fields of THIS value"
+    );
+}
+
+#[test]
+fn kr315_unit_like_values_are_defeq_when_their_types_are() {
+    // Two opaque values of the same zero-field structure type are defeq;
+    // values of DIFFERENT unit-like types are not — the type-agreement gate
+    // is what separates KR-315 from unsoundness (kills a dropped-type-check
+    // mutant in either eta rule, since `U2.mk` is a saturated zero-field
+    // constructor that try_eta_struct also inspects).
+    let env = add_structure(&Environment::new(), "U", "U.mk", sort1(), &[]);
+    let env = add_structure(&env, "U2", "U2.mk", sort1(), &[]);
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("u1"),
+                level_params: vec![],
+                type_: Expr::const_(n("U"), vec![]),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("u2"),
+                level_params: vec![],
+                type_: Expr::const_(n("U"), vec![]),
+            },
+            is_unsafe: false,
+        }),
+    );
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &Expr::const_(n("u1"), vec![]),
+            &Expr::const_(n("u2"), vec![]),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "two values of one unit-like type are defeq"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &Expr::const_(n("u1"), vec![]),
+            &Expr::const_(n("U2.mk"), vec![]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "a value of U is NOT defeq to the constructor of the DIFFERENT unit-like U2"
+    );
+}

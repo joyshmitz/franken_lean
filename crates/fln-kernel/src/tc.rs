@@ -661,10 +661,8 @@ impl<'a> TypeChecker<'a> {
         let Some(induct_name) = self.recursor_major_induct(rec, depth)? else {
             return Ok(major.clone());
         };
-        match self.env.find(&induct_name) {
-            Some(ConstantInfo::Induct(ind))
-                if ind.ctors.len() == 1 && ind.num_indices == 0 && !ind.is_rec => {}
-            _ => return Ok(major.clone()),
+        if !self.is_non_rec_structure(&induct_name) {
+            return Ok(major.clone());
         }
         let (major_head, _) = app_spine(major);
         if let ExprNode::Const { name, .. } = major_head.node()
@@ -841,7 +839,110 @@ impl<'a> TypeChecker<'a> {
         if self.try_eta(&tn, &sn, depth + 1)? || self.try_eta(&sn, &tn, depth + 1)? {
             return Ok(true);
         }
+        // KR-903 structure eta, both directions (pin: try_eta_struct).
+        if self.try_eta_struct(&tn, &sn, depth + 1)? || self.try_eta_struct(&sn, &tn, depth + 1)? {
+            return Ok(true);
+        }
+        // KR-315 unit-like structures (pin: is_def_eq_unit_like, one-sided).
+        if self.is_def_eq_unit_like(&tn, &sn, depth + 1)? {
+            return Ok(true);
+        }
         Ok(false)
+    }
+
+    /// Is `name` a one-constructor, index-free, non-recursive structure?
+    /// (pin: `is_non_rec_structure`, inductive.cpp:27.)
+    fn is_non_rec_structure(&self, name: &Name) -> bool {
+        matches!(
+            self.env.find(name),
+            Some(ConstantInfo::Induct(ind))
+                if ind.ctors.len() == 1 && ind.num_indices == 0 && !ind.is_rec
+        )
+    }
+
+    /// KR-903 (`try_eta_struct_core`): `t ≟ mk as fs` for a one-constructor,
+    /// index-free, non-recursive structure holds when the types agree and
+    /// every field `fᵢ` of `s` is defeq to `t.i`. The type-agreement gate is
+    /// load-bearing: without it a zero-field constructor would equate values
+    /// of DIFFERENT unit-like types.
+    fn try_eta_struct(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
+        self.step(depth)?;
+        let (s_head, s_args) = app_spine(s);
+        let ExprNode::Const {
+            name: ctor_name, ..
+        } = s_head.node()
+        else {
+            return Ok(false);
+        };
+        let (induct, num_params, num_fields) = match self.env.find(ctor_name) {
+            Some(ConstantInfo::Ctor(ctor)) => (
+                ctor.induct.clone(),
+                ctor.num_params as usize,
+                ctor.num_fields as usize,
+            ),
+            _ => return Ok(false),
+        };
+        if s_args.len() != num_params + num_fields || !self.is_non_rec_structure(&induct) {
+            return Ok(false);
+        }
+        let t_type = match self.infer(t, depth) {
+            Ok(type_) => type_,
+            Err(Stop::Reject(..)) => return Ok(false),
+            Err(stop) => return Err(stop),
+        };
+        let s_type = match self.infer(s, depth) {
+            Ok(type_) => type_,
+            Err(Stop::Reject(..)) => return Ok(false),
+            Err(stop) => return Err(stop),
+        };
+        if !self.is_def_eq(&t_type, &s_type, depth + 1)? {
+            return Ok(false);
+        }
+        for (i, field) in s_args.iter().enumerate().skip(num_params) {
+            let projected = Expr::proj(induct.clone(), (i - num_params) as u64, t.clone());
+            if !self.is_def_eq(&projected, field, depth + 1)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// KR-315 (`is_def_eq_unit_like`): two terms of the same one-constructor,
+    /// ZERO-field structure type are defeq when their types are. One-sided,
+    /// as at the pin — full whnf of `t`'s type unfolds any abbrev first.
+    fn is_def_eq_unit_like(&mut self, t: &Expr, s: &Expr, depth: u32) -> KResult<bool> {
+        let t_type = match self.infer(t, depth) {
+            Ok(type_) => type_,
+            Err(Stop::Reject(..)) => return Ok(false),
+            Err(stop) => return Err(stop),
+        };
+        let t_type = self.whnf(&t_type, depth + 1)?;
+        let (type_head, _) = app_spine(&t_type);
+        let ExprNode::Const { name, .. } = type_head.node() else {
+            return Ok(false);
+        };
+        if !self.is_non_rec_structure(name) {
+            return Ok(false);
+        }
+        let zero_fields = match self.env.find(name) {
+            Some(ConstantInfo::Induct(ind)) => match ind.ctors.first() {
+                Some(ctor_name) => matches!(
+                    self.env.find(ctor_name),
+                    Some(ConstantInfo::Ctor(ctor)) if ctor.num_fields == 0
+                ),
+                None => false,
+            },
+            _ => false,
+        };
+        if !zero_fields {
+            return Ok(false);
+        }
+        let s_type = match self.infer(s, depth) {
+            Ok(type_) => type_,
+            Err(Stop::Reject(..)) => return Ok(false),
+            Err(stop) => return Err(stop),
+        };
+        self.is_def_eq(&t_type, &s_type, depth + 1)
     }
 
     /// KR-306: if `t`'s type is a Prop, t ≟ s reduces to type-defeq.
