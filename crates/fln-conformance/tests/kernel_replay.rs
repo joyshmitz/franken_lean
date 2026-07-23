@@ -1491,19 +1491,23 @@ fn admission_fault_matrix_is_typed_and_atomic() {
                 None
             }
         });
-        let (item_a, defn_a) = defns.next().expect("a first safe definition");
-        let (_, defn_b) = defns
+        let (_, defn_a) = defns.next().expect("a first safe definition");
+        let (item_b, defn_b) = defns
             .find(|(_, b)| b.base.type_ != defn_a.base.type_)
             .expect("a second safe definition with a different type");
-        let mut swapped = defn_a.clone();
-        swapped.base.type_ = defn_b.base.type_.clone();
+        // The LATER definition takes the EARLIER one's statement, so every
+        // constant in the swapped type is already in the checking
+        // environment and the rejection witnesses the declared-type-versus-
+        // value law itself, not name resolution.
+        let mut swapped = defn_b.clone();
+        swapped.base.type_ = defn_a.base.type_.clone();
         cases.push(MutantCase {
             id: "definition_type_swap",
-            target: item_a.lead.to_display_string(),
+            target: item_b.lead.to_display_string(),
             expected_class: "",
             message_must_contain: "",
             decl: Declaration::Defn(swapped),
-            env_lead: item_a.lead.to_display_string(),
+            env_lead: item_b.lead.to_display_string(),
         });
     }
 

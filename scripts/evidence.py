@@ -99,6 +99,19 @@ E2E_STEP_ORDERS = {
         "collision_mutant",
         "collision_recovery",
     ],
+    "kernel_replay": [
+        "decoder_suite",
+        "admission_replay",
+        "census_floor",
+        "corruption",
+        "corruption_recovery",
+        "resource_exhaustion",
+        "resource_recovery",
+        "cancellation",
+        "cancellation_recovery",
+        "internal_fault_probe",
+        "final_real_recheck",
+    ],
 }
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
@@ -173,6 +186,115 @@ ENVIRONMENT_COLLISION_FIELDS = {
     "first_divergence",
     "cleanup_status",
     "final_state",
+}
+
+KERNEL_ADMISSION_SCHEMA = "fln.e2e.kernel-admission"
+KERNEL_ADMISSION_FAULT_SCHEMA = "fln.e2e.kernel-admission-fault"
+KERNEL_ADMISSION_VERSION = 1
+KERNEL_ADMISSION_THREADS = (1, 8, 32)
+KERNEL_ADMISSION_TESTS = (
+    "prelude_replays_through_the_kernel",
+    "admission_fault_matrix_is_typed_and_atomic",
+)
+KERNEL_ADMISSION_BUDGET_STEPS = 10_000_000
+KERNEL_ADMISSION_BUDGET_DEPTH = 4_096
+# The pinned Init.Prelude verdict census (beads franken_lean-irm +
+# franken_lean-ap6). Moves only with a deliberate, bead-tracked change.
+KERNEL_ADMISSION_CENSUS = {
+    "decls_total": 2204,
+    "checked": 2198,
+    "accepted": 2198,
+    "rejected_total": 0,
+    "inconclusive": 0,
+    "unchecked_nonsafe_with_unserialized_refs": 6,
+    "nested_partial_blocks": 1,
+}
+# The named single-defect admission mutants (bead franken_lean-ap6): every
+# one must be killed by a typed rejection in the fault matrix.
+KERNEL_ADMISSION_MUTANTS = (
+    "tampered_recursor_rhs",
+    "nonpositive_ctor_field",
+    "inverted_universe_ctor_field",
+    "quotient_missing_member",
+    "definition_type_swap",
+    "mutual_membership_mismatch",
+)
+KERNEL_ADMISSION_RESOURCE_PHASES = {
+    "resource_boundary_exact_accept": "accepted",
+    "resource_exhaustion_steps": "inconclusive:Steps",
+    "resource_exhaustion_depth": "inconclusive:Depth",
+    "resource_recovery": "accepted",
+}
+_KERNEL_ADMISSION_COMMON_FIELDS = {
+    "schema",
+    "version",
+    "run_id",
+    "bead",
+    "claim_id",
+    "claim_type",
+    "invariant_id",
+    "invariant_relation",
+    "determinism_invariant",
+    "gate_id",
+    "gate_relation",
+    "parity_ledger_row",
+    "data_grade",
+    "epoch",
+    "mode",
+    "profile",
+    "platform",
+    "seed",
+    "cache_state",
+    "canonical_input_root",
+    "scenario",
+    "cwd",
+    "argv",
+    "stdout_artifact",
+    "stderr_artifact",
+    "phase",
+    "status",
+    "budget_steps",
+    "budget_depth",
+    "monotonic_start_us",
+    "monotonic_end_us",
+    "duration_us",
+    "timing_used_as_gate",
+    "process_exit",
+    "signal",
+    "first_divergence",
+    "cleanup_status",
+    "final_state",
+}
+KERNEL_ADMISSION_FIELDS = _KERNEL_ADMISSION_COMMON_FIELDS | {
+    "threads",
+    "decls_total",
+    "units_total",
+    "units_checked",
+    "units_cyclic",
+    "checked",
+    "accepted",
+    "rejected_total",
+    "inconclusive",
+    "unchecked_nonsafe_with_unserialized_refs",
+    "nested_partial_blocks",
+    "verdict_stream_digest",
+    "final_logical_root",
+    "steps_used_total",
+    "max_depth_seen",
+}
+KERNEL_ADMISSION_FAULT_FIELDS = _KERNEL_ADMISSION_COMMON_FIELDS | {
+    "mutant_id",
+    "target",
+    "expected_outcome",
+    "actual_outcome",
+    "reject_class",
+    "message_excerpt",
+    "steps_used",
+    "max_depth",
+    "root_before",
+    "root_after",
+    "atomicity_held",
+    "recovery_outcome",
 }
 
 MAX_RECORD_BYTES = 1_048_576
@@ -3127,6 +3249,497 @@ def validate_environment_collision(
     }
 
 
+def read_kernel_admission_stream(
+    path: Path, artifact_root: Path, *, label: str
+) -> tuple[Path, bytes, str, str, str]:
+    root = lexical_absolute(artifact_root)
+    absolute = require_within(path, root, label=f"kernel-admission {label}")
+    data, _size, digest = stable_file_facts(absolute, max_bytes=MAX_LOG_BYTES)
+    if data and not data.endswith(b"\n"):
+        raise EvidenceError(f"kernel-admission {label} is unterminated: {absolute}")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(f"kernel-admission {label} is not UTF-8: {absolute}") from error
+    for number, raw_line in enumerate(data.splitlines(), 1):
+        if len(raw_line) > MAX_RECORD_BYTES:
+            raise EvidenceError(
+                f"{absolute}:{number}: kernel-admission {label} line is too large"
+            )
+    relative = absolute.relative_to(root).as_posix()
+    return absolute, data, text, digest, relative
+
+
+def kernel_admission_failure_material(text: str) -> bool:
+    failed_forms = set()
+    for test in KERNEL_ADMISSION_TESTS:
+        failed_forms.add(f"{test} --- FAILED")
+        failed_forms.add(f"test {test} ... FAILED")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if (
+            stripped in failed_forms
+            or stripped.startswith("test result: FAILED.")
+            or stripped.startswith("thread '")
+            and " panicked at " in stripped
+            or re.fullmatch(r"assertion .* failed(?:: .*)?", stripped) is not None
+            or stripped.startswith("error: test failed")
+        ):
+            return True
+    return False
+
+
+def validate_kernel_admission(
+    stdout_path: Path,
+    stderr_path: Path,
+    phase: str,
+    expected_run_id: str,
+    observed_exit: int,
+    *,
+    artifact_root: Path,
+    expected_stdout_artifact: str,
+    expected_stderr_artifact: str,
+    expected_cwd: str | None = None,
+    expected_argv: str | None = None,
+    expected_cache_state: str | None = None,
+    expected_input_root: str | None = None,
+) -> dict[str, Any]:
+    """Validate the kernel admission replay's NDJSON detail streams (bead
+    franken_lean-ap6): the {1,8,32} thread matrix must be byte-identical, the
+    pinned census exact, every named mutant killed typed, every resource phase
+    typed Inconclusive-never-verdict, and the machine/human streams disjoint.
+    """
+    if phase not in {"positive", "recovery"}:
+        raise EvidenceError(f"unsupported kernel-admission phase: {phase!r}")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", expected_run_id):
+        raise EvidenceError("kernel-admission run id is malformed")
+    if not isinstance(observed_exit, int) or isinstance(observed_exit, bool):
+        raise EvidenceError("kernel-admission observed exit is not an integer")
+    if observed_exit != 0:
+        raise EvidenceError(
+            f"kernel-admission {phase} exit {observed_exit}, expected 0"
+        )
+    required_cli_values = {
+        "expected cwd": expected_cwd,
+        "expected argv": expected_argv,
+        "expected cache state": expected_cache_state,
+    }
+    missing_cli = sorted(
+        label
+        for label, value in required_cli_values.items()
+        if not isinstance(value, str) or not value
+    )
+    if missing_cli:
+        raise EvidenceError(f"kernel-admission {phase} validation lacks {missing_cli!r}")
+    if not Path(expected_cwd).is_absolute():
+        raise EvidenceError("kernel-admission expected cwd is not absolute")
+    if expected_input_root is not None and not re.fullmatch(
+        r"fln-fixture:[0-9a-f]{64}", expected_input_root
+    ):
+        raise EvidenceError("kernel-admission expected input root is malformed")
+
+    root = lexical_absolute(artifact_root)
+    stdout_path, stdout_data, stdout_text, stdout_digest, stdout_relative = (
+        read_kernel_admission_stream(stdout_path, root, label="stdout")
+    )
+    stderr_path, stderr_data, stderr_text, stderr_digest, stderr_relative = (
+        read_kernel_admission_stream(stderr_path, root, label="stderr")
+    )
+    if stdout_path == stderr_path:
+        raise EvidenceError("kernel-admission stdout and stderr are not distinct")
+    for label, expected, actual in (
+        ("stdout", expected_stdout_artifact, stdout_relative),
+        ("stderr", expected_stderr_artifact, stderr_relative),
+    ):
+        expected_as_path = Path(expected)
+        if (
+            not expected
+            or expected_as_path.is_absolute()
+            or ".." in expected_as_path.parts
+            or expected in {"."}
+            or expected_as_path.as_posix() != expected
+        ):
+            raise EvidenceError(
+                f"kernel-admission expected {label} artifact is not a canonical relative path"
+            )
+        if expected != actual:
+            raise EvidenceError(
+                f"kernel-admission {label} path {actual!r}, expected {expected!r}"
+            )
+
+    matrix_marker = KERNEL_ADMISSION_SCHEMA.encode("ascii")
+    fault_marker = KERNEL_ADMISSION_FAULT_SCHEMA.encode("ascii")
+    if matrix_marker in stderr_data or fault_marker in stderr_data:
+        raise EvidenceError("kernel-admission detail rows leaked into stderr")
+    if "kernel_replay census:" in stdout_text:
+        raise EvidenceError("kernel-admission human census line leaked into stdout")
+    census_lines = [
+        line
+        for line in stderr_text.splitlines()
+        if line.startswith("kernel_replay census:")
+    ]
+    if len(census_lines) != 1:
+        raise EvidenceError(
+            "kernel-admission stderr lacks exactly one human census line"
+        )
+    if kernel_admission_failure_material(stdout_text):
+        raise EvidenceError(f"kernel-admission {phase} stdout contains failure material")
+    if kernel_admission_failure_material(stderr_text):
+        raise EvidenceError(f"kernel-admission {phase} stderr contains failure material")
+    pass_result_lines = [
+        line.strip()
+        for line in stdout_text.splitlines()
+        if line.strip().startswith("test result: ok.")
+    ]
+    if len(pass_result_lines) != 1 or not re.match(
+        r"^test result: ok\. 2 passed; 0 failed;", pass_result_lines[0]
+    ):
+        raise EvidenceError(
+            f"kernel-admission {phase} log lacks the exact two-test pass summary"
+        )
+
+    matrix_records: list[dict[str, Any]] = []
+    fault_records: list[dict[str, Any]] = []
+    for number, raw_line in enumerate(stdout_data.splitlines(), 1):
+        is_fault = fault_marker in raw_line
+        if not is_fault and matrix_marker not in raw_line:
+            continue
+        object_start = raw_line.find(b"{")
+        if object_start < 0:
+            raise EvidenceError(
+                f"{stdout_path}:{number}: kernel-admission evidence is not a JSON object"
+            )
+        value = parse_json(
+            raw_line[object_start:].strip(), subject=f"{stdout_path}:{number}"
+        )
+        if not isinstance(value, dict):
+            raise EvidenceError(
+                f"{stdout_path}:{number}: kernel-admission evidence is not an object"
+            )
+        (fault_records if is_fault else matrix_records).append(value)
+
+    expected_shared_identity = {
+        "bead": "franken_lean-ap6",
+        "claim_type": "bounded_model",
+        "invariant_relation": "single-authority-admission",
+        "determinism_invariant": "FL-INV-01",
+        "gate_id": "G1",
+        "gate_relation": "partial-component-evidence",
+        "parity_ledger_row": "init-prelude-admission-replay",
+        "data_grade": "verified",
+        "epoch": "lean-v4.32.0",
+        "mode": "sound",
+        "profile": "e2e",
+        "seed": "module-order-kahn-v1",
+        "cleanup_status": "retained_by_policy",
+        "timing_used_as_gate": False,
+        "process_exit": 0,
+        "signal": None,
+    }
+
+    def positive_integer(record: dict[str, Any], key: str) -> int:
+        value = record.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise EvidenceError(
+                f"kernel-admission {key} {value!r} is not a non-negative integer"
+            )
+        return value
+
+    shared_input_root: str | None = None
+    shared_platform: str | None = None
+
+    def check_shared(record: dict[str, Any], label: str) -> None:
+        nonlocal shared_input_root, shared_platform
+        for key, expected in expected_shared_identity.items():
+            if record.get(key) != expected:
+                raise EvidenceError(
+                    f"kernel-admission {label} {key} {record.get(key)!r}, "
+                    f"expected {expected!r}"
+                )
+        version = record.get("version")
+        if version != KERNEL_ADMISSION_VERSION or isinstance(version, bool):
+            raise EvidenceError(f"kernel-admission {label} version {version!r}")
+        if record.get("run_id") != expected_run_id:
+            raise EvidenceError(f"kernel-admission {label} run id mismatch")
+        if record.get("cwd") != expected_cwd:
+            raise EvidenceError(f"kernel-admission {label} cwd mismatch")
+        if record.get("argv") != [expected_argv]:
+            raise EvidenceError(f"kernel-admission {label} argv mismatch")
+        if record.get("cache_state") != expected_cache_state:
+            raise EvidenceError(f"kernel-admission {label} cache-state mismatch")
+        if (
+            record.get("stdout_artifact") != expected_stdout_artifact
+            or record.get("stderr_artifact") != expected_stderr_artifact
+        ):
+            raise EvidenceError(f"kernel-admission {label} artifact identity mismatch")
+        platform_value = record.get("platform")
+        if (
+            not isinstance(platform_value, str)
+            or not platform_value
+            or "-" not in platform_value
+        ):
+            raise EvidenceError(f"kernel-admission {label} platform is malformed")
+        if shared_platform is None:
+            shared_platform = platform_value
+        elif platform_value != shared_platform:
+            raise EvidenceError("kernel-admission platform changed across rows")
+        input_root = record.get("canonical_input_root")
+        if not isinstance(input_root, str) or not re.fullmatch(
+            r"fln-fixture:[0-9a-f]{64}", input_root
+        ):
+            raise EvidenceError(f"kernel-admission {label} input root is malformed")
+        if shared_input_root is None:
+            shared_input_root = input_root
+        elif input_root != shared_input_root:
+            raise EvidenceError("kernel-admission input root changed across rows")
+        if (
+            positive_integer(record, "budget_steps") != KERNEL_ADMISSION_BUDGET_STEPS
+            and record.get("phase")
+            not in {
+                "resource_boundary_exact_accept",
+                "resource_exhaustion_steps",
+            }
+        ):
+            raise EvidenceError(f"kernel-admission {label} step budget differs")
+        start_us = positive_integer(record, "monotonic_start_us")
+        end_us = positive_integer(record, "monotonic_end_us")
+        positive_integer(record, "duration_us")
+        if end_us < start_us:
+            raise EvidenceError(f"kernel-admission {label} timing facts are inconsistent")
+
+    expected_matrix_phases = [
+        f"matrix-threads-{threads}" for threads in KERNEL_ADMISSION_THREADS
+    ] + ["matrix-identity"]
+    if len(matrix_records) != len(expected_matrix_phases):
+        raise EvidenceError(
+            f"kernel-admission emitted {len(matrix_records)} matrix rows, "
+            f"expected {len(expected_matrix_phases)}"
+        )
+    shared_digest: str | None = None
+    shared_root: str | None = None
+    shared_steps: int | None = None
+    shared_depth: int | None = None
+    for record, expected_phase in zip(
+        matrix_records, expected_matrix_phases, strict=True
+    ):
+        if set(record) != KERNEL_ADMISSION_FIELDS:
+            missing = sorted(KERNEL_ADMISSION_FIELDS - set(record))
+            extra = sorted(set(record) - KERNEL_ADMISSION_FIELDS)
+            raise EvidenceError(
+                f"kernel-admission matrix field mismatch: "
+                f"missing={missing!r} extra={extra!r}"
+            )
+        if record.get("schema") != KERNEL_ADMISSION_SCHEMA:
+            raise EvidenceError("kernel-admission matrix schema mismatch")
+        if record.get("claim_id") != "franken_lean-ap6-admission-determinism":
+            raise EvidenceError("kernel-admission matrix claim id mismatch")
+        if record.get("invariant_id") != "FL-INV-02":
+            raise EvidenceError("kernel-admission matrix invariant id mismatch")
+        if record.get("scenario") != "init-prelude-admission-thread-matrix":
+            raise EvidenceError("kernel-admission matrix scenario mismatch")
+        if record.get("phase") != expected_phase:
+            raise EvidenceError(
+                f"kernel-admission matrix phase {record.get('phase')!r}, "
+                f"expected {expected_phase!r}"
+            )
+        if record.get("status") != "pass":
+            raise EvidenceError(
+                f"kernel-admission matrix row {expected_phase} did not pass"
+            )
+        if record.get("first_divergence") is not None:
+            raise EvidenceError(
+                "kernel-admission passing matrix row claims a divergence"
+            )
+        check_shared(record, f"matrix {expected_phase}")
+        if positive_integer(record, "budget_depth") != KERNEL_ADMISSION_BUDGET_DEPTH:
+            raise EvidenceError("kernel-admission matrix depth budget differs")
+        if expected_phase == "matrix-identity":
+            if record.get("final_state") != "byte-identical-across-1-8-32":
+                raise EvidenceError(
+                    "kernel-admission identity row lost its final state"
+                )
+        else:
+            expected_threads = int(expected_phase.rsplit("-", 1)[1])
+            if positive_integer(record, "threads") != expected_threads:
+                raise EvidenceError(
+                    f"kernel-admission matrix threads mismatch for {expected_phase}"
+                )
+            if record.get("final_state") != "verdict-stream-merged-canonical-order":
+                raise EvidenceError(
+                    "kernel-admission matrix row lost its final state"
+                )
+        for key, expected_value in KERNEL_ADMISSION_CENSUS.items():
+            if positive_integer(record, key) != expected_value:
+                raise EvidenceError(
+                    f"kernel-admission census {key} "
+                    f"{record.get(key)!r}, expected {expected_value}"
+                )
+        digest = record.get("verdict_stream_digest")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise EvidenceError("kernel-admission verdict-stream digest is malformed")
+        if shared_digest is None:
+            shared_digest = digest
+        elif digest != shared_digest:
+            raise EvidenceError(
+                "kernel-admission verdict stream diverged across the thread matrix"
+            )
+        logical_root = record.get("final_logical_root")
+        if not isinstance(logical_root, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", logical_root
+        ):
+            raise EvidenceError("kernel-admission logical root is malformed")
+        if shared_root is None:
+            shared_root = logical_root
+        elif logical_root != shared_root:
+            raise EvidenceError("kernel-admission logical root changed across rows")
+        steps_total = positive_integer(record, "steps_used_total")
+        depth_seen = positive_integer(record, "max_depth_seen")
+        if shared_steps is None:
+            shared_steps, shared_depth = steps_total, depth_seen
+        elif steps_total != shared_steps or depth_seen != shared_depth:
+            raise EvidenceError(
+                "kernel-admission resource facts diverged across the thread matrix"
+            )
+
+    expected_fault_count = len(KERNEL_ADMISSION_MUTANTS) + len(
+        KERNEL_ADMISSION_RESOURCE_PHASES
+    )
+    if len(fault_records) != expected_fault_count:
+        raise EvidenceError(
+            f"kernel-admission emitted {len(fault_records)} fault rows, "
+            f"expected {expected_fault_count}"
+        )
+    seen_mutants: list[str] = []
+    seen_resource: list[str] = []
+    for record in fault_records:
+        if set(record) != KERNEL_ADMISSION_FAULT_FIELDS:
+            missing = sorted(KERNEL_ADMISSION_FAULT_FIELDS - set(record))
+            extra = sorted(set(record) - KERNEL_ADMISSION_FAULT_FIELDS)
+            raise EvidenceError(
+                f"kernel-admission fault field mismatch: "
+                f"missing={missing!r} extra={extra!r}"
+            )
+        if record.get("schema") != KERNEL_ADMISSION_FAULT_SCHEMA:
+            raise EvidenceError("kernel-admission fault schema mismatch")
+        if record.get("claim_id") != "franken_lean-ap6-admission-fault-matrix":
+            raise EvidenceError("kernel-admission fault claim id mismatch")
+        if record.get("scenario") != "kernel-admission-fault-matrix":
+            raise EvidenceError("kernel-admission fault scenario mismatch")
+        if record.get("status") != "pass":
+            raise EvidenceError(
+                f"kernel-admission fault row {record.get('phase')!r} did not pass"
+            )
+        if record.get("first_divergence") is not None:
+            raise EvidenceError("kernel-admission passing fault row claims a divergence")
+        row_phase = record.get("phase")
+        if not isinstance(row_phase, str):
+            raise EvidenceError("kernel-admission fault phase is malformed")
+        check_shared(record, f"fault {row_phase}")
+        if row_phase.startswith("mutant:"):
+            mutant_id = record.get("mutant_id")
+            if row_phase != f"mutant:{mutant_id}":
+                raise EvidenceError(
+                    "kernel-admission mutant phase and mutant id disagree"
+                )
+            if mutant_id not in KERNEL_ADMISSION_MUTANTS:
+                raise EvidenceError(
+                    f"kernel-admission unknown mutant {mutant_id!r}"
+                )
+            if record.get("invariant_id") != "FL-INV-02":
+                raise EvidenceError("kernel-admission mutant invariant id mismatch")
+            if record.get("expected_outcome") != "rejected":
+                raise EvidenceError(
+                    f"kernel-admission mutant {mutant_id} expects a non-rejection"
+                )
+            if record.get("actual_outcome") != "rejected":
+                raise EvidenceError(
+                    f"kernel-admission mutant {mutant_id} SURVIVED: "
+                    f"{record.get('actual_outcome')!r}"
+                )
+            reject_class = record.get("reject_class")
+            if not isinstance(reject_class, str) or not reject_class:
+                raise EvidenceError(
+                    f"kernel-admission mutant {mutant_id} rejection is untyped"
+                )
+            if record.get("final_state") != "mutant-killed-typed-rejection":
+                raise EvidenceError(
+                    f"kernel-admission mutant {mutant_id} final state mismatch"
+                )
+            if record.get("atomicity_held") is not True:
+                raise EvidenceError(
+                    f"kernel-admission mutant {mutant_id} broke failure atomicity"
+                )
+            if record.get("root_before") != record.get("root_after"):
+                raise EvidenceError(
+                    f"kernel-admission mutant {mutant_id} mutated the environment root"
+                )
+            if record.get("recovery_outcome") != "accepted":
+                raise EvidenceError(
+                    f"kernel-admission mutant {mutant_id} recovery failed"
+                )
+            seen_mutants.append(mutant_id)
+        elif row_phase in KERNEL_ADMISSION_RESOURCE_PHASES:
+            if record.get("invariant_id") != "FL-INV-07":
+                raise EvidenceError("kernel-admission resource invariant id mismatch")
+            if record.get("mutant_id") is not None:
+                raise EvidenceError(
+                    f"kernel-admission resource row {row_phase} carries a mutant id"
+                )
+            expected_outcome = KERNEL_ADMISSION_RESOURCE_PHASES[row_phase]
+            if record.get("actual_outcome") != expected_outcome:
+                raise EvidenceError(
+                    f"kernel-admission resource row {row_phase} outcome "
+                    f"{record.get('actual_outcome')!r}, expected {expected_outcome!r}"
+                )
+            if record.get("atomicity_held") is not True:
+                raise EvidenceError(
+                    f"kernel-admission resource row {row_phase} broke atomicity"
+                )
+            seen_resource.append(row_phase)
+        else:
+            raise EvidenceError(f"kernel-admission unknown fault phase {row_phase!r}")
+    if sorted(seen_mutants) != sorted(KERNEL_ADMISSION_MUTANTS):
+        missing_mutants = sorted(set(KERNEL_ADMISSION_MUTANTS) - set(seen_mutants))
+        raise EvidenceError(
+            f"kernel-admission mutant coverage incomplete: missing={missing_mutants!r}"
+        )
+    if sorted(seen_resource) != sorted(KERNEL_ADMISSION_RESOURCE_PHASES):
+        missing_phases = sorted(set(KERNEL_ADMISSION_RESOURCE_PHASES) - set(seen_resource))
+        raise EvidenceError(
+            f"kernel-admission resource coverage incomplete: missing={missing_phases!r}"
+        )
+
+    if shared_input_root is None or shared_digest is None or shared_root is None:
+        raise EvidenceError("kernel-admission shared identity facts are incomplete")
+    if expected_input_root is not None and shared_input_root != expected_input_root:
+        raise EvidenceError(
+            f"kernel-admission input root {shared_input_root!r} is stale: "
+            f"expected {expected_input_root!r}"
+        )
+    return {
+        "schema": "fln.validation/1",
+        "validator": "kernel-admission/1",
+        "subject": stdout_relative,
+        "valid": True,
+        "phase": phase,
+        "run_id": expected_run_id,
+        "observed_exit": observed_exit,
+        "matrix_records": len(matrix_records),
+        "fault_records": len(fault_records),
+        "thread_matrix": list(KERNEL_ADMISSION_THREADS),
+        "census": dict(KERNEL_ADMISSION_CENSUS),
+        "mutants_killed": sorted(seen_mutants),
+        "resource_phases": sorted(seen_resource),
+        "canonical_input_root": shared_input_root,
+        "verdict_stream_digest": shared_digest,
+        "final_logical_root": shared_root,
+        "stdout_artifact": stdout_relative,
+        "stderr_artifact": stderr_relative,
+        "stdout_sha256": stdout_digest,
+        "stderr_sha256": stderr_digest,
+    }
+
+
 def validate_run(
     path: Path,
     schema: str,
@@ -4450,6 +5063,40 @@ def validate_supervisor_object(
             raise EvidenceError(
                 f"{path}:{record_number}: malformed resource fact {key}"
             )
+    if classification in {"pass", "fail"} and (
+        resource_facts["term_sent"] or resource_facts["kill_sent"]
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: conclusive outcome required forced cleanup"
+        )
+    if classification == "inconclusive" and value["cancel_signal"] is not None:
+        raise EvidenceError(
+            f"{path}:{record_number}: inconclusive outcome carries cancellation"
+        )
+    if (
+        schema in {"fln.supervisor/2", "fln.supervisor/3"}
+        and value["reason_code"].startswith("child_signal_")
+        and (
+            value["phase_timing"]["execution_start_ns"] is None
+            or value["target_exec"]["status"] in {"not_released", "failed"}
+        )
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: child signal lacks released target execution"
+        )
+    if (
+        schema in {"fln.supervisor/2", "fln.supervisor/3"}
+        and value["reason_code"] == "target_exec_failure"
+        and (
+            value["phase_timing"]["execution_start_ns"] is None
+            or value["child_exit"] != SETUP_FAILURE
+            or value["child_signal"] is not None
+            or value["errors"]
+        )
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: target exec failure facts are inconsistent"
+        )
     if resource_facts.get("process_tree_scope") not in {
         "linux_nested_subreapers_pidfd_procfs_best_effort",
         "linux_subreaper_pidfd_procfs_best_effort",
@@ -6633,6 +7280,40 @@ def cmd_validate_environment_collision(args: argparse.Namespace) -> int:
             Path(args.output),
             artifact_root,
             label="environment-collision validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_validate_kernel_admission(args: argparse.Namespace) -> int:
+    artifact_root = lexical_absolute(Path(args.artifact_root))
+    stdout_path = require_within(
+        Path(args.file), artifact_root, label="kernel-admission log"
+    )
+    stderr_path = require_within(
+        Path(args.stderr_file), artifact_root, label="kernel-admission stderr"
+    )
+    report = validate_kernel_admission(
+        stdout_path,
+        stderr_path,
+        args.phase,
+        args.expected_run_id,
+        args.observed_exit,
+        artifact_root=artifact_root,
+        expected_stdout_artifact=args.expected_stdout_artifact,
+        expected_stderr_artifact=args.expected_stderr_artifact,
+        expected_cwd=args.expected_cwd,
+        expected_argv=args.expected_argv,
+        expected_cache_state=args.expected_cache_state,
+        expected_input_root=args.expected_input_root,
+    )
+    if args.output:
+        output = require_within(
+            Path(args.output),
+            artifact_root,
+            label="kernel-admission validation",
         )
         write_new(output, canonical_json(report))
     else:
@@ -9269,6 +9950,483 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         }
     )
 
+    admission_validation_root = case_dir("kernel_admission_validation")
+    admission_run_id = "kernel-admission-self-test"
+    admission_cwd = str(art_dir)
+    admission_argv = (
+        "cargo test --locked -q -p fln-conformance --test kernel_replay -- --nocapture"
+    )
+    admission_cache_state = "self-test-cache"
+    admission_input_root = f"fln-fixture:{'a' * 64}"
+    admission_digest = "d" * 64
+    admission_env_root = "e" * 64
+
+    def admission_common(
+        stdout_artifact: str, stderr_artifact: str, start_us: int
+    ) -> dict[str, Any]:
+        return {
+            "version": KERNEL_ADMISSION_VERSION,
+            "run_id": admission_run_id,
+            "bead": "franken_lean-ap6",
+            "claim_type": "bounded_model",
+            "invariant_relation": "single-authority-admission",
+            "determinism_invariant": "FL-INV-01",
+            "gate_id": "G1",
+            "gate_relation": "partial-component-evidence",
+            "parity_ledger_row": "init-prelude-admission-replay",
+            "data_grade": "verified",
+            "epoch": "lean-v4.32.0",
+            "mode": "sound",
+            "profile": "e2e",
+            "platform": "linux-x86_64",
+            "seed": "module-order-kahn-v1",
+            "cache_state": admission_cache_state,
+            "canonical_input_root": admission_input_root,
+            "status": "pass",
+            "cwd": admission_cwd,
+            "argv": [admission_argv],
+            "stdout_artifact": stdout_artifact,
+            "stderr_artifact": stderr_artifact,
+            "budget_steps": KERNEL_ADMISSION_BUDGET_STEPS,
+            "budget_depth": KERNEL_ADMISSION_BUDGET_DEPTH,
+            "monotonic_start_us": start_us,
+            "monotonic_end_us": start_us + 5,
+            "duration_us": 5,
+            "timing_used_as_gate": False,
+            "process_exit": 0,
+            "signal": None,
+            "first_divergence": None,
+            "cleanup_status": "retained_by_policy",
+        }
+
+    def admission_matrix_record(
+        phase: str,
+        threads: int,
+        stdout_artifact: str,
+        stderr_artifact: str,
+        start_us: int,
+    ) -> dict[str, Any]:
+        record = admission_common(stdout_artifact, stderr_artifact, start_us)
+        record.update(
+            {
+                "schema": KERNEL_ADMISSION_SCHEMA,
+                "claim_id": "franken_lean-ap6-admission-determinism",
+                "invariant_id": "FL-INV-02",
+                "scenario": "init-prelude-admission-thread-matrix",
+                "phase": phase,
+                "threads": threads,
+                "units_total": 1915,
+                "units_checked": 1909,
+                "units_cyclic": 4,
+                "verdict_stream_digest": admission_digest,
+                "final_logical_root": admission_env_root,
+                "steps_used_total": 2_694_649,
+                "max_depth_seen": 132,
+                "final_state": (
+                    "byte-identical-across-1-8-32"
+                    if phase == "matrix-identity"
+                    else "verdict-stream-merged-canonical-order"
+                ),
+            }
+        )
+        record.update(KERNEL_ADMISSION_CENSUS)
+        return record
+
+    def admission_fault_record(
+        phase: str,
+        mutant_id: str | None,
+        invariant_id: str,
+        actual_outcome: str,
+        final_state: str,
+        stdout_artifact: str,
+        stderr_artifact: str,
+        start_us: int,
+        *,
+        budget_steps: int = KERNEL_ADMISSION_BUDGET_STEPS,
+        budget_depth: int = KERNEL_ADMISSION_BUDGET_DEPTH,
+        recovery_outcome: str | None = "accepted",
+    ) -> dict[str, Any]:
+        record = admission_common(stdout_artifact, stderr_artifact, start_us)
+        record.update(
+            {
+                "schema": KERNEL_ADMISSION_FAULT_SCHEMA,
+                "claim_id": "franken_lean-ap6-admission-fault-matrix",
+                "invariant_id": invariant_id,
+                "scenario": "kernel-admission-fault-matrix",
+                "phase": phase,
+                "mutant_id": mutant_id,
+                "target": "self-test-target",
+                "expected_outcome": "rejected" if mutant_id else actual_outcome,
+                "actual_outcome": actual_outcome,
+                "reject_class": "BlockMismatch" if mutant_id else None,
+                "message_excerpt": "self-test excerpt",
+                "budget_steps": budget_steps,
+                "budget_depth": budget_depth,
+                "steps_used": 10,
+                "max_depth": 1,
+                "root_before": "f" * 64,
+                "root_after": "f" * 64,
+                "atomicity_held": True,
+                "recovery_outcome": recovery_outcome,
+                "final_state": final_state,
+            }
+        )
+        return record
+
+    def admission_records_for(
+        stdout_artifact: str, stderr_artifact: str
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        clock = 0
+        for threads in KERNEL_ADMISSION_THREADS:
+            records.append(
+                admission_matrix_record(
+                    f"matrix-threads-{threads}",
+                    threads,
+                    stdout_artifact,
+                    stderr_artifact,
+                    clock,
+                )
+            )
+            clock += 10
+        records.append(
+            admission_matrix_record(
+                "matrix-identity", 1, stdout_artifact, stderr_artifact, clock
+            )
+        )
+        clock += 10
+        for mutant in KERNEL_ADMISSION_MUTANTS:
+            records.append(
+                admission_fault_record(
+                    f"mutant:{mutant}",
+                    mutant,
+                    "FL-INV-02",
+                    "rejected",
+                    "mutant-killed-typed-rejection",
+                    stdout_artifact,
+                    stderr_artifact,
+                    clock,
+                )
+            )
+            clock += 10
+        resource_budgets = {
+            "resource_boundary_exact_accept": (127, KERNEL_ADMISSION_BUDGET_DEPTH),
+            "resource_exhaustion_steps": (126, KERNEL_ADMISSION_BUDGET_DEPTH),
+            "resource_exhaustion_depth": (KERNEL_ADMISSION_BUDGET_STEPS, 2),
+            "resource_recovery": (
+                KERNEL_ADMISSION_BUDGET_STEPS,
+                KERNEL_ADMISSION_BUDGET_DEPTH,
+            ),
+        }
+        for resource_phase, outcome in KERNEL_ADMISSION_RESOURCE_PHASES.items():
+            steps, depth = resource_budgets[resource_phase]
+            records.append(
+                admission_fault_record(
+                    resource_phase,
+                    None,
+                    "FL-INV-07",
+                    outcome,
+                    f"self-test-{resource_phase}",
+                    stdout_artifact,
+                    stderr_artifact,
+                    clock,
+                    budget_steps=steps,
+                    budget_depth=depth,
+                    recovery_outcome=None,
+                )
+            )
+            clock += 10
+        return records
+
+    def admission_pass_log(records: list[dict[str, Any]]) -> bytes:
+        return (
+            b"running 2 tests\n"
+            + b"".join(canonical_json(record) for record in records)
+            + b"test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured\n"
+        )
+
+    admission_stderr_bytes = (
+        b"kernel_replay order: 1915 units over 2204 declarations\n"
+        b'kernel_replay census: checked=2198 accepted=2198 inconclusive=0 '
+        b'rejected={} unchecked={"nonsafe_with_unserialized_refs": 6} '
+        b"nested_partial_blocks=1\n"
+    )
+
+    def admission_validate(
+        stdout_path: Path,
+        stderr_path: Path,
+        phase: str,
+        observed_exit: int,
+        stdout_artifact: str,
+        stderr_artifact: str,
+        *,
+        expected_input_root: str | None = None,
+    ) -> dict[str, Any]:
+        return validate_kernel_admission(
+            stdout_path,
+            stderr_path,
+            phase,
+            admission_run_id,
+            observed_exit,
+            artifact_root=admission_validation_root,
+            expected_stdout_artifact=stdout_artifact,
+            expected_stderr_artifact=stderr_artifact,
+            expected_cwd=admission_cwd,
+            expected_argv=admission_argv,
+            expected_cache_state=admission_cache_state,
+            expected_input_root=expected_input_root,
+        )
+
+    def write_admission_case(
+        name: str,
+        mutate: Callable[[list[dict[str, Any]]], None] | None = None,
+        *,
+        stdout_bytes: bytes | None = None,
+        stderr_bytes: bytes | None = None,
+    ) -> tuple[Path, Path, str, str]:
+        stdout_artifact = f"{name}.out"
+        stderr_artifact = f"{name}.err"
+        records = parse_json(
+            json.dumps(admission_records_for(stdout_artifact, stderr_artifact)),
+            subject="kernel-admission self-test copy",
+        )
+        if mutate is not None:
+            mutate(records)
+        stdout_file = admission_validation_root / stdout_artifact
+        stderr_file = admission_validation_root / stderr_artifact
+        write_new(
+            stdout_file,
+            admission_pass_log(records) if stdout_bytes is None else stdout_bytes,
+        )
+        write_new(
+            stderr_file,
+            admission_stderr_bytes if stderr_bytes is None else stderr_bytes,
+        )
+        return stdout_file, stderr_file, stdout_artifact, stderr_artifact
+
+    def expect_admission_rejection(
+        label: str,
+        name: str,
+        mutate: Callable[[list[dict[str, Any]]], None] | None = None,
+        *,
+        stdout_bytes: bytes | None = None,
+        stderr_bytes: bytes | None = None,
+        expected_message: str | None = None,
+        expected_input_root: str | None = None,
+    ) -> None:
+        stdout_file, stderr_file, stdout_artifact, stderr_artifact = (
+            write_admission_case(
+                name, mutate, stdout_bytes=stdout_bytes, stderr_bytes=stderr_bytes
+            )
+        )
+        try:
+            admission_validate(
+                stdout_file,
+                stderr_file,
+                "positive",
+                0,
+                stdout_artifact,
+                stderr_artifact,
+                expected_input_root=expected_input_root,
+            )
+        except (EvidenceError, OSError) as error:
+            if expected_message is not None:
+                require(
+                    expected_message in str(error),
+                    f"{label} rejected for the wrong reason: {error}",
+                )
+        else:
+            raise EvidenceError(f"{label} was accepted")
+
+    admission_positive_out, admission_positive_err, admission_pos_a, admission_pos_b = (
+        write_admission_case("admission_positive")
+    )
+    admission_report = admission_validate(
+        admission_positive_out,
+        admission_positive_err,
+        "positive",
+        0,
+        admission_pos_a,
+        admission_pos_b,
+    )
+    require(
+        admission_report["matrix_records"] == len(KERNEL_ADMISSION_THREADS) + 1
+        and admission_report["fault_records"]
+        == len(KERNEL_ADMISSION_MUTANTS) + len(KERNEL_ADMISSION_RESOURCE_PHASES)
+        and sorted(admission_report["mutants_killed"])
+        == sorted(KERNEL_ADMISSION_MUTANTS),
+        "valid kernel-admission evidence lost its records",
+    )
+    admission_recovery_out, admission_recovery_err, admission_rec_a, admission_rec_b = (
+        write_admission_case("admission_recovery")
+    )
+    admission_recovery_report = admission_validate(
+        admission_recovery_out,
+        admission_recovery_err,
+        "recovery",
+        0,
+        admission_rec_a,
+        admission_rec_b,
+        expected_input_root=admission_input_root,
+    )
+    require(
+        admission_recovery_report["phase"] == "recovery"
+        and admission_recovery_report["canonical_input_root"] == admission_input_root,
+        "valid kernel-admission recovery evidence lost its identity",
+    )
+
+    expect_admission_rejection(
+        "malformed kernel-admission row",
+        "admission_malformed",
+        stdout_bytes=(
+            b"running 2 tests\n"
+            + b'{"schema":"' + KERNEL_ADMISSION_SCHEMA.encode() + b'", not-json\n'
+            + b"test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured\n"
+        ),
+    )
+
+    def add_extra_field(records: list[dict[str, Any]]) -> None:
+        records[0]["stowaway"] = True
+
+    expect_admission_rejection(
+        "extra-field kernel-admission row",
+        "admission_extra_field",
+        add_extra_field,
+        expected_message="extra=['stowaway']",
+    )
+
+    def drop_field(records: list[dict[str, Any]]) -> None:
+        del records[1]["verdict_stream_digest"]
+
+    expect_admission_rejection(
+        "missing-field kernel-admission row",
+        "admission_missing_field",
+        drop_field,
+        expected_message="missing=['verdict_stream_digest']",
+    )
+
+    def diverge_digest(records: list[dict[str, Any]]) -> None:
+        records[2]["verdict_stream_digest"] = "0" * 64
+
+    expect_admission_rejection(
+        "thread-matrix digest divergence",
+        "admission_digest_divergence",
+        diverge_digest,
+        expected_message="verdict stream diverged",
+    )
+
+    def drift_census(records: list[dict[str, Any]]) -> None:
+        records[0]["accepted"] = KERNEL_ADMISSION_CENSUS["accepted"] - 1
+
+    expect_admission_rejection(
+        "census drift",
+        "admission_census_drift",
+        drift_census,
+        expected_message="census accepted",
+    )
+
+    def wrong_mutant(records: list[dict[str, Any]]) -> None:
+        row = next(
+            record
+            for record in records
+            if record.get("mutant_id") == "tampered_recursor_rhs"
+        )
+        row["mutant_id"] = "tampered_recursor_lhs"
+        row["phase"] = "mutant:tampered_recursor_lhs"
+
+    expect_admission_rejection(
+        "wrong-mutant kernel-admission row",
+        "admission_wrong_mutant",
+        wrong_mutant,
+        expected_message="unknown mutant",
+    )
+
+    def surviving_mutant(records: list[dict[str, Any]]) -> None:
+        row = next(
+            record
+            for record in records
+            if record.get("mutant_id") == "nonpositive_ctor_field"
+        )
+        row["actual_outcome"] = "accepted"
+
+    expect_admission_rejection(
+        "surviving kernel-admission mutant",
+        "admission_surviving_mutant",
+        surviving_mutant,
+        expected_message="SURVIVED",
+    )
+
+    expect_admission_rejection(
+        "merged kernel-admission streams (census into stdout)",
+        "admission_merged_census",
+        stdout_bytes=(
+            admission_pass_log(
+                admission_records_for(
+                    "admission_merged_census.out", "admission_merged_census.err"
+                )
+            )
+            + admission_stderr_bytes
+        ),
+        expected_message="human census line leaked into stdout",
+    )
+
+    admission_leak_rows = admission_records_for(
+        "admission_merged_rows.out", "admission_merged_rows.err"
+    )
+    expect_admission_rejection(
+        "merged kernel-admission streams (rows into stderr)",
+        "admission_merged_rows",
+        stderr_bytes=admission_stderr_bytes
+        + canonical_json(admission_leak_rows[0]),
+        expected_message="detail rows leaked into stderr",
+    )
+
+    def stale_row_input(records: list[dict[str, Any]]) -> None:
+        records[3]["canonical_input_root"] = f"fln-fixture:{'b' * 64}"
+
+    expect_admission_rejection(
+        "stale-input kernel-admission row",
+        "admission_stale_row",
+        stale_row_input,
+        expected_message="input root changed across rows",
+    )
+    expect_admission_rejection(
+        "stale-input kernel-admission run",
+        "admission_stale_run",
+        expected_input_root=f"fln-fixture:{'c' * 64}",
+        expected_message="is stale",
+    )
+
+    def drop_resource_row(records: list[dict[str, Any]]) -> None:
+        for index, record in enumerate(records):
+            if record.get("phase") == "resource_recovery":
+                del records[index]
+                return
+
+    expect_admission_rejection(
+        "missing kernel-admission resource phase",
+        "admission_missing_resource",
+        drop_resource_row,
+        expected_message="fault rows",
+    )
+
+    expect_admission_rejection(
+        "kernel-admission stderr with failure material",
+        "admission_failure_material",
+        stderr_bytes=admission_stderr_bytes
+        + b"test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured\n",
+        expected_message="stderr contains failure material",
+    )
+
+    cases.append(
+        {
+            "case": "kernel_admission_validation",
+            "ok": True,
+            "positive": str(admission_positive_out),
+            "recovery": str(admission_recovery_out),
+        }
+    )
+
     hash_root = case_dir("canonical_hash")
     write_new(hash_root / "a", b"alpha")
     write_new(hash_root / "b", b"beta")
@@ -9676,6 +10834,27 @@ def build_parser() -> argparse.ArgumentParser:
     collision_parser.add_argument("--artifact-root", required=True)
     collision_parser.add_argument("--output")
     collision_parser.set_defaults(func=cmd_validate_environment_collision)
+
+    admission_parser = subparsers.add_parser(
+        "validate-kernel-admission",
+        help="validate franken_lean-ap6 kernel admission replay evidence",
+    )
+    admission_parser.add_argument("--file", required=True)
+    admission_parser.add_argument("--stderr-file", required=True)
+    admission_parser.add_argument(
+        "--phase", required=True, choices=("positive", "recovery")
+    )
+    admission_parser.add_argument("--expected-run-id", required=True)
+    admission_parser.add_argument("--observed-exit", type=int, required=True)
+    admission_parser.add_argument("--expected-cwd")
+    admission_parser.add_argument("--expected-argv")
+    admission_parser.add_argument("--expected-stdout-artifact", required=True)
+    admission_parser.add_argument("--expected-stderr-artifact", required=True)
+    admission_parser.add_argument("--expected-cache-state")
+    admission_parser.add_argument("--expected-input-root")
+    admission_parser.add_argument("--artifact-root", required=True)
+    admission_parser.add_argument("--output")
+    admission_parser.set_defaults(func=cmd_validate_kernel_admission)
 
     run_validation = subparsers.add_parser(
         "validate-run", help="validate a check/E2E run envelope"
