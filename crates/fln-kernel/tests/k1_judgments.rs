@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use fln_core::expr::{BinderInfo, Expr, Literal, NatLit};
+use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::options::KVMap;
@@ -63,6 +63,10 @@ fn admit(env: &Environment, decl: &Declaration) -> Environment {
         Declaration::Axiom(v) => ConstantInfo::Axiom(v),
         Declaration::Defn(v) => ConstantInfo::Defn(v),
         Declaration::Thm(v) => ConstantInfo::Thm(v),
+        // Block declarations use their own admission helpers in these tests.
+        Declaration::Inductive(_) | Declaration::Quotient(_) => {
+            unreachable!("admit() is only used for single-constant declarations")
+        }
     };
     env.add_decl(info).expect("kernel-accepted decl adds")
 }
@@ -3791,6 +3795,825 @@ fn kr314_string_recursor_fires_on_a_literal_major() {
         )),
         Some(RejectClass::NotDefEq),
         "the recursor delivers the literal's actual code points"
+    );
+}
+
+// ---- KR-6xx/7xx/8xx/95x/97x: block admission (bead franken_lean-ap6) ----------------
+
+use fln_kernel::InductiveBlock;
+
+fn cval(name: Name, level_params: Vec<Name>, type_: Expr) -> ConstantVal {
+    ConstantVal {
+        name,
+        level_params,
+        type_,
+    }
+}
+
+/// A single-type block declaration from raw parts.
+fn block_decl(
+    types: Vec<InductiveVal>,
+    ctors: Vec<ConstructorVal>,
+    recursors: Vec<RecursorVal>,
+) -> Declaration {
+    Declaration::Inductive(InductiveBlock {
+        types,
+        ctors,
+        recursors,
+    })
+}
+
+/// `MyNat` — a large-eliminating recursive type — with its decoded rows
+/// exactly as the pin's generation produces them (the acceptance test IS the
+/// regeneration cross-check: any drift in elim levels, K-targeting, implicit
+/// inference, minor naming, or iota rhs shape rejects).
+fn mynat_block() -> (Vec<InductiveVal>, Vec<ConstructorVal>, Vec<RecursorVal>) {
+    let mynat = || Expr::const_(n("MyNat"), vec![]);
+    let ind = InductiveVal {
+        base: cval(n("MyNat"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyNat")],
+        ctors: vec![nn("MyNat", "zero"), nn("MyNat", "succ")],
+        num_nested: 0,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let zero = ConstructorVal {
+        base: cval(nn("MyNat", "zero"), vec![], mynat()),
+        induct: n("MyNat"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 0,
+        is_unsafe: false,
+    };
+    let succ = ConstructorVal {
+        base: cval(
+            nn("MyNat", "succ"),
+            vec![],
+            Expr::forall_e(n("n"), mynat(), mynat(), BinderInfo::Default),
+        ),
+        induct: n("MyNat"),
+        cidx: 1,
+        num_params: 0,
+        num_fields: 1,
+        is_unsafe: false,
+    };
+    // MyNat.rec.{u} : {motive : MyNat → Sort u} → motive MyNat.zero →
+    //   ((n : MyNat) → motive n → motive (MyNat.succ n)) → (t : MyNat) → motive t
+    let u = Level::param(n("u"));
+    let motive_ty = Expr::forall_e(n("t"), mynat(), Expr::sort(u.clone()), BinderInfo::Default);
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let succ_minor_ty = |motive: Expr| {
+        // (n : MyNat) → motive n → motive (MyNat.succ n), motive at the given bvar
+        Expr::forall_e(
+            n("n"),
+            mynat(),
+            Expr::forall_e(
+                n("n_ih"),
+                Expr::app(shift(&motive, 1), bv(0)),
+                Expr::app(
+                    shift(&motive, 2),
+                    Expr::app(Expr::const_(nn("MyNat", "succ"), vec![]), bv(1)),
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    };
+    let rec_ty = Expr::forall_e(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::forall_e(
+            n("zero"),
+            Expr::app(bv(0), Expr::const_(nn("MyNat", "zero"), vec![])),
+            Expr::forall_e(
+                n("succ"),
+                succ_minor_ty(bv(1)),
+                Expr::forall_e(
+                    n("t"),
+                    mynat(),
+                    Expr::app(bv(3), bv(0)),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    // zero rule rhs: fun (motive) (zero) (succ) => zero
+    let zero_rhs = Expr::lam(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::lam(
+            n("zero"),
+            Expr::app(bv(0), Expr::const_(nn("MyNat", "zero"), vec![])),
+            Expr::lam(n("succ"), succ_minor_ty(bv(1)), bv(1), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // succ rule rhs: fun motive zero succ (n) => succ n (MyNat.rec.{u} motive zero succ n)
+    let rec_call = {
+        let mut app = Expr::const_(nn("MyNat", "rec"), vec![u]);
+        for arg in [bv(3), bv(2), bv(1), bv(0)] {
+            app = Expr::app(app, arg);
+        }
+        app
+    };
+    let succ_rhs = Expr::lam(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::lam(
+            n("zero"),
+            Expr::app(bv(0), Expr::const_(nn("MyNat", "zero"), vec![])),
+            Expr::lam(
+                n("succ"),
+                succ_minor_ty(bv(1)),
+                Expr::lam(
+                    n("n"),
+                    mynat(),
+                    Expr::app(Expr::app(bv(1), bv(0)), rec_call),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let rec = RecursorVal {
+        base: cval(nn("MyNat", "rec"), vec![n("u")], rec_ty),
+        all: vec![n("MyNat")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 1,
+        num_minors: 2,
+        rules: vec![
+            RecursorRule {
+                ctor: nn("MyNat", "zero"),
+                nfields: 0,
+                rhs: zero_rhs,
+            },
+            RecursorRule {
+                ctor: nn("MyNat", "succ"),
+                nfields: 1,
+                rhs: succ_rhs,
+            },
+        ],
+        k: false,
+        is_unsafe: false,
+    };
+    (vec![ind], vec![zero, succ], vec![rec])
+}
+
+/// Shift loose bvars in `e` up by `d` (test helper for hand-built types).
+fn shift(e: &Expr, d: u32) -> Expr {
+    fn go(e: &Expr, d: u32, cutoff: u32) -> Expr {
+        match e.node() {
+            ExprNode::BVar { idx } if *idx >= cutoff => Expr::bvar(idx + d).expect("packs"),
+            ExprNode::App { f, a } => Expr::app(go(f, d, cutoff), go(a, d, cutoff)),
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => Expr::lam(
+                binder_name.clone(),
+                go(binder_type, d, cutoff),
+                go(body, d, cutoff + 1),
+                *binder_info,
+            ),
+            ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } => Expr::forall_e(
+                binder_name.clone(),
+                go(binder_type, d, cutoff),
+                go(body, d, cutoff + 1),
+                *binder_info,
+            ),
+            _ => e.clone(),
+        }
+    }
+    go(e, d, 0)
+}
+
+fn reject_message(verdict: &Verdict) -> String {
+    match verdict {
+        Verdict::Rejected { message, .. } => message.clone(),
+        other => panic!("expected rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn kr6xx_a_recursive_block_admits_with_byte_exact_recursor_regeneration() {
+    // The acceptance test IS the KR-800..803 cross-check: the decoded rows
+    // (flags, counts, elim level, K, implicit inference, minor/ih naming,
+    // iota right-hand sides) must equal the kernel's own regeneration
+    // byte-for-byte. An inverted KR-604 universe condition, a dropped
+    // consume_type_annotations, or any generation drift rejects this block.
+    let (types, ctors, recursors) = mynat_block();
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "MyNat block must admit; got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr606_negative_occurrences_are_rejected() {
+    // MANDATED MUTANT (AGENTS testing policy: "skipped positivity check"):
+    // `Bad.mk : (Bad → Bad) → Bad` places the block in a Π DOMAIN — the
+    // classic non-positive occurrence that makes the theory inconsistent.
+    // The assertion pins the positivity MESSAGE, so a mutant that skips
+    // check_positivity fails here even if a later cross-check still rejects.
+    let bad = || Expr::const_(n("Bad"), vec![]);
+    let ind = InductiveVal {
+        base: cval(n("Bad"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("Bad")],
+        ctors: vec![nn("Bad", "mk")],
+        num_nested: 0,
+        is_rec: true,
+        is_unsafe: false,
+        is_reflexive: true,
+    };
+    let mk = ConstructorVal {
+        base: cval(
+            nn("Bad", "mk"),
+            vec![],
+            Expr::forall_e(
+                n("f"),
+                Expr::forall_e(n("x"), bad(), bad(), BinderInfo::Default),
+                bad(),
+                BinderInfo::Default,
+            ),
+        ),
+        induct: n("Bad"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 1,
+        is_unsafe: false,
+    };
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(vec![ind], vec![mk], vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("non positive"),
+        "the rejection must be the KR-606 positivity judgment, got: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr604_oversized_constructor_fields_are_rejected() {
+    // MANDATED MUTANT (AGENTS testing policy: "inverted universe condition"):
+    // a `Type`-level datatype with a `Type 1` field violates KR-604. The
+    // message is pinned; the ACCEPT side of the same condition is pinned by
+    // the MyNat test (an inversion rejects every valid block).
+    let big = || Expr::const_(n("Big"), vec![]);
+    let ind = InductiveVal {
+        base: cval(n("Big"), vec![], sort1()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("Big")],
+        ctors: vec![nn("Big", "mk")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let mk = ConstructorVal {
+        base: cval(
+            nn("Big", "mk"),
+            vec![],
+            Expr::forall_e(n("x"), sort1(), big(), BinderInfo::Default),
+        ),
+        induct: n("Big"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 1,
+        is_unsafe: false,
+    };
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(vec![ind], vec![mk], vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("too big"),
+        "the rejection must be the KR-604 universe judgment, got: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr605_indices_may_not_mention_the_block() {
+    // Soundness-critical (pin is_valid_ind_app, leanprover/lean4#2125): a
+    // constructor whose RESULT applies the inductive to an index that itself
+    // mentions the block must reject.
+    let ind = InductiveVal {
+        base: cval(
+            n("J"),
+            vec![],
+            Expr::forall_e(n("i"), prop(), prop(), BinderInfo::Default),
+        ),
+        num_params: 0,
+        num_indices: 1,
+        all: vec![n("J")],
+        ctors: vec![nn("J", "mk")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let env = admit(&Environment::new(), &axiom("TrueP", prop()));
+    let mk = ConstructorVal {
+        base: cval(
+            nn("J", "mk"),
+            vec![],
+            Expr::app(
+                Expr::const_(n("J"), vec![]),
+                Expr::app(
+                    Expr::const_(n("J"), vec![]),
+                    Expr::const_(n("TrueP"), vec![]),
+                ),
+            ),
+        ),
+        induct: n("J"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 0,
+        is_unsafe: false,
+    };
+    let verdict = check(
+        &env,
+        &block_decl(vec![ind], vec![mk], vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("invalid return type"),
+        "the rejection must be the KR-605 occurrence judgment, got: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr700_restricted_elimination_and_kr317_k_flags_are_regenerated() {
+    // Two decoded-observable cross-checks that kill comparison-drop mutants:
+    // (a) `W : Prop` with two nullary constructors is elimination-restricted
+    // (KR-700) — a decoded recursor claiming the large-elim level parameter
+    // must reject; (b) MyNat's recursor decoded with `k: true` must reject
+    // (K-targeting is REGENERATED, never trusted).
+    let w = || Expr::const_(n("W"), vec![]);
+    let ind = InductiveVal {
+        base: cval(n("W"), vec![], prop()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("W")],
+        ctors: vec![nn("W", "a"), nn("W", "b")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let ctor = |name: Name, cidx: u32| ConstructorVal {
+        base: cval(name, vec![], w()),
+        induct: n("W"),
+        cidx,
+        num_params: 0,
+        num_fields: 0,
+        is_unsafe: false,
+    };
+    // A decoded recursor that wrongly claims LARGE elimination (level param).
+    let wrong_rec = RecursorVal {
+        base: cval(
+            nn("W", "rec"),
+            vec![n("u")],
+            Expr::sort(Level::one()), // shape is irrelevant; lparams diverge first
+        ),
+        all: vec![n("W")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 1,
+        num_minors: 2,
+        rules: vec![],
+        k: false,
+        is_unsafe: false,
+    };
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(
+            vec![ind],
+            vec![ctor(nn("W", "a"), 0), ctor(nn("W", "b"), 1)],
+            vec![wrong_rec],
+        ),
+        Budget::DEFAULT,
+    );
+    assert_eq!(
+        reject_class(&verdict),
+        Some(RejectClass::BlockMismatch),
+        "a Prop 2-ctor type eliminates only into Prop — large-elim lparams must reject"
+    );
+    // (b) K-flag forgery on an otherwise byte-exact MyNat recursor.
+    let (types, ctors, mut recursors) = mynat_block();
+    recursors[0].k = true;
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("observables diverge"),
+        "K is regenerated, never trusted; got: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr317_a_k_target_block_admits_with_k_true() {
+    // `MyTrue : Prop` with one nullary constructor is a K-target that still
+    // eliminates LARGE (empty to_check ⇒ KR-701 passes): the generated
+    // recursor carries k=true and the elim level parameter. An
+    // always-false K-targeting mutant rejects this acceptance.
+    let mytrue = || Expr::const_(n("MyTrue"), vec![]);
+    let ind = InductiveVal {
+        base: cval(n("MyTrue"), vec![], prop()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("MyTrue")],
+        ctors: vec![nn("MyTrue", "intro")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let intro = ConstructorVal {
+        base: cval(nn("MyTrue", "intro"), vec![], mytrue()),
+        induct: n("MyTrue"),
+        cidx: 0,
+        num_params: 0,
+        num_fields: 0,
+        is_unsafe: false,
+    };
+    let u = Level::param(n("u"));
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let motive_ty = Expr::forall_e(n("t"), mytrue(), Expr::sort(u), BinderInfo::Default);
+    let rec_ty = Expr::forall_e(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::forall_e(
+            n("intro"),
+            Expr::app(bv(0), Expr::const_(nn("MyTrue", "intro"), vec![])),
+            Expr::forall_e(
+                n("t"),
+                mytrue(),
+                Expr::app(bv(2), bv(0)),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let rhs = Expr::lam(
+        n("motive"),
+        motive_ty,
+        Expr::lam(
+            n("intro"),
+            Expr::app(bv(0), Expr::const_(nn("MyTrue", "intro"), vec![])),
+            bv(0),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let rec = RecursorVal {
+        base: cval(nn("MyTrue", "rec"), vec![n("u")], rec_ty),
+        all: vec![n("MyTrue")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 1,
+        num_minors: 1,
+        rules: vec![RecursorRule {
+            ctor: nn("MyTrue", "intro"),
+            nfields: 0,
+            rhs,
+        }],
+        k: true,
+        is_unsafe: false,
+    };
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(vec![ind], vec![intro], vec![rec]),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "MyTrue is a K-target with large elimination; got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr700_a_restricted_block_admits_with_prop_elimination() {
+    // `W : Prop` with TWO nullary constructors eliminates only into Prop
+    // (KR-700): the generated recursor has NO extra level parameter and its
+    // motive lands in Sort 0. An elimination-restriction-drop mutant
+    // generates the large-elim recursor instead and rejects this acceptance.
+    let w = || Expr::const_(n("W"), vec![]);
+    let ind = InductiveVal {
+        base: cval(n("W"), vec![], prop()),
+        num_params: 0,
+        num_indices: 0,
+        all: vec![n("W")],
+        ctors: vec![nn("W", "a"), nn("W", "b")],
+        num_nested: 0,
+        is_rec: false,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    let ctor = |name: Name, cidx: u32| ConstructorVal {
+        base: cval(name, vec![], w()),
+        induct: n("W"),
+        cidx,
+        num_params: 0,
+        num_fields: 0,
+        is_unsafe: false,
+    };
+    let bv = |i: u32| Expr::bvar(i).expect("packs");
+    let motive_ty = Expr::forall_e(n("t"), w(), prop(), BinderInfo::Default);
+    let rec_ty = Expr::forall_e(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::forall_e(
+            n("a"),
+            Expr::app(bv(0), Expr::const_(nn("W", "a"), vec![])),
+            Expr::forall_e(
+                n("b"),
+                Expr::app(bv(1), Expr::const_(nn("W", "b"), vec![])),
+                Expr::forall_e(n("t"), w(), Expr::app(bv(3), bv(0)), BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Implicit,
+    );
+    let minor_domain =
+        |i: u32, ctor_leaf: &str| Expr::app(bv(i), Expr::const_(nn("W", ctor_leaf), vec![]));
+    let rhs_a = Expr::lam(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::lam(
+            n("a"),
+            minor_domain(0, "a"),
+            Expr::lam(n("b"), minor_domain(1, "b"), bv(1), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let rhs_b = Expr::lam(
+        n("motive"),
+        motive_ty,
+        Expr::lam(
+            n("a"),
+            minor_domain(0, "a"),
+            Expr::lam(n("b"), minor_domain(1, "b"), bv(0), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let rec = RecursorVal {
+        base: cval(nn("W", "rec"), vec![], rec_ty),
+        all: vec![n("W")],
+        num_params: 0,
+        num_indices: 0,
+        num_motives: 1,
+        num_minors: 2,
+        rules: vec![
+            RecursorRule {
+                ctor: nn("W", "a"),
+                nfields: 0,
+                rhs: rhs_a,
+            },
+            RecursorRule {
+                ctor: nn("W", "b"),
+                nfields: 0,
+                rhs: rhs_b,
+            },
+        ],
+        k: false,
+        is_unsafe: false,
+    };
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(
+            vec![ind],
+            vec![ctor(nn("W", "a"), 0), ctor(nn("W", "b"), 1)],
+            vec![rec],
+        ),
+        Budget::DEFAULT,
+    );
+    assert!(
+        verdict.is_accepted(),
+        "a 2-ctor Prop inductive admits with Prop-restricted elimination; got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr607_decoded_flags_are_cross_checked() {
+    // The decoded is_rec flag is UNTRUSTED: MyNat decoded as non-recursive
+    // must reject (a flags-comparison-drop mutant dies here).
+    let (mut types, ctors, recursors) = mynat_block();
+    types[0].is_rec = false;
+    let verdict = check(
+        &Environment::new(),
+        &block_decl(types, ctors, recursors),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("recursivity flags"),
+        "got: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr95x_quotient_initialization_requires_the_exact_eq_shape() {
+    // KR-950: without the expected `Eq`, quotient initialization rejects.
+    let verdict = check(
+        &Environment::new(),
+        &Declaration::Quotient(vec![]),
+        Budget::DEFAULT,
+    );
+    assert_eq!(reject_class(&verdict), Some(RejectClass::BlockMismatch));
+    assert!(
+        reject_message(&verdict).contains("does not have 'Eq'"),
+        "got: {}",
+        reject_message(&verdict)
+    );
+}
+
+#[test]
+fn kr973_nonsafe_definitions_check_and_safe_references_are_gated() {
+    // Pin add_definition/add_mutual semantics: a PARTIAL definition may
+    // reference itself (header → add → body in the scratch env); a SAFE
+    // definition may reference neither partial nor unsafe declarations
+    // (KR-973), while an UNSAFE definition may reference unsafe ones.
+    let env = admit(&Environment::new(), &axiom("A", sort1()));
+    let a = || Expr::const_(n("A"), vec![]);
+    let mk_defn = |name: &str, safety: DefinitionSafety, value: Expr| {
+        Declaration::Defn(DefinitionVal {
+            base: cval(
+                n(name),
+                vec![],
+                Expr::forall_e(n("x"), a(), a(), BinderInfo::Default),
+            ),
+            value,
+            hints: ReducibilityHints::Regular(1),
+            safety,
+            all: vec![n(name)],
+        })
+    };
+    // Self-recursive partial: fun (x : A) => selfRec x — legal only because
+    // the body checks AFTER the scratch add.
+    let self_body = Expr::lam(
+        n("x"),
+        a(),
+        Expr::app(
+            Expr::const_(n("selfRec"), vec![]),
+            Expr::bvar(0).expect("packs"),
+        ),
+        BinderInfo::Default,
+    );
+    let partial_decl = mk_defn("selfRec", DefinitionSafety::Partial, self_body.clone());
+    let verdict = check(&env, &partial_decl, Budget::DEFAULT);
+    assert!(
+        verdict.is_accepted(),
+        "self-recursive partial definitions admit via the scratch env; got {verdict:?}"
+    );
+    // The SAME body as a SAFE definition rejects: no pre-add, unknown constant
+    // (rename to keep the one-name law out of the picture).
+    let safe_self = Declaration::Defn(DefinitionVal {
+        base: cval(
+            n("selfSafe"),
+            vec![],
+            Expr::forall_e(n("x"), a(), a(), BinderInfo::Default),
+        ),
+        value: Expr::lam(
+            n("x"),
+            a(),
+            Expr::app(
+                Expr::const_(n("selfSafe"), vec![]),
+                Expr::bvar(0).expect("packs"),
+            ),
+            BinderInfo::Default,
+        ),
+        hints: ReducibilityHints::Regular(1),
+        safety: DefinitionSafety::Safe,
+        all: vec![n("selfSafe")],
+    });
+    assert_eq!(
+        reject_class(&check(&env, &safe_self, Budget::DEFAULT)),
+        Some(RejectClass::UnknownConstant),
+        "safe definitions cannot be self-recursive"
+    );
+    // Admit the partial def, then: a SAFE definition referencing it rejects
+    // (KR-973), an UNSAFE definition referencing an unsafe one admits.
+    let env = add_info(
+        &env,
+        ConstantInfo::Defn(DefinitionVal {
+            base: cval(
+                n("selfRec"),
+                vec![],
+                Expr::forall_e(n("x"), a(), a(), BinderInfo::Default),
+            ),
+            value: self_body,
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Partial,
+            all: vec![n("selfRec")],
+        }),
+    );
+    let safe_uses_partial = mk_defn(
+        "usesPartial",
+        DefinitionSafety::Safe,
+        Expr::const_(n("selfRec"), vec![]),
+    );
+    assert_eq!(
+        reject_class(&check(&env, &safe_uses_partial, Budget::DEFAULT)),
+        Some(RejectClass::SafetyViolation),
+        "a safe definition must not reference a partial one (KR-973)"
+    );
+    let unsafe_id = mk_defn(
+        "unsafeId",
+        DefinitionSafety::Unsafe,
+        Expr::lam(
+            n("x"),
+            a(),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        ),
+    );
+    let verdict = check(&env, &unsafe_id, Budget::DEFAULT);
+    assert!(
+        verdict.is_accepted(),
+        "unsafe definitions admit; got {verdict:?}"
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Defn(DefinitionVal {
+            base: cval(
+                n("unsafeId"),
+                vec![],
+                Expr::forall_e(n("x"), a(), a(), BinderInfo::Default),
+            ),
+            value: Expr::lam(
+                n("x"),
+                a(),
+                Expr::bvar(0).expect("packs"),
+                BinderInfo::Default,
+            ),
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Unsafe,
+            all: vec![n("unsafeId")],
+        }),
+    );
+    assert_eq!(
+        reject_class(&check(
+            &env,
+            &mk_defn(
+                "safeUsesUnsafe",
+                DefinitionSafety::Safe,
+                Expr::const_(n("unsafeId"), vec![])
+            ),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::SafetyViolation),
+        "a safe definition must not reference an unsafe one (KR-973)"
+    );
+    let uses_unsafe = mk_defn(
+        "unsafeUsesUnsafe",
+        DefinitionSafety::Unsafe,
+        Expr::const_(n("unsafeId"), vec![]),
+    );
+    let verdict = check(&env, &uses_unsafe, Budget::DEFAULT);
+    assert!(
+        verdict.is_accepted(),
+        "unsafe may reference unsafe; got {verdict:?}"
     );
 }
 

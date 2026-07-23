@@ -14,10 +14,12 @@
 //!     pinned below and re-triaged whenever the census moves) or a soundness
 //!     finding (immediately fatal here).
 //!
-//! Kinds K1 does not yet admit (inductives, constructors, recursors, quots,
-//! opaques, unsafe/partial definitions) are admitted-unchecked into the
-//! environment, counted per kind — an honestly-typed limitation of the
-//! bootstrap slice, not a silent pass.
+//! Every declaration kind in the module is kernel-checked (bead
+//! franken_lean-ap6): inductive blocks as whole units under KR-6xx/7xx/8xx
+//! with recursor regeneration, quotients under KR-95x, definitions of every
+//! safety level under the pin's add_definition split. The one typed
+//! limitation: a nested block (Lean.Syntax) admits under the partial ruleset
+//! (no positivity, no regeneration) and is surfaced by the census.
 
 #![forbid(unsafe_code)]
 
@@ -146,64 +148,54 @@ fn dependencies(info: &ConstantInfo) -> HashSet<Name> {
     out
 }
 
-/// Replay order: a declaration is admitted only after every constant it
-/// mentions that lives in the SAME module. The module's `constants` array is
-/// storage order, not dependency order — a checker must sort it (Kahn, with
-/// stable module-order tie-breaking so the replay is deterministic).
-/// Declarations inside a dependency cycle (mutual blocks, and the
-/// self-referential generated equation lemmas) are emitted last, in module
+/// Replay order over admission UNITS: a unit is admitted only after every
+/// unit owning a constant any of its members mention (Kahn, with stable
+/// unit-creation-order tie-breaking so the replay is deterministic). Because
+/// every declaration belongs to exactly one unit, dependency edges are direct
+/// — the d4x frontier-transitive expansion is subsumed (a declaration that
+/// applies `Membership.rec` has an edge to the `Membership` BLOCK unit, whose
+/// own edges cover `outParam` before it). Units inside a dependency cycle
+/// (self-referential generated equation lemmas) are emitted last, in unit
 /// order, and reported.
-///
-/// References are expanded TRANSITIVELY THROUGH the type-forming frontier:
-/// checking a declaration that applies `Membership.rec` makes the kernel read
-/// the recursor's TYPE, which names `outParam` — a checkable definition the
-/// declaration never names directly. Likewise `Lean.mkNode`'s `TSyntax`
-/// (frontier) names `SyntaxNodeKinds` (checkable abbrev). Dropping those
-/// edges replays the dependent BEFORE the abbrev exists in the environment
-/// and manufactures spurious `TypeMismatch` rejections (the bead fln-d4x
-/// probe found `env outParam = ABSENT` at `Membership.casesOn`'s check).
-fn topological_order(
+fn unit_topological_order(
     infos: &[ConstantInfo],
-    module: &HashMap<Name, ConstantInfo>,
+    units: &[Vec<usize>],
 ) -> (Vec<usize>, Vec<usize>) {
-    let index: HashMap<Name, usize> = infos
+    let mut owner: HashMap<Name, usize> = HashMap::new();
+    for (u, members) in units.iter().enumerate() {
+        for &m in members {
+            owner.insert(infos[m].name().clone(), u);
+        }
+    }
+    let deps: Vec<Vec<usize>> = units
         .iter()
         .enumerate()
-        .map(|(i, info)| (info.name().clone(), i))
-        .collect();
-    let deps: Vec<Vec<usize>> = infos
-        .iter()
-        .enumerate()
-        .map(|(i, info)| {
-            let mut d: Vec<usize> = Vec::new();
-            let mut seen: HashSet<Name> = HashSet::new();
-            let mut stack: Vec<Name> = dependencies(info).into_iter().collect();
-            while let Some(name) = stack.pop() {
-                if !seen.insert(name.clone()) {
-                    continue;
-                }
-                if let Some(&j) = index.get(&name) {
-                    d.push(j);
-                } else if let Some(frontier) = module.get(&name) {
-                    stack.extend(dependencies(frontier));
+        .map(|(u, members)| {
+            let mut d: HashSet<usize> = HashSet::new();
+            for &m in members {
+                for name in dependencies(&infos[m]) {
+                    if let Some(&j) = owner.get(&name)
+                        && j != u
+                    {
+                        d.insert(j);
+                    }
                 }
             }
-            let mut d: Vec<usize> = d.into_iter().filter(|&j| j != i).collect();
+            let mut d: Vec<usize> = d.into_iter().collect();
             d.sort_unstable();
-            d.dedup();
             d
         })
         .collect();
     let mut remaining: Vec<usize> = deps.iter().map(|d| d.len()).collect();
-    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); infos.len()];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); units.len()];
     for (i, d) in deps.iter().enumerate() {
         for &j in d {
             dependents[j].push(i);
         }
     }
-    let mut ready: Vec<usize> = (0..infos.len()).filter(|&i| remaining[i] == 0).collect();
-    ready.reverse(); // pop() yields ascending module order
-    let mut order = Vec::with_capacity(infos.len());
+    let mut ready: Vec<usize> = (0..units.len()).filter(|&i| remaining[i] == 0).collect();
+    ready.reverse(); // pop() yields ascending unit order
+    let mut order = Vec::with_capacity(units.len());
     while let Some(i) = ready.pop() {
         order.push(i);
         for &d in &dependents[i] {
@@ -215,7 +207,7 @@ fn topological_order(
         ready.sort_unstable_by(|a, b| b.cmp(a));
     }
     let placed: HashSet<usize> = order.iter().copied().collect();
-    let cyclic: Vec<usize> = (0..infos.len()).filter(|i| !placed.contains(i)).collect();
+    let cyclic: Vec<usize> = (0..units.len()).filter(|i| !placed.contains(i)).collect();
     (order, cyclic)
 }
 
@@ -266,15 +258,15 @@ fn reduction_gap_family(name: &Name) -> &'static str {
     }
 }
 
-/// The kernel `Declaration` for a checkable constant kind, or `None` for the
-/// type-forming frontier (which is admitted-unchecked in phase 1).
+/// The kernel `Declaration` for a singleton-unit constant. Definitions of
+/// EVERY safety level check (bead franken_lean-ap6: unsafe definitions take
+/// the pin's two-phase path, partial definitions the safe path). `None` only
+/// for kinds with no admission rule yet (opaques — none in Init.Prelude).
 fn as_declaration(info: &ConstantInfo) -> Option<Declaration> {
     match info {
         ConstantInfo::Axiom(v) => Some(Declaration::Axiom(v.clone())),
         ConstantInfo::Thm(v) => Some(Declaration::Thm(v.clone())),
-        ConstantInfo::Defn(v) if v.safety == DefinitionSafety::Safe => {
-            Some(Declaration::Defn(v.clone()))
-        }
+        ConstantInfo::Defn(v) => Some(Declaration::Defn(v.clone())),
         _ => None,
     }
 }
@@ -309,38 +301,106 @@ fn prelude_replays_through_the_kernel() {
         .expect("decode Prelude constants");
     assert_eq!(infos.len(), 2204, "Prelude constant census at the pin");
 
-    // Admission is two-phase. Phase 1: the type-forming frontier K1 does not
-    // yet check — inductives, their constructors and recursors, quotients —
-    // is mutually referential by nature (an inductive's constructor's type
-    // names the inductive), so it is admitted-unchecked as a block, in module
-    // order, giving every later declaration its type constants. Phase 2: the
-    // K1-checkable declarations (axioms, safe defs, theorems) are replayed in
-    // dependency order AMONG THEMSELVES, so a proof is never checked before a
-    // lemma it cites. This mirrors how a real checker consumes a module.
-    // Frontier = exactly the kinds `as_declaration` cannot turn into a kernel
-    // Declaration, so the two partitions are complementary by construction.
-    let is_frontier = |info: &ConstantInfo| as_declaration(info).is_none();
-    let frontier: Vec<usize> = (0..infos.len())
-        .filter(|&i| is_frontier(&infos[i]))
-        .collect();
-    let checkable: Vec<ConstantInfo> = infos
-        .iter()
-        .filter(|info| !is_frontier(info))
-        .cloned()
-        .collect();
+    // Admission is UNIT-based (bead franken_lean-ap6): an inductive block —
+    // its types, constructors, and recursors, mutually referential by nature —
+    // is ONE kernel `Declaration::Inductive` checked as a whole (KR-6xx/7xx/
+    // 8xx with recursor regeneration); the four quotient declarations are one
+    // `Declaration::Quotient` (KR-95x); every axiom, definition (all safety
+    // levels), and theorem is a singleton. Units are replayed in dependency
+    // order (Kahn over unit-level edges, stable module-order tie-break), so a
+    // proof is never checked before a lemma it cites and a block is never
+    // checked before the constants its types mention.
     let module_by_name: HashMap<Name, ConstantInfo> = infos
         .iter()
         .map(|info| (info.name().clone(), info.clone()))
         .collect();
-    let (order, cyclic) = topological_order(&checkable, &module_by_name);
+    let index_by_name: HashMap<Name, usize> = infos
+        .iter()
+        .enumerate()
+        .map(|(i, info)| (info.name().clone(), i))
+        .collect();
+    let mut recs_by_block: HashMap<Name, Vec<usize>> = HashMap::new();
+    for (i, info) in infos.iter().enumerate() {
+        if let ConstantInfo::Rec(r) = info
+            && let Some(leader) = r.all.first()
+        {
+            recs_by_block.entry(leader.clone()).or_default().push(i);
+        }
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum UnitKind {
+        Single,
+        Block,
+        Quot,
+    }
+    struct Unit {
+        kind: UnitKind,
+        members: Vec<usize>,
+    }
+    let mut units: Vec<Unit> = Vec::new();
+    let mut quot_members: Vec<usize> = Vec::new();
+    for (i, info) in infos.iter().enumerate() {
+        match info {
+            ConstantInfo::Quot(_) => quot_members.push(i),
+            // Constructors and recursors are absorbed into their block's unit.
+            ConstantInfo::Ctor(_) | ConstantInfo::Rec(_) => {}
+            ConstantInfo::Induct(ind) => {
+                // Only the block leader creates the unit (singleton blocks
+                // throughout Init.Prelude; the general case follows `all`).
+                if ind.all.first() != Some(&ind.base.name) {
+                    continue;
+                }
+                let mut members: Vec<usize> = Vec::new();
+                for type_name in &ind.all {
+                    if let Some(&t) = index_by_name.get(type_name) {
+                        members.push(t);
+                        if let ConstantInfo::Induct(t_ind) = &infos[t] {
+                            for ctor_name in &t_ind.ctors {
+                                if let Some(&c) = index_by_name.get(ctor_name) {
+                                    members.push(c);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(recs) = recs_by_block.get(&ind.base.name) {
+                    members.extend(recs.iter().copied());
+                }
+                units.push(Unit {
+                    kind: UnitKind::Block,
+                    members,
+                });
+            }
+            _ => units.push(Unit {
+                kind: UnitKind::Single,
+                members: vec![i],
+            }),
+        }
+    }
+    if !quot_members.is_empty() {
+        units.push(Unit {
+            kind: UnitKind::Quot,
+            members: quot_members,
+        });
+    }
+    let member_lists: Vec<Vec<usize>> = units.iter().map(|u| u.members.clone()).collect();
+    let (order, cyclic) = unit_topological_order(&infos, &member_lists);
     eprintln!(
-        "kernel_replay order: {} frontier admitted-unchecked, {} checkable \
+        "kernel_replay order: {} units over {} declarations \
          ({} topologically sorted, {} in dependency cycles replayed last)",
-        frontier.len(),
-        checkable.len(),
+        units.len(),
+        infos.len(),
         order.len(),
         cyclic.len()
     );
+    for &u in cyclic.iter().take(10) {
+        let names: Vec<String> = units[u]
+            .members
+            .iter()
+            .map(|&m| infos[m].name().to_display_string())
+            .collect();
+        eprintln!("  cyclic unit: {names:?}");
+    }
 
     let mut env = Environment::new();
     let mut accepted: u64 = 0;
@@ -350,35 +410,199 @@ fn prelude_replays_through_the_kernel() {
     let mut inconclusive: u64 = 0;
     let mut unchecked: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut gap_families: BTreeMap<&'static str, u64> = BTreeMap::new();
-    let mut skipped_partition: u64 = 0;
-    // Phase 1: frontier, in module order.
-    for &i in &frontier {
-        env = env.add_decl(infos[i].clone()).expect("frontier admission");
-        *unchecked.entry(infos[i].kind_name()).or_default() += 1;
+    let mut nested_partial: u64 = 0;
+    // Probe lane (bead franken_lean-ap6): FLN_REPLAY_ADMISSION_CENSUS=1
+    // classifies the block/quotient/non-safe-definition feature surface —
+    // which KR-6xx/7xx/8xx/95x/97x machinery this corpus exercises, measured
+    // from decoded declarations rather than guessed from the pin.
+    if std::env::var("FLN_REPLAY_ADMISSION_CENSUS").is_ok() {
+        let mut block_sizes: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut ctor_counts: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut lparam_counts: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut with_indices = 0u64;
+        let mut nested: Vec<String> = Vec::new();
+        let mut reflexive: Vec<String> = Vec::new();
+        let mut unsafe_inds: Vec<String> = Vec::new();
+        let mut recursive = 0u64;
+        let mut rec_k: Vec<String> = Vec::new();
+        let mut rec_multi_motive: Vec<String> = Vec::new();
+        let mut rec_lparams_extra = 0u64;
+        let mut rec_lparams_same = 0u64;
+        let mut max_fields = 0u32;
+        let mut def_safety: BTreeMap<String, u64> = BTreeMap::new();
+        let mut def_names: Vec<String> = Vec::new();
+        let mut quots: Vec<String> = Vec::new();
+        for (i, _) in infos.iter().enumerate() {
+            match &infos[i] {
+                ConstantInfo::Induct(ind) => {
+                    *block_sizes.entry(ind.all.len()).or_default() += 1;
+                    *ctor_counts.entry(ind.ctors.len()).or_default() += 1;
+                    *lparam_counts
+                        .entry(ind.base.level_params.len())
+                        .or_default() += 1;
+                    if ind.num_indices > 0 {
+                        with_indices += 1;
+                    }
+                    if ind.num_nested > 0 {
+                        nested.push(ind.base.name.to_display_string());
+                    }
+                    if ind.is_reflexive {
+                        reflexive.push(ind.base.name.to_display_string());
+                    }
+                    if ind.is_unsafe {
+                        unsafe_inds.push(ind.base.name.to_display_string());
+                    }
+                    if ind.is_rec {
+                        recursive += 1;
+                    }
+                }
+                ConstantInfo::Ctor(ctor) => {
+                    max_fields = max_fields.max(ctor.num_fields);
+                }
+                ConstantInfo::Rec(rec) => {
+                    if rec.k {
+                        rec_k.push(rec.base.name.to_display_string());
+                    }
+                    if rec.num_motives > 1 {
+                        rec_multi_motive.push(rec.base.name.to_display_string());
+                    }
+                    let ind_lparams = module_by_name
+                        .get(&rec.base.name.parent())
+                        .map(|info| info.constant_val().level_params.len());
+                    match ind_lparams {
+                        Some(n) if rec.base.level_params.len() == n + 1 => rec_lparams_extra += 1,
+                        Some(n) if rec.base.level_params.len() == n => rec_lparams_same += 1,
+                        _ => {}
+                    }
+                }
+                ConstantInfo::Quot(q) => {
+                    quots.push(format!(
+                        "{}:{:?}",
+                        infos[i].name().to_display_string(),
+                        q.kind
+                    ));
+                }
+                ConstantInfo::Defn(d) if d.safety != DefinitionSafety::Safe => {
+                    *def_safety.entry(format!("{:?}", d.safety)).or_default() += 1;
+                    if def_names.len() < 40 {
+                        def_names.push(infos[i].name().to_display_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        eprintln!("ADMISSION CENSUS (block/quot/non-safe-def features, bead franken_lean-ap6):");
+        eprintln!("  inductive blocks: sizes(all.len->n)={block_sizes:?} ctors={ctor_counts:?}");
+        eprintln!(
+            "  inductive lparams={lparam_counts:?} with_indices={with_indices} recursive={recursive}"
+        );
+        eprintln!(
+            "  nested({})={:?}",
+            nested.len(),
+            &nested[..nested.len().min(12)]
+        );
+        eprintln!(
+            "  reflexive({})={:?}",
+            reflexive.len(),
+            &reflexive[..reflexive.len().min(12)]
+        );
+        eprintln!("  unsafe({})={:?}", unsafe_inds.len(), unsafe_inds);
+        eprintln!(
+            "  recursors: K({})={:?} multi-motive({})={:?} lparams(extra-elim/same)={}/{}",
+            rec_k.len(),
+            &rec_k[..rec_k.len().min(12)],
+            rec_multi_motive.len(),
+            rec_multi_motive,
+            rec_lparams_extra,
+            rec_lparams_same
+        );
+        eprintln!("  ctor max_fields={max_fields}");
+        eprintln!("  non-safe defs by safety={def_safety:?} names={def_names:?}");
+        eprintln!("  quots={quots:?}");
     }
-    // Phase 2 below iterates the checkable declarations in dependency order.
-    let checkable_infos = checkable;
+    // The unit replay: every declaration in the module flows through the one
+    // authority, either as a singleton or inside its block/quotient unit.
     let budget = Budget::DEFAULT;
 
-    for idx in order.into_iter().chain(cyclic) {
-        let info = checkable_infos[idx].clone();
-        // `checkable` was partitioned to hold exactly axioms, theorems, and
-        // safe definitions, so `as_declaration` is always `Some` here; a `None`
-        // would only mean the partition drifted, and is skipped defensively
-        // rather than panicking (FL-INV-07 keeps the harness itself panic-free).
-        let Some(decl) = as_declaration(&info) else {
-            skipped_partition += 1;
-            env = env.add_decl(info).expect("one-name law over Prelude");
+    for u in order.into_iter().chain(cyclic) {
+        let unit = &units[u];
+        let info = infos[unit.members[0]].clone();
+        let n_members = unit.members.len() as u64;
+        let decl: Option<Declaration> = match unit.kind {
+            UnitKind::Single => as_declaration(&info),
+            UnitKind::Block => {
+                let mut types = Vec::new();
+                let mut ctors = Vec::new();
+                let mut recursors = Vec::new();
+                for &m in &unit.members {
+                    match &infos[m] {
+                        ConstantInfo::Induct(v) => types.push(v.clone()),
+                        ConstantInfo::Ctor(v) => ctors.push(v.clone()),
+                        ConstantInfo::Rec(v) => recursors.push(v.clone()),
+                        _ => {}
+                    }
+                }
+                if types.iter().any(|t| t.num_nested > 0) {
+                    nested_partial += 1;
+                }
+                Some(Declaration::Inductive(fln_kernel::InductiveBlock {
+                    types,
+                    ctors,
+                    recursors,
+                }))
+            }
+            UnitKind::Quot => {
+                let mut decls = Vec::new();
+                for &m in &unit.members {
+                    if let ConstantInfo::Quot(v) = &infos[m] {
+                        decls.push(v.clone());
+                    }
+                }
+                Some(Declaration::Quotient(decls))
+            }
+        };
+        let Some(decl) = decl else {
+            // No admission rule for this kind yet (opaques): typed limitation,
+            // counted per kind — never a silent pass.
+            for &m in &unit.members {
+                *unchecked.entry(infos[m].kind_name()).or_default() += 1;
+                env = env
+                    .add_decl(infos[m].clone())
+                    .expect("one-name law over Prelude");
+            }
             continue;
         };
+        // Uncheckable-from-the-artifact (bead franken_lean-ap6): six non-safe
+        // implementation helpers (`._unsafe_rec`/`._override`) reference
+        // PRIVATE auxiliaries (`.match_1`, `._proof_N`) that the pin's own
+        // serializer does NOT include in the module's constants array. The
+        // Reference itself cannot re-check these declarations from the olean
+        // — their checking context was transient elaboration state. Typed
+        // limitation, censused by name-count, never a silent pass.
+        if let ConstantInfo::Defn(d) = &info
+            && d.safety != DefinitionSafety::Safe
+            && dependencies(&info)
+                .iter()
+                .any(|n| !index_by_name.contains_key(n))
+        {
+            *unchecked
+                .entry("nonsafe_with_unserialized_refs")
+                .or_default() += n_members;
+            for &m in &unit.members {
+                env = env
+                    .add_decl(infos[m].clone())
+                    .expect("one-name law over Prelude");
+            }
+            continue;
+        }
         match fln_kernel::check(&env, &decl, budget) {
-            Verdict::Accepted { .. } => accepted += 1,
+            Verdict::Accepted { .. } => accepted += n_members,
             Verdict::Rejected { class, message, .. } => {
-                *rejected.entry(format!("{class:?}")).or_default() += 1;
+                *rejected.entry(format!("{class:?}")).or_default() += n_members;
                 *reasons.entry(format!("{class:?}: {message}")).or_default() += 1;
                 *gap_families
                     .entry(reduction_gap_family(info.name()))
-                    .or_default() += 1;
+                    .or_default() += n_members;
                 if rejected_names.len() < 20 {
                     rejected_names.push(format!("{} ({class:?})", info.name().to_display_string()));
                 }
@@ -420,17 +644,22 @@ fn prelude_replays_through_the_kernel() {
                     }
                 }
             }
-            Verdict::Inconclusive { .. } => inconclusive += 1,
+            Verdict::Inconclusive { .. } => inconclusive += n_members,
         }
         // The Reference accepted this module; carry every declaration forward
         // regardless of our verdict so downstream declarations see it.
-        env = env.add_decl(info).expect("one-name law over Prelude");
+        for &m in &unit.members {
+            env = env
+                .add_decl(infos[m].clone())
+                .expect("one-name law over Prelude");
+        }
     }
 
     let checked = accepted + inconclusive + rejected.values().sum::<u64>();
     eprintln!(
         "kernel_replay census: checked={checked} accepted={accepted} \
-         inconclusive={inconclusive} rejected={rejected:?} unchecked={unchecked:?}"
+         inconclusive={inconclusive} rejected={rejected:?} unchecked={unchecked:?} \
+         nested_partial_blocks={nested_partial}"
     );
     if !rejected_names.is_empty() {
         eprintln!("first rejections: {rejected_names:?}");
@@ -443,10 +672,22 @@ fn prelude_replays_through_the_kernel() {
 
     eprintln!("kernel_replay triage (reduction-gap families): {gap_families:?}");
 
-    // Census law: every declaration lands in exactly one bucket.
-    assert_eq!(skipped_partition, 0, "checkable partition drifted");
+    // Census law: every declaration lands in exactly one bucket — and the
+    // admission slice leaves NOTHING unchecked in this module (opaques would
+    // be the only unchecked kind, and Init.Prelude has none).
     let unchecked_total: u64 = unchecked.values().sum();
     assert_eq!(checked + unchecked_total, 2204);
+    // The ONLY unchecked family is the six non-safe implementation helpers
+    // whose private auxiliary references the pin serializer discarded — the
+    // Reference itself cannot re-check them from this artifact.
+    assert_eq!(
+        unchecked
+            .get("nonsafe_with_unserialized_refs")
+            .copied()
+            .unwrap_or(0),
+        unchecked_total,
+        "a declaration kind bypassed the kernel: {unchecked:?}"
+    );
 
     // Never Inconclusive: the default budget suffices for every Prelude
     // declaration K1 can check (FL-INV-07 — exhaustion would be honest, but

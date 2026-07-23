@@ -55,18 +55,25 @@ if [ "$rc" -ne 0 ]; then
 fi
 emit suite passed "\"expected_exit\":0,\"actual_exit\":0,\"artifact\":\"suite.log\""
 
-# ---- lane 1b: verdict-census floor (bead franken_lean-irm) ------------------------------
-# The literal-acceleration slice closed the last Init.Prelude residuals: the
-# census is pinned at full acceptance and may only move by a deliberate,
-# bead-tracked change. A regression in any KR-31x/KR-30x rule trips this.
+# ---- lane 1b: verdict-census floor (beads franken_lean-irm + franken_lean-ap6) ----------
+# The literal-acceleration slice closed the last false-rejects (irm:
+# 1755/1755 checkable); the admission slice then put EVERY declaration kind
+# through the kernel (ap6: inductive blocks with recursor regeneration,
+# quotients, all definition safeties) — 2198/2198 checked accepted, with
+# exactly 6 non-safe helpers typed as uncheckable-from-artifact (their
+# private auxiliary references are absent from the pin's own serialization)
+# and 1 nested block under the documented partial ruleset. The census may
+# only move by a deliberate, bead-tracked change.
 census_line="$(grep -E '^kernel_replay census:' "$ART_DIR/suite.log" | tail -1 || true)"
-if [[ "$census_line" != *"accepted=1755"* || "$census_line" != *"rejected={}"* || "$census_line" != *"inconclusive=0"* ]]; then
-  emit census failed "\"expected\":\"checked=1755 accepted=1755 inconclusive=0 rejected={}\",\"actual\":\"${census_line//\"/\\\"}\",\"artifact\":\"suite.log\""
+if [[ "$census_line" != *"checked=2198 accepted=2198"* || "$census_line" != *"rejected={}"* \
+      || "$census_line" != *"inconclusive=0"* \
+      || "$census_line" != *'unchecked={"nonsafe_with_unserialized_refs": 6}'* ]]; then
+  emit census failed "\"expected\":\"checked=2198 accepted=2198 inconclusive=0 rejected={} unchecked={nonsafe_with_unserialized_refs:6}\",\"actual\":\"${census_line//\"/\\\"}\",\"artifact\":\"suite.log\""
   note "FAIL: Init.Prelude verdict census regressed: ${census_line:-<census line missing>}"
   exit 1
 fi
-emit census passed "\"accepted\":1755,\"rejected\":0,\"inconclusive\":0,\"bead\":\"franken_lean-irm\""
-note "census floor: Init.Prelude 1755/1755 accepted, 0 rejected, 0 inconclusive"
+emit census passed "\"checked\":2198,\"accepted\":2198,\"rejected\":0,\"inconclusive\":0,\"uncheckable_from_artifact\":6,\"beads\":\"franken_lean-irm,franken_lean-ap6\""
+note "census floor: Init.Prelude 2198/2198 checked accepted (6 typed uncheckable-from-artifact), 0 rejected, 0 inconclusive"
 
 # ---- build the decode driver -----------------------------------------------------------
 ( cd "$ROOT" && CARGO_TARGET_DIR=target_local cargo build -q --locked -p fln-olean --example decode_olean ) \

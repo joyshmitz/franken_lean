@@ -41,6 +41,13 @@ pub enum RejectClass {
     DefinitionTypeMismatch,
     /// The two sides are simply not definitionally equal (defeq query verdict).
     NotDefEq,
+    /// KR-973 (pin type_checker.cpp:101/105): a non-unsafe context referenced an
+    /// unsafe declaration, or a safe context referenced a partial definition.
+    SafetyViolation,
+    /// KR-6xx/95x/97x: a decoded declaration-block observable (flag, count,
+    /// name list, generated recursor) does not match the kernel's own
+    /// regeneration from the declaration.
+    BlockMismatch,
 }
 
 impl RejectClass {
@@ -61,6 +68,8 @@ impl RejectClass {
             RejectClass::TheoremNotProp => "theorem_not_prop",
             RejectClass::DefinitionTypeMismatch => "definition_type_mismatch",
             RejectClass::NotDefEq => "not_def_eq",
+            RejectClass::SafetyViolation => "safety_violation",
+            RejectClass::BlockMismatch => "block_mismatch",
         }
     }
 }
@@ -179,6 +188,8 @@ mod tests {
             RejectClass::TheoremNotProp,
             RejectClass::DefinitionTypeMismatch,
             RejectClass::NotDefEq,
+            RejectClass::SafetyViolation,
+            RejectClass::BlockMismatch,
         ] {
             assert!(seen.insert(class.as_str()), "duplicate class string");
         }

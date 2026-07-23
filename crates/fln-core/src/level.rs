@@ -605,6 +605,64 @@ impl Level {
         self == other || self.normalize() == other.normalize()
     }
 
+    /// `is_not_zero` (vendor: src/kernel/level.cpp:160): `true` means NO
+    /// parameter assignment can make this level zero. Conservatively `false`
+    /// for params and mvars.
+    pub fn is_not_zero(&self) -> bool {
+        match self.view() {
+            LevelView::Zero | LevelView::Param(_) | LevelView::MVar(_) => false,
+            LevelView::Succ(_) => true,
+            LevelView::Max(a, b) => a.is_not_zero() || b.is_not_zero(),
+            LevelView::IMax(_, b) => b.is_not_zero(),
+        }
+    }
+
+    /// `is_geq` (vendor: src/kernel/level.cpp:508-531): a sound approximation
+    /// of "`self ≥ other` under every parameter assignment", computed on
+    /// normalized forms exactly as the pin does. Used by KR-604 (constructor
+    /// field universes) and KR-602/700 machinery.
+    pub fn is_geq(&self, other: &Level) -> bool {
+        fn to_offset(l: &Level) -> (Level, u32) {
+            let mut base = l.clone();
+            let mut k = 0u32;
+            while let LevelView::Succ(inner) = base.view() {
+                let inner = inner.clone();
+                base = inner;
+                k += 1;
+            }
+            (base, k)
+        }
+        fn core(l1: &Level, l2: &Level) -> bool {
+            if l1 == l2 || l2.is_zero() {
+                return true;
+            }
+            if let LevelView::Max(a, b) = l2.view() {
+                return l1.is_geq(a) && l1.is_geq(b);
+            }
+            if let LevelView::Max(a, b) = l1.view()
+                && (a.is_geq(l2) || b.is_geq(l2))
+            {
+                return true;
+            }
+            if let LevelView::IMax(a, b) = l2.view() {
+                return l1.is_geq(a) && l1.is_geq(b);
+            }
+            if let LevelView::IMax(_, b) = l1.view() {
+                return b.is_geq(l2);
+            }
+            let (base1, k1) = to_offset(l1);
+            let (base2, k2) = to_offset(l2);
+            if base1 == base2 || base2.is_zero() {
+                return k1 >= k2;
+            }
+            if k1 == k2 && k1 > 0 {
+                return base1.is_geq(&base2);
+            }
+            false
+        }
+        core(&self.normalize(), &other.normalize())
+    }
+
     // ---- cheap smart constructors ------------------------------------------------------
 
     /// `subsumes` inside `mkLevelMaxCore` (Level.lean:517-522).

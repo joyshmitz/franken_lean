@@ -64,10 +64,23 @@ pub(crate) struct TypeChecker<'a> {
     fresh: u64,
     budget: Budget,
     used: Consumption,
+    /// The checking context's safety mode (pin `m_definition_safety`): gates
+    /// KR-973 constant references. `Safe` everywhere except unsafe-declaration
+    /// bodies and unsafe inductive blocks.
+    safety: DefinitionSafety,
 }
 
 impl<'a> TypeChecker<'a> {
     pub(crate) fn new(env: &'a Environment, lparams: &'a [Name], budget: Budget) -> Self {
+        TypeChecker::new_with_safety(env, lparams, budget, DefinitionSafety::Safe)
+    }
+
+    pub(crate) fn new_with_safety(
+        env: &'a Environment,
+        lparams: &'a [Name],
+        budget: Budget,
+        safety: DefinitionSafety,
+    ) -> Self {
         TypeChecker {
             env,
             lparams,
@@ -75,7 +88,18 @@ impl<'a> TypeChecker<'a> {
             fresh: 0,
             budget,
             used: Consumption::default(),
+            safety,
         }
+    }
+
+    /// Adopt an externally-created local (the admission engine's telescopes,
+    /// bead franken_lean-ap6) so `infer`/`whnf`/`def_eq` resolve its fvar.
+    pub(crate) fn adopt_local(&mut self, id: FVarId, type_: Expr) {
+        self.locals.push(LocalDecl {
+            id,
+            type_,
+            value: None,
+        });
     }
 
     pub(crate) fn consumption(&self) -> Consumption {
@@ -133,7 +157,13 @@ impl<'a> TypeChecker<'a> {
     /// Replace loose `bvar k` by `subst` (which must be closed w.r.t. bvars, as all
     /// kernel substitution values here are: fvars or closed terms), decrementing
     /// looser indices. Flag-pruned: subtrees without loose bvars ≥ k are shared.
-    fn instantiate(&mut self, e: &Expr, k: u32, subst: &Expr, depth: u32) -> KResult<Expr> {
+    pub(crate) fn instantiate(
+        &mut self,
+        e: &Expr,
+        k: u32,
+        subst: &Expr,
+        depth: u32,
+    ) -> KResult<Expr> {
         self.step(depth)?;
         if e.loose_bvar_range() <= k {
             return Ok(e.clone());
@@ -1395,6 +1425,30 @@ impl<'a> TypeChecker<'a> {
                 for level in levels {
                     self.check_level(level)?;
                 }
+                // KR-973 (pin type_checker.cpp:101/105): a non-unsafe checking
+                // context may not reference unsafe declarations, and a SAFE
+                // context may not reference partial definitions.
+                if constant_is_unsafe(info) && self.safety != DefinitionSafety::Unsafe {
+                    return reject(
+                        RejectClass::SafetyViolation,
+                        format!(
+                            "declaration uses unsafe declaration `{}`",
+                            name.to_display_string()
+                        ),
+                    );
+                }
+                if let ConstantInfo::Defn(d) = info
+                    && d.safety == DefinitionSafety::Partial
+                    && self.safety == DefinitionSafety::Safe
+                {
+                    return reject(
+                        RejectClass::SafetyViolation,
+                        format!(
+                            "safe declaration must not contain partial declaration `{}`",
+                            name.to_display_string()
+                        ),
+                    );
+                }
                 let params = params.clone();
                 let type_ = info.constant_val().type_.clone();
                 let levels = levels.clone();
@@ -1899,6 +1953,11 @@ pub(crate) fn brief_public(e: &Expr) -> String {
     brief_expr(e, 5)
 }
 
+/// Crate-facing divergence locator (admit.rs cross-check messages).
+pub(crate) fn first_divergence_public(t: &Expr, s: &Expr) -> Option<String> {
+    first_divergence(t, s)
+}
+
 /// Structural first-divergence locator for mismatch DIAGNOSTICS only — never
 /// part of a judgment. Walks both terms in lockstep and reports the path to,
 /// and both sides of, the first place the trees differ, exposing exactly the
@@ -2338,6 +2397,19 @@ fn bool_const_expr(value: bool) -> Expr {
 /// A bignum value back onto the term plane, loss-free.
 fn nat_lit_expr(value: &BigNat) -> Expr {
     Expr::lit(Literal::Nat(literal_from_bignat(value)))
+}
+
+/// Is this constant unsafe in the KR-973 sense (pin `constant_info::is_unsafe`)?
+pub(crate) fn constant_is_unsafe(info: &ConstantInfo) -> bool {
+    match info {
+        ConstantInfo::Axiom(v) => v.is_unsafe,
+        ConstantInfo::Defn(v) => v.safety == DefinitionSafety::Unsafe,
+        ConstantInfo::Thm(_) | ConstantInfo::Quot(_) => false,
+        ConstantInfo::Opaque(v) => v.is_unsafe,
+        ConstantInfo::Induct(v) => v.is_unsafe,
+        ConstantInfo::Ctor(v) => v.is_unsafe,
+        ConstantInfo::Rec(v) => v.is_unsafe,
+    }
 }
 
 /// Level-parameter substitution (pure, structural).
