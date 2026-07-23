@@ -10,7 +10,7 @@ use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_env::constants::{
     AxiomVal, ConstantInfo, ConstantVal, ConstructorVal, DefinitionSafety, DefinitionVal,
-    InductiveVal, ReducibilityHints, TheoremVal,
+    InductiveVal, QuotKind, QuotVal, RecursorRule, RecursorVal, ReducibilityHints, TheoremVal,
 };
 use fln_env::environment::Environment;
 use fln_kernel::verdict::{Budget, ExhaustionReason, RejectClass, Verdict};
@@ -1075,5 +1075,1547 @@ fn kr303_sorts_are_defeq_iff_their_levels_are_equivalent() {
         reject_class(&check_def_eq(&env, &[], &prop(), &s1, Budget::DEFAULT)),
         Some(RejectClass::NotDefEq),
         "Sort 0 (Prop) and Sort 1 are distinct sorts"
+    );
+}
+
+// ---- recursor reduction (KR-205/316/317/955; bead franken_lean-5p2) -----------------
+
+/// Shorthand for a dotted two-segment name, e.g. `nn("E", "a")` = `E.a`.
+fn nn(outer: &str, inner: &str) -> Name {
+    Name::str(n(outer), inner)
+}
+
+/// A two-constructor enum `E : Sort 1` with nullary constructors `E.a`/`E.b` and
+/// the standard recursor `E.rec.{u} : ∀ (motive : E → Sort u) (ca : motive E.a)
+/// (cb : motive E.b) (t : E), motive t` — each rule returning its own minor.
+fn add_enum_e(env: &Environment) -> Environment {
+    let e = n("E");
+    let env = add_info(
+        env,
+        ConstantInfo::Induct(InductiveVal {
+            base: ConstantVal {
+                name: e.clone(),
+                level_params: vec![],
+                type_: sort1(),
+            },
+            num_params: 0,
+            num_indices: 0,
+            all: vec![e.clone()],
+            ctors: vec![nn("E", "a"), nn("E", "b")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }),
+    );
+    let mut env = env;
+    for (idx, ctor) in ["a", "b"].iter().enumerate() {
+        env = add_info(
+            &env,
+            ConstantInfo::Ctor(ConstructorVal {
+                base: ConstantVal {
+                    name: nn("E", ctor),
+                    level_params: vec![],
+                    type_: Expr::const_(e.clone(), vec![]),
+                },
+                induct: e.clone(),
+                cidx: idx as u32,
+                num_params: 0,
+                num_fields: 0,
+                is_unsafe: false,
+            }),
+        );
+    }
+    let u = n("u");
+    let motive_ty = Expr::forall_e(
+        n("t"),
+        Expr::const_(e.clone(), vec![]),
+        Expr::sort(Level::param(u.clone())),
+        BinderInfo::Default,
+    );
+    // ∀ (motive) (ca : motive E.a) (cb : motive E.b) (t : E), motive t
+    let rec_ty = Expr::forall_e(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::forall_e(
+            n("ca"),
+            Expr::app(
+                Expr::bvar(0).expect("packs"),
+                Expr::const_(nn("E", "a"), vec![]),
+            ),
+            Expr::forall_e(
+                n("cb"),
+                Expr::app(
+                    Expr::bvar(1).expect("packs"),
+                    Expr::const_(nn("E", "b"), vec![]),
+                ),
+                Expr::forall_e(
+                    n("t"),
+                    Expr::const_(e.clone(), vec![]),
+                    Expr::app(Expr::bvar(3).expect("packs"), Expr::bvar(0).expect("packs")),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // rule rhs: fun (motive) (ca) (cb) => <the matching minor>.
+    let rule_rhs = |pick: u32| {
+        Expr::lam(
+            n("motive"),
+            motive_ty.clone(),
+            Expr::lam(
+                n("ca"),
+                Expr::app(
+                    Expr::bvar(0).expect("packs"),
+                    Expr::const_(nn("E", "a"), vec![]),
+                ),
+                Expr::lam(
+                    n("cb"),
+                    Expr::app(
+                        Expr::bvar(1).expect("packs"),
+                        Expr::const_(nn("E", "b"), vec![]),
+                    ),
+                    Expr::bvar(pick).expect("packs"),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    };
+    add_info(
+        &env,
+        ConstantInfo::Rec(RecursorVal {
+            base: ConstantVal {
+                name: nn("E", "rec"),
+                level_params: vec![u],
+                type_: rec_ty,
+            },
+            all: vec![e],
+            num_params: 0,
+            num_indices: 0,
+            num_motives: 1,
+            num_minors: 2,
+            rules: vec![
+                RecursorRule {
+                    ctor: nn("E", "a"),
+                    nfields: 0,
+                    rhs: rule_rhs(1),
+                },
+                RecursorRule {
+                    ctor: nn("E", "b"),
+                    nfields: 0,
+                    rhs: rule_rhs(0),
+                },
+            ],
+            k: false,
+            is_unsafe: false,
+        }),
+    )
+}
+
+/// The motive/minor axioms for `E.rec` at u := 1: `M : E → Sort 1`,
+/// `ca : M E.a`, `cb : M E.b`.
+fn add_enum_e_axioms(env: &Environment) -> Environment {
+    let motive_ty = Expr::forall_e(
+        n("t"),
+        Expr::const_(n("E"), vec![]),
+        sort1(),
+        BinderInfo::Default,
+    );
+    let env = add_info(
+        env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("M"),
+                level_params: vec![],
+                type_: motive_ty,
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("ca"),
+                level_params: vec![],
+                type_: Expr::app(
+                    Expr::const_(n("M"), vec![]),
+                    Expr::const_(nn("E", "a"), vec![]),
+                ),
+            },
+            is_unsafe: false,
+        }),
+    );
+    add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("cb"),
+                level_params: vec![],
+                type_: Expr::app(
+                    Expr::const_(n("M"), vec![]),
+                    Expr::const_(nn("E", "b"), vec![]),
+                ),
+            },
+            is_unsafe: false,
+        }),
+    )
+}
+
+fn e_rec_app(major: Expr) -> Expr {
+    let mut app = Expr::const_(nn("E", "rec"), vec![Level::one()]);
+    for arg in [
+        Expr::const_(n("M"), vec![]),
+        Expr::const_(n("ca"), vec![]),
+        Expr::const_(n("cb"), vec![]),
+        major,
+    ] {
+        app = Expr::app(app, arg);
+    }
+    app
+}
+
+#[test]
+fn kr316_iota_selects_the_matching_rule_per_constructor() {
+    // KR-316: `E.rec M ca cb E.a ≟ ca` and `E.rec M ca cb E.b ≟ cb` — and the
+    // CROSS pairings must fail, killing any always-take-the-first-rule mutant.
+    let env = add_enum_e_axioms(&add_enum_e(&Environment::new()));
+    let ca = Expr::const_(n("ca"), vec![]);
+    let cb = Expr::const_(n("cb"), vec![]);
+    let on_a = e_rec_app(Expr::const_(nn("E", "a"), vec![]));
+    let on_b = e_rec_app(Expr::const_(nn("E", "b"), vec![]));
+    assert!(
+        check_def_eq(&env, &[], &on_a, &ca, Budget::DEFAULT).is_accepted(),
+        "iota on E.a reduces to the first minor"
+    );
+    assert!(
+        check_def_eq(&env, &[], &on_b, &cb, Budget::DEFAULT).is_accepted(),
+        "iota on E.b reduces to the second minor"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(&env, &[], &on_a, &cb, Budget::DEFAULT)),
+        Some(RejectClass::NotDefEq),
+        "iota must select the rule OF THE MAJOR'S CONSTRUCTOR"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(&env, &[], &on_b, &ca, Budget::DEFAULT)),
+        Some(RejectClass::NotDefEq),
+        "iota must select the rule OF THE MAJOR'S CONSTRUCTOR"
+    );
+}
+
+#[test]
+fn kr316_iota_is_stuck_without_a_constructor_major_or_full_arity() {
+    // A non-constructor major (an axiom of type E, on a 2-ctor inductive that is
+    // NOT structure-eta eligible) must leave the recursor application stuck —
+    // a typed NotDefEq, never a panic or a wrong acceptance. Likewise an
+    // under-applied recursor (major premise missing) must not fire.
+    let env = add_enum_e_axioms(&add_enum_e(&Environment::new()));
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("e0"),
+                level_params: vec![],
+                type_: Expr::const_(n("E"), vec![]),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let ca = Expr::const_(n("ca"), vec![]);
+    let stuck = e_rec_app(Expr::const_(n("e0"), vec![]));
+    assert_eq!(
+        reject_class(&check_def_eq(&env, &[], &stuck, &ca, Budget::DEFAULT)),
+        Some(RejectClass::NotDefEq),
+        "an opaque major premise cannot fire iota on a multi-constructor inductive"
+    );
+    // Under-applied: E.rec M ca cb (no major) against ca.
+    let mut under = Expr::const_(nn("E", "rec"), vec![Level::one()]);
+    for arg in [
+        Expr::const_(n("M"), vec![]),
+        Expr::const_(n("ca"), vec![]),
+        Expr::const_(n("cb"), vec![]),
+    ] {
+        under = Expr::app(under, arg);
+    }
+    assert_eq!(
+        reject_class(&check_def_eq(&env, &[], &under, &ca, Budget::DEFAULT)),
+        Some(RejectClass::NotDefEq),
+        "an under-applied recursor (missing major) must not fire"
+    );
+}
+
+#[test]
+fn kr316_iota_preserves_trailing_arguments() {
+    // Trailing arguments after the major premise must be re-applied to the
+    // reduced right-hand side (kills a dropped-extras mutant). Motive returns a
+    // function type: M2 := fun _ : E => (D → D); minors are function-valued.
+    let env = add_enum_e(&Environment::new());
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("D"),
+                level_params: vec![],
+                type_: sort1(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let d = || Expr::const_(n("D"), vec![]);
+    let d_to_d = Expr::forall_e(n("x"), d(), d(), BinderInfo::Default);
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("f"),
+                level_params: vec![],
+                type_: d_to_d.clone(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("g"),
+                level_params: vec![],
+                type_: d_to_d.clone(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("d0"),
+                level_params: vec![],
+                type_: d(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    // motive := fun _ : E => D → D, passed inline.
+    let motive = Expr::lam(
+        n("t"),
+        Expr::const_(n("E"), vec![]),
+        d_to_d,
+        BinderInfo::Default,
+    );
+    let mut lhs = Expr::const_(nn("E", "rec"), vec![Level::one()]);
+    for arg in [
+        motive,
+        Expr::const_(n("f"), vec![]),
+        Expr::const_(n("g"), vec![]),
+        Expr::const_(nn("E", "a"), vec![]),
+        Expr::const_(n("d0"), vec![]), // trailing argument after the major
+    ] {
+        lhs = Expr::app(lhs, arg);
+    }
+    let rhs = Expr::app(Expr::const_(n("f"), vec![]), Expr::const_(n("d0"), vec![]));
+    assert!(
+        check_def_eq(&env, &[], &lhs, &rhs, Budget::DEFAULT).is_accepted(),
+        "trailing arguments ride along: E.rec … E.a d0 ≟ f d0"
+    );
+    let wrong = Expr::app(Expr::const_(n("g"), vec![]), Expr::const_(n("d0"), vec![]));
+    assert_eq!(
+        reject_class(&check_def_eq(&env, &[], &lhs, &wrong, Budget::DEFAULT)),
+        Some(RejectClass::NotDefEq),
+        "…and still through the MATCHING rule"
+    );
+}
+
+/// A Nat-like inductive under the REAL name `Nat` (so KR-316's
+/// literal-to-constructor conversion resolves `Nat.zero`/`Nat.succ`), with the
+/// standard recursor whose succ rule takes the field and the inductive
+/// hypothesis: `fun motive mz ms n => ms n (Nat.rec motive mz ms n)`.
+fn add_nat_with_rec(env: &Environment) -> Environment {
+    let nat = n("Nat");
+    let nat_c = || Expr::const_(n("Nat"), vec![]);
+    let env = add_info(
+        env,
+        ConstantInfo::Induct(InductiveVal {
+            base: ConstantVal {
+                name: nat.clone(),
+                level_params: vec![],
+                type_: sort1(),
+            },
+            num_params: 0,
+            num_indices: 0,
+            all: vec![nat.clone()],
+            ctors: vec![nn("Nat", "zero"), nn("Nat", "succ")],
+            num_nested: 0,
+            is_rec: true,
+            is_unsafe: false,
+            is_reflexive: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: nn("Nat", "zero"),
+                level_params: vec![],
+                type_: nat_c(),
+            },
+            induct: nat.clone(),
+            cidx: 0,
+            num_params: 0,
+            num_fields: 0,
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: nn("Nat", "succ"),
+                level_params: vec![],
+                type_: Expr::forall_e(n("n"), nat_c(), nat_c(), BinderInfo::Default),
+            },
+            induct: nat.clone(),
+            cidx: 1,
+            num_params: 0,
+            num_fields: 1,
+            is_unsafe: false,
+        }),
+    );
+    let u = n("u");
+    let motive_ty = Expr::forall_e(
+        n("t"),
+        nat_c(),
+        Expr::sort(Level::param(u.clone())),
+        BinderInfo::Default,
+    );
+    // minor_succ type: ∀ (n : Nat), motive n → motive (Nat.succ n). Every use
+    // site has [motive, mz] in scope, so under the `n` binder motive is bvar 2
+    // and under the `ih` binder it is bvar 3.
+    let ms_ty = || {
+        Expr::forall_e(
+            n("n"),
+            nat_c(),
+            Expr::forall_e(
+                n("ih"),
+                Expr::app(Expr::bvar(2).expect("packs"), Expr::bvar(0).expect("packs")),
+                Expr::app(
+                    Expr::bvar(3).expect("packs"),
+                    Expr::app(
+                        Expr::const_(nn("Nat", "succ"), vec![]),
+                        Expr::bvar(1).expect("packs"),
+                    ),
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        )
+    };
+    // ∀ (motive) (mz : motive Nat.zero) (ms : …) (t : Nat), motive t
+    let rec_ty = Expr::forall_e(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::forall_e(
+            n("mz"),
+            Expr::app(
+                Expr::bvar(0).expect("packs"),
+                Expr::const_(nn("Nat", "zero"), vec![]),
+            ),
+            Expr::forall_e(
+                n("ms"),
+                ms_ty(),
+                Expr::forall_e(
+                    n("t"),
+                    nat_c(),
+                    Expr::app(Expr::bvar(3).expect("packs"), Expr::bvar(0).expect("packs")),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // zero rhs: fun motive mz ms => mz
+    let zero_rhs = Expr::lam(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::lam(
+            n("mz"),
+            Expr::app(
+                Expr::bvar(0).expect("packs"),
+                Expr::const_(nn("Nat", "zero"), vec![]),
+            ),
+            Expr::lam(
+                n("ms"),
+                ms_ty(),
+                Expr::bvar(1).expect("packs"),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // succ rhs: fun motive mz ms n => ms n (Nat.rec.{u} motive mz ms n)
+    let succ_rhs = Expr::lam(
+        n("motive"),
+        motive_ty,
+        Expr::lam(
+            n("mz"),
+            Expr::app(
+                Expr::bvar(0).expect("packs"),
+                Expr::const_(nn("Nat", "zero"), vec![]),
+            ),
+            Expr::lam(
+                n("ms"),
+                ms_ty(),
+                Expr::lam(
+                    n("n"),
+                    nat_c(),
+                    {
+                        let mut ih = Expr::const_(nn("Nat", "rec"), vec![Level::param(u.clone())]);
+                        for arg in [
+                            Expr::bvar(3).expect("packs"),
+                            Expr::bvar(2).expect("packs"),
+                            Expr::bvar(1).expect("packs"),
+                            Expr::bvar(0).expect("packs"),
+                        ] {
+                            ih = Expr::app(ih, arg);
+                        }
+                        Expr::app(
+                            Expr::app(Expr::bvar(1).expect("packs"), Expr::bvar(0).expect("packs")),
+                            ih,
+                        )
+                    },
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    add_info(
+        &env,
+        ConstantInfo::Rec(RecursorVal {
+            base: ConstantVal {
+                name: nn("Nat", "rec"),
+                level_params: vec![u],
+                type_: rec_ty,
+            },
+            all: vec![nat.clone()],
+            num_params: 0,
+            num_indices: 0,
+            num_motives: 1,
+            num_minors: 2,
+            rules: vec![
+                RecursorRule {
+                    ctor: nn("Nat", "zero"),
+                    nfields: 0,
+                    rhs: zero_rhs,
+                },
+                RecursorRule {
+                    ctor: nn("Nat", "succ"),
+                    nfields: 1,
+                    rhs: succ_rhs,
+                },
+            ],
+            k: false,
+            is_unsafe: false,
+        }),
+    )
+}
+
+/// `Nat.rec.{1} NM nmz nms <major>` over axioms NM/nmz/nms.
+fn nat_rec_app(env: &Environment, major: Expr) -> (Environment, Expr) {
+    let nat_c = || Expr::const_(n("Nat"), vec![]);
+    let env = add_info(
+        env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("NM"),
+                level_params: vec![],
+                type_: Expr::forall_e(n("t"), nat_c(), sort1(), BinderInfo::Default),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("nmz"),
+                level_params: vec![],
+                type_: Expr::app(
+                    Expr::const_(n("NM"), vec![]),
+                    Expr::const_(nn("Nat", "zero"), vec![]),
+                ),
+            },
+            is_unsafe: false,
+        }),
+    );
+    // nms : ∀ (n : Nat), NM n → NM (Nat.succ n)
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("nms"),
+                level_params: vec![],
+                type_: Expr::forall_e(
+                    n("n"),
+                    nat_c(),
+                    Expr::forall_e(
+                        n("ih"),
+                        Expr::app(Expr::const_(n("NM"), vec![]), Expr::bvar(0).expect("packs")),
+                        Expr::app(
+                            Expr::const_(n("NM"), vec![]),
+                            Expr::app(
+                                Expr::const_(nn("Nat", "succ"), vec![]),
+                                Expr::bvar(1).expect("packs"),
+                            ),
+                        ),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let mut app = Expr::const_(nn("Nat", "rec"), vec![Level::one()]);
+    for arg in [
+        Expr::const_(n("NM"), vec![]),
+        Expr::const_(n("nmz"), vec![]),
+        Expr::const_(n("nms"), vec![]),
+        major,
+    ] {
+        app = Expr::app(app, arg);
+    }
+    (env, app)
+}
+
+#[test]
+fn kr316_iota_applies_constructor_fields_and_the_inductive_hypothesis() {
+    // Syntactic-constructor major: Nat.rec … (Nat.succ Nat.zero) must equal
+    // nms Nat.zero nmz — the field is passed to the rule AND the recursive
+    // occurrence computes (kills a fields-slice-offset mutant).
+    let env = add_nat_with_rec(&Environment::new());
+    let succ_zero = Expr::app(
+        Expr::const_(nn("Nat", "succ"), vec![]),
+        Expr::const_(nn("Nat", "zero"), vec![]),
+    );
+    let (env, lhs) = nat_rec_app(&env, succ_zero);
+    let rhs = Expr::app(
+        Expr::app(
+            Expr::const_(n("nms"), vec![]),
+            Expr::const_(nn("Nat", "zero"), vec![]),
+        ),
+        Expr::const_(n("nmz"), vec![]),
+    );
+    assert!(
+        check_def_eq(&env, &[], &lhs, &rhs, Budget::DEFAULT).is_accepted(),
+        "iota on succ: field + inductive hypothesis"
+    );
+}
+
+#[test]
+fn kr316_nat_literal_majors_convert_to_constructor_form() {
+    // KR-316's Nat-literal gate: a literal major converts through
+    // Nat.zero/Nat.succ before rule matching. Lit(0) takes the zero rule;
+    // Lit(2) recurses down to `nms lit1 (nms lit0 nmz)`-shape (checked against
+    // the fully symbolic expansion); and Lit(1) against the ZERO minor fails.
+    let env = add_nat_with_rec(&Environment::new());
+    let lit = |v: u64| Expr::lit(Literal::Nat(NatLit::from_u64(v)));
+    let (env, on_zero_lit) = nat_rec_app(&env, lit(0));
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &on_zero_lit,
+            &Expr::const_(n("nmz"), vec![]),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "literal 0 reduces through the Nat.zero rule"
+    );
+    // Same env already carries NM/nmz/nms; build further apps by hand.
+    let rec_on = |major: Expr| {
+        let mut app = Expr::const_(nn("Nat", "rec"), vec![Level::one()]);
+        for arg in [
+            Expr::const_(n("NM"), vec![]),
+            Expr::const_(n("nmz"), vec![]),
+            Expr::const_(n("nms"), vec![]),
+            major,
+        ] {
+            app = Expr::app(app, arg);
+        }
+        app
+    };
+    let on_two_lit = rec_on(lit(2));
+    // Fully-literal expansion: rec on lit 2 unrolls through the succ rule twice
+    // and the zero rule once, staying in literal form throughout. (Comparing
+    // against the SYMBOLIC succ (succ zero) major would additionally need
+    // KR-313 Nat acceleration — `lit 1 ≟ Nat.succ Nat.zero` in argument
+    // position — which is the fln-bignum follow-up slice, not iota.)
+    let expected_two = Expr::app(
+        Expr::app(Expr::const_(n("nms"), vec![]), lit(1)),
+        Expr::app(
+            Expr::app(Expr::const_(n("nms"), vec![]), lit(0)),
+            Expr::const_(n("nmz"), vec![]),
+        ),
+    );
+    assert!(
+        check_def_eq(&env, &[], &on_two_lit, &expected_two, Budget::DEFAULT).is_accepted(),
+        "literal 2 unrolls through succ, succ, zero rules"
+    );
+    assert_eq!(
+        reject_class(&check_def_eq(
+            &env,
+            &[],
+            &rec_on(lit(1)),
+            &Expr::const_(n("nmz"), vec![]),
+            Budget::DEFAULT
+        )),
+        Some(RejectClass::NotDefEq),
+        "literal 1 must take the SUCC rule, not the zero rule"
+    );
+}
+
+#[test]
+fn fl_inv_07_iota_chain_exhaustion_is_inconclusive_never_rejected() {
+    // A large literal drives a long succ-rule chain that stays in HEAD position:
+    // the succ minor is `fun n ih => ih`, so each iota step beta-reduces
+    // straight into the next recursor application. A tiny budget must yield a
+    // typed Inconclusive (FL-INV-07) — not acceptance, not rejection. (An
+    // axiom minor would NOT work here: reduction would stick behind the axiom
+    // head after one step and terminate as an honest NotDefEq.)
+    let env = add_nat_with_rec(&Environment::new());
+    let (env, _) = nat_rec_app(&env, Expr::lit(Literal::Nat(NatLit::from_u64(0))));
+    let nat_c = || Expr::const_(n("Nat"), vec![]);
+    let ih_minor = Expr::lam(
+        n("n"),
+        nat_c(),
+        Expr::lam(
+            n("ih"),
+            Expr::app(Expr::const_(n("NM"), vec![]), Expr::bvar(0).expect("packs")),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let mut lhs = Expr::const_(nn("Nat", "rec"), vec![Level::one()]);
+    for arg in [
+        Expr::const_(n("NM"), vec![]),
+        Expr::const_(n("nmz"), vec![]),
+        ih_minor,
+        Expr::lit(Literal::Nat(NatLit::from_u64(1_000_000))),
+    ] {
+        lhs = Expr::app(lhs, arg);
+    }
+    let verdict = check_def_eq(
+        &env,
+        &[],
+        &lhs,
+        &Expr::const_(n("nmz"), vec![]),
+        Budget {
+            steps: 2_000,
+            depth: 64,
+        },
+    );
+    assert!(
+        matches!(verdict, Verdict::Inconclusive { .. }),
+        "budget exhaustion in an iota chain is Inconclusive, got {verdict:?}"
+    );
+}
+
+#[test]
+fn kr317_k_like_recursor_reduces_an_opaque_proof() {
+    // KR-317: `T : Prop` with one nullary constructor `T.intro`; T.rec is
+    // K-flagged. The major premise is an OPAQUE axiom `h : T` — never
+    // syntactically a constructor — yet the recursor must reduce, because K
+    // conversion replaces h by T.intro after the type check. Kills a
+    // missing-K-conversion mutant (without it the application is stuck).
+    let t = n("T");
+    let env = add_info(
+        &Environment::new(),
+        ConstantInfo::Induct(InductiveVal {
+            base: ConstantVal {
+                name: t.clone(),
+                level_params: vec![],
+                type_: prop(),
+            },
+            num_params: 0,
+            num_indices: 0,
+            all: vec![t.clone()],
+            ctors: vec![nn("T", "intro")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: nn("T", "intro"),
+                level_params: vec![],
+                type_: Expr::const_(t.clone(), vec![]),
+            },
+            induct: t.clone(),
+            cidx: 0,
+            num_params: 0,
+            num_fields: 0,
+            is_unsafe: false,
+        }),
+    );
+    let u = n("u");
+    let motive_ty = Expr::forall_e(
+        n("t"),
+        Expr::const_(t.clone(), vec![]),
+        Expr::sort(Level::param(u.clone())),
+        BinderInfo::Default,
+    );
+    // ∀ (motive) (c : motive T.intro) (h : T), motive h
+    let rec_ty = Expr::forall_e(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::forall_e(
+            n("c"),
+            Expr::app(
+                Expr::bvar(0).expect("packs"),
+                Expr::const_(nn("T", "intro"), vec![]),
+            ),
+            Expr::forall_e(
+                n("h"),
+                Expr::const_(t.clone(), vec![]),
+                Expr::app(Expr::bvar(2).expect("packs"), Expr::bvar(0).expect("packs")),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // rule rhs: fun motive c => c
+    let rhs = Expr::lam(
+        n("motive"),
+        motive_ty,
+        Expr::lam(
+            n("c"),
+            Expr::app(
+                Expr::bvar(0).expect("packs"),
+                Expr::const_(nn("T", "intro"), vec![]),
+            ),
+            Expr::bvar(0).expect("packs"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Rec(RecursorVal {
+            base: ConstantVal {
+                name: nn("T", "rec"),
+                level_params: vec![u],
+                type_: rec_ty,
+            },
+            all: vec![t.clone()],
+            num_params: 0,
+            num_indices: 0,
+            num_motives: 1,
+            num_minors: 1,
+            rules: vec![RecursorRule {
+                ctor: nn("T", "intro"),
+                nfields: 0,
+                rhs,
+            }],
+            k: true,
+            is_unsafe: false,
+        }),
+    );
+    // Motive/minor/proof axioms: TM : T → Sort 1, tc : TM T.intro, h : T.
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("TM"),
+                level_params: vec![],
+                type_: Expr::forall_e(
+                    n("t"),
+                    Expr::const_(t.clone(), vec![]),
+                    sort1(),
+                    BinderInfo::Default,
+                ),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("tc"),
+                level_params: vec![],
+                type_: Expr::app(
+                    Expr::const_(n("TM"), vec![]),
+                    Expr::const_(nn("T", "intro"), vec![]),
+                ),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("h"),
+                level_params: vec![],
+                type_: Expr::const_(t.clone(), vec![]),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let mut lhs = Expr::const_(nn("T", "rec"), vec![Level::one()]);
+    for arg in [
+        Expr::const_(n("TM"), vec![]),
+        Expr::const_(n("tc"), vec![]),
+        Expr::const_(n("h"), vec![]),
+    ] {
+        lhs = Expr::app(lhs, arg);
+    }
+    assert!(
+        check_def_eq(
+            &env,
+            &[],
+            &lhs,
+            &Expr::const_(n("tc"), vec![]),
+            Budget::DEFAULT
+        )
+        .is_accepted(),
+        "K-like reduction fires on an opaque proof of a K-eligible inductive"
+    );
+}
+
+#[test]
+fn kr316_structure_eta_coercion_fires_the_recursor_on_an_opaque_major() {
+    // KR-316's structure-eta gate: `S` is a one-constructor, index-free,
+    // non-recursive structure; the major is an OPAQUE axiom `s : S`. The
+    // coercion rewrites it to `S.mk (proj 0 s) (proj 1 s)`, so S.rec must
+    // reduce to `minor (proj 0 s) (proj 1 s)` (kills a missing-eta mutant).
+    let env = add_info(
+        &Environment::new(),
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("D"),
+                level_params: vec![],
+                type_: sort1(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let d = || Expr::const_(n("D"), vec![]);
+    let env = add_structure(&env, "S", "mk", sort1(), &[d(), d()]);
+    let s_c = || Expr::const_(n("S"), vec![]);
+    let u = n("u");
+    let motive_ty = Expr::forall_e(
+        n("t"),
+        s_c(),
+        Expr::sort(Level::param(u.clone())),
+        BinderInfo::Default,
+    );
+    // minor : ∀ (f0 f1 : D), motive (S.mk f0 f1); at its use site [motive] is in
+    // scope, so under f0/f1 motive is bvar 1/2 respectively.
+    let minor_ty = Expr::forall_e(
+        n("f0"),
+        d(),
+        Expr::forall_e(
+            n("f1"),
+            d(),
+            Expr::app(
+                Expr::bvar(2).expect("packs"),
+                Expr::app(
+                    Expr::app(Expr::const_(n("mk"), vec![]), Expr::bvar(1).expect("packs")),
+                    Expr::bvar(0).expect("packs"),
+                ),
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // ∀ (motive) (minor : …) (t : S), motive t
+    let rec_ty = Expr::forall_e(
+        n("motive"),
+        motive_ty.clone(),
+        Expr::forall_e(
+            n("minor"),
+            minor_ty.clone(),
+            Expr::forall_e(
+                n("t"),
+                s_c(),
+                Expr::app(Expr::bvar(2).expect("packs"), Expr::bvar(0).expect("packs")),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // rule rhs: fun motive minor f0 f1 => minor f0 f1
+    let rhs = Expr::lam(
+        n("motive"),
+        motive_ty,
+        Expr::lam(
+            n("minor"),
+            minor_ty,
+            Expr::lam(
+                n("f0"),
+                d(),
+                Expr::lam(
+                    n("f1"),
+                    d(),
+                    Expr::app(
+                        Expr::app(Expr::bvar(2).expect("packs"), Expr::bvar(1).expect("packs")),
+                        Expr::bvar(0).expect("packs"),
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Rec(RecursorVal {
+            base: ConstantVal {
+                name: nn("S", "rec"),
+                level_params: vec![u],
+                type_: rec_ty,
+            },
+            all: vec![n("S")],
+            num_params: 0,
+            num_indices: 0,
+            num_motives: 1,
+            num_minors: 1,
+            rules: vec![RecursorRule {
+                ctor: n("mk"),
+                nfields: 2,
+                rhs,
+            }],
+            k: false,
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("SM"),
+                level_params: vec![],
+                type_: Expr::forall_e(n("t"), s_c(), sort1(), BinderInfo::Default),
+            },
+            is_unsafe: false,
+        }),
+    );
+    // minor axiom: sm : ∀ (f0 f1 : D), SM (mk f0 f1)
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("sm"),
+                level_params: vec![],
+                type_: Expr::forall_e(
+                    n("f0"),
+                    d(),
+                    Expr::forall_e(
+                        n("f1"),
+                        d(),
+                        Expr::app(
+                            Expr::const_(n("SM"), vec![]),
+                            Expr::app(
+                                Expr::app(
+                                    Expr::const_(n("mk"), vec![]),
+                                    Expr::bvar(1).expect("packs"),
+                                ),
+                                Expr::bvar(0).expect("packs"),
+                            ),
+                        ),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("s"),
+                level_params: vec![],
+                type_: s_c(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let mut lhs = Expr::const_(nn("S", "rec"), vec![Level::one()]);
+    for arg in [
+        Expr::const_(n("SM"), vec![]),
+        Expr::const_(n("sm"), vec![]),
+        Expr::const_(n("s"), vec![]),
+    ] {
+        lhs = Expr::app(lhs, arg);
+    }
+    let s0 = Expr::proj(n("S"), 0, Expr::const_(n("s"), vec![]));
+    let s1 = Expr::proj(n("S"), 1, Expr::const_(n("s"), vec![]));
+    let rhs_expected = Expr::app(Expr::app(Expr::const_(n("sm"), vec![]), s0), s1);
+    assert!(
+        check_def_eq(&env, &[], &lhs, &rhs_expected, Budget::DEFAULT).is_accepted(),
+        "structure-eta coercion lets the recursor fire on an opaque structure value"
+    );
+}
+
+/// The Quot machinery as QuotVals (types are structural placeholders — KR-955
+/// computation never consults them, exactly like the pin's quot_reduce_rec).
+fn add_quot(env: &Environment) -> Environment {
+    let mut env = env.clone();
+    for (name_, kind) in [
+        (n("Quot"), QuotKind::Type),
+        (nn("Quot", "mk"), QuotKind::Ctor),
+        (nn("Quot", "lift"), QuotKind::Lift),
+        (nn("Quot", "ind"), QuotKind::Ind),
+    ] {
+        env = add_info(
+            &env,
+            ConstantInfo::Quot(QuotVal {
+                base: ConstantVal {
+                    name: name_,
+                    level_params: vec![],
+                    type_: sort1(),
+                },
+                kind,
+            }),
+        );
+    }
+    // Scaffolding axioms: A, R, B, f, H, a, P, Mo.
+    for (name_, type_) in [("A", sort1()), ("B", sort1()), ("R", prop()), ("H", prop())] {
+        env = add_info(
+            &env,
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: n(name_),
+                    level_params: vec![],
+                    type_,
+                },
+                is_unsafe: false,
+            }),
+        );
+    }
+    for (name_, type_) in [
+        ("a", Expr::const_(n("A"), vec![])),
+        (
+            "f",
+            Expr::forall_e(
+                n("x"),
+                Expr::const_(n("A"), vec![]),
+                Expr::const_(n("B"), vec![]),
+                BinderInfo::Default,
+            ),
+        ),
+        ("hp", Expr::const_(n("H"), vec![])),
+        (
+            "P",
+            Expr::forall_e(
+                n("x"),
+                Expr::const_(n("A"), vec![]),
+                Expr::const_(n("B"), vec![]),
+                BinderInfo::Default,
+            ),
+        ),
+        ("Mo", sort1()),
+    ] {
+        env = add_info(
+            &env,
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: n(name_),
+                    level_params: vec![],
+                    type_,
+                },
+                is_unsafe: false,
+            }),
+        );
+    }
+    env
+}
+
+fn quot_mk_a() -> Expr {
+    let mut mk = Expr::const_(nn("Quot", "mk"), vec![]);
+    for arg in [
+        Expr::const_(n("A"), vec![]),
+        Expr::const_(n("R"), vec![]),
+        Expr::const_(n("a"), vec![]),
+    ] {
+        mk = Expr::app(mk, arg);
+    }
+    mk
+}
+
+#[test]
+fn kr955_quot_lift_and_ind_compute() {
+    // KR-955: `Quot.lift A R B f hp (Quot.mk A R a) ≟ f a` (mk at position 5, f
+    // at 3) and `Quot.ind A R Mo P (Quot.mk A R a) ≟ P a` (mk at 4, P at 3).
+    // The cross-check `… ≟ f a` vs a WRONG argument kills swapped-position
+    // mutants.
+    let env = add_quot(&Environment::new());
+    let mut lift = Expr::const_(nn("Quot", "lift"), vec![]);
+    for arg in [
+        Expr::const_(n("A"), vec![]),
+        Expr::const_(n("R"), vec![]),
+        Expr::const_(n("B"), vec![]),
+        Expr::const_(n("f"), vec![]),
+        Expr::const_(n("hp"), vec![]),
+        quot_mk_a(),
+    ] {
+        lift = Expr::app(lift, arg);
+    }
+    let f_a = Expr::app(Expr::const_(n("f"), vec![]), Expr::const_(n("a"), vec![]));
+    assert!(
+        check_def_eq(&env, &[], &lift, &f_a, Budget::DEFAULT).is_accepted(),
+        "Quot.lift computes: lift f h (mk r a) ≟ f a"
+    );
+    let hp_a = Expr::app(Expr::const_(n("hp"), vec![]), Expr::const_(n("a"), vec![]));
+    assert_eq!(
+        reject_class(&check_def_eq(&env, &[], &lift, &hp_a, Budget::DEFAULT)),
+        Some(RejectClass::NotDefEq),
+        "the FUNCTION is at position 3, not the proof at 4"
+    );
+    let mut ind = Expr::const_(nn("Quot", "ind"), vec![]);
+    for arg in [
+        Expr::const_(n("A"), vec![]),
+        Expr::const_(n("R"), vec![]),
+        Expr::const_(n("Mo"), vec![]),
+        Expr::const_(n("P"), vec![]),
+        quot_mk_a(),
+    ] {
+        ind = Expr::app(ind, arg);
+    }
+    let p_a = Expr::app(Expr::const_(n("P"), vec![]), Expr::const_(n("a"), vec![]));
+    assert!(
+        check_def_eq(&env, &[], &ind, &p_a, Budget::DEFAULT).is_accepted(),
+        "Quot.ind computes: ind p (mk r a) ≟ p a"
+    );
+}
+
+#[test]
+fn kr955_quot_computation_preserves_trailing_args_and_requires_a_saturated_mk() {
+    let env = add_quot(&Environment::new());
+    // Trailing argument: motive B := fun _ => (B → B) shape is overkill; reuse
+    // f : A → B and apply the lift result is already B. Instead check the
+    // under-saturated mk: `Quot.lift A R B f hp (Quot.mk A R)` must be STUCK
+    // (mk has 2 args, not 3), not wrongly reduced.
+    let mut partial_mk = Expr::const_(nn("Quot", "mk"), vec![]);
+    for arg in [Expr::const_(n("A"), vec![]), Expr::const_(n("R"), vec![])] {
+        partial_mk = Expr::app(partial_mk, arg);
+    }
+    let mut lift = Expr::const_(nn("Quot", "lift"), vec![]);
+    for arg in [
+        Expr::const_(n("A"), vec![]),
+        Expr::const_(n("R"), vec![]),
+        Expr::const_(n("B"), vec![]),
+        Expr::const_(n("f"), vec![]),
+        Expr::const_(n("hp"), vec![]),
+        partial_mk,
+    ] {
+        lift = Expr::app(lift, arg);
+    }
+    let f_alone = Expr::const_(n("f"), vec![]);
+    assert_eq!(
+        reject_class(&check_def_eq(&env, &[], &lift, &f_alone, Budget::DEFAULT)),
+        Some(RejectClass::NotDefEq),
+        "an under-saturated Quot.mk must not fire quotient computation"
+    );
+    // Trailing argument preservation: Quot.ind with one extra argument after the
+    // mk — `Quot.ind A R Mo P (mk …) extra ≟ P a extra`.
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("extra"),
+                level_params: vec![],
+                type_: Expr::const_(n("B"), vec![]),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let mut ind = Expr::const_(nn("Quot", "ind"), vec![]);
+    for arg in [
+        Expr::const_(n("A"), vec![]),
+        Expr::const_(n("R"), vec![]),
+        Expr::const_(n("Mo"), vec![]),
+        Expr::const_(n("P"), vec![]),
+        quot_mk_a(),
+        Expr::const_(n("extra"), vec![]),
+    ] {
+        ind = Expr::app(ind, arg);
+    }
+    let expected = Expr::app(
+        Expr::app(Expr::const_(n("P"), vec![]), Expr::const_(n("a"), vec![])),
+        Expr::const_(n("extra"), vec![]),
+    );
+    assert!(
+        check_def_eq(&env, &[], &ind, &expected, Budget::DEFAULT).is_accepted(),
+        "trailing arguments after the mk position are preserved"
+    );
+}
+
+#[test]
+fn kr316_parameterized_iota_takes_the_last_nfields_arguments() {
+    // `Opt` has one parameter, so a constructor application's spine is
+    // [param, field]. The rule must receive the LAST nfields arguments (the
+    // field x), never the leading parameter — kills a fields-slice-offset
+    // mutant that num_params = 0 fixtures cannot see.
+    let a_ty = || Expr::const_(n("AT"), vec![]);
+    let opt = |arg: Expr| Expr::app(Expr::const_(n("Opt"), vec![]), arg);
+    let env = add_info(
+        &Environment::new(),
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("AT"),
+                level_params: vec![],
+                type_: sort1(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    // Opt : Sort 1 → Sort 1, one ctor `Opt.some : ∀ (A : Sort 1) (a : A), Opt A`.
+    let env = add_info(
+        &env,
+        ConstantInfo::Induct(InductiveVal {
+            base: ConstantVal {
+                name: n("Opt"),
+                level_params: vec![],
+                type_: Expr::forall_e(n("A"), sort1(), sort1(), BinderInfo::Default),
+            },
+            num_params: 1,
+            num_indices: 0,
+            all: vec![n("Opt")],
+            ctors: vec![nn("Opt", "some")],
+            num_nested: 0,
+            is_rec: false,
+            is_unsafe: false,
+            is_reflexive: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Ctor(ConstructorVal {
+            base: ConstantVal {
+                name: nn("Opt", "some"),
+                level_params: vec![],
+                type_: Expr::forall_e(
+                    n("A"),
+                    sort1(),
+                    Expr::forall_e(
+                        n("a"),
+                        Expr::bvar(0).expect("packs"),
+                        Expr::app(
+                            Expr::const_(n("Opt"), vec![]),
+                            Expr::bvar(1).expect("packs"),
+                        ),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+            },
+            induct: n("Opt"),
+            cidx: 0,
+            num_params: 1,
+            num_fields: 1,
+            is_unsafe: false,
+        }),
+    );
+    let u = n("u");
+    // motive : Opt A → Sort u (with A = the bvar of the enclosing param binder).
+    // Opt.rec.{u} : ∀ (A : Sort 1) (motive : Opt A → Sort u)
+    //                 (msome : ∀ (a : A), motive (Opt.some A a)) (t : Opt A), motive t
+    let rec_ty = Expr::forall_e(
+        n("A"),
+        sort1(),
+        Expr::forall_e(
+            n("motive"),
+            Expr::forall_e(
+                n("t"),
+                opt(Expr::bvar(0).expect("packs")),
+                Expr::sort(Level::param(u.clone())),
+                BinderInfo::Default,
+            ),
+            Expr::forall_e(
+                n("msome"),
+                Expr::forall_e(
+                    n("a"),
+                    Expr::bvar(1).expect("packs"),
+                    Expr::app(
+                        Expr::bvar(1).expect("packs"),
+                        Expr::app(
+                            Expr::app(
+                                Expr::const_(nn("Opt", "some"), vec![]),
+                                Expr::bvar(2).expect("packs"),
+                            ),
+                            Expr::bvar(0).expect("packs"),
+                        ),
+                    ),
+                    BinderInfo::Default,
+                ),
+                Expr::forall_e(
+                    n("t"),
+                    opt(Expr::bvar(2).expect("packs")),
+                    Expr::app(Expr::bvar(2).expect("packs"), Expr::bvar(0).expect("packs")),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    // rule rhs: fun A motive msome a => msome a
+    let rhs = Expr::lam(
+        n("A"),
+        sort1(),
+        Expr::lam(
+            n("motive"),
+            Expr::forall_e(
+                n("t"),
+                opt(Expr::bvar(0).expect("packs")),
+                Expr::sort(Level::param(u.clone())),
+                BinderInfo::Default,
+            ),
+            Expr::lam(
+                n("msome"),
+                Expr::forall_e(
+                    n("a"),
+                    Expr::bvar(1).expect("packs"),
+                    Expr::app(
+                        Expr::bvar(1).expect("packs"),
+                        Expr::app(
+                            Expr::app(
+                                Expr::const_(nn("Opt", "some"), vec![]),
+                                Expr::bvar(2).expect("packs"),
+                            ),
+                            Expr::bvar(0).expect("packs"),
+                        ),
+                    ),
+                    BinderInfo::Default,
+                ),
+                Expr::lam(
+                    n("a"),
+                    // a : A — at scope [A, motive, msome], A is bvar 2.
+                    Expr::bvar(2).expect("packs"),
+                    Expr::app(Expr::bvar(1).expect("packs"), Expr::bvar(0).expect("packs")),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Rec(RecursorVal {
+            base: ConstantVal {
+                name: nn("Opt", "rec"),
+                level_params: vec![u],
+                type_: rec_ty,
+            },
+            all: vec![n("Opt")],
+            num_params: 1,
+            num_indices: 0,
+            num_motives: 1,
+            num_minors: 1,
+            rules: vec![RecursorRule {
+                ctor: nn("Opt", "some"),
+                nfields: 1,
+                rhs,
+            }],
+            k: false,
+            is_unsafe: false,
+        }),
+    );
+    // OM : Opt AT → Sort 1; om : ∀ (a : AT), OM (Opt.some AT a); x : AT.
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("OM"),
+                level_params: vec![],
+                type_: Expr::forall_e(n("t"), opt(a_ty()), sort1(), BinderInfo::Default),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("om"),
+                level_params: vec![],
+                type_: Expr::forall_e(
+                    n("a"),
+                    a_ty(),
+                    Expr::app(
+                        Expr::const_(n("OM"), vec![]),
+                        Expr::app(
+                            Expr::app(Expr::const_(nn("Opt", "some"), vec![]), a_ty()),
+                            Expr::bvar(0).expect("packs"),
+                        ),
+                    ),
+                    BinderInfo::Default,
+                ),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let env = add_info(
+        &env,
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("x"),
+                level_params: vec![],
+                type_: a_ty(),
+            },
+            is_unsafe: false,
+        }),
+    );
+    let some_x = Expr::app(
+        Expr::app(Expr::const_(nn("Opt", "some"), vec![]), a_ty()),
+        Expr::const_(n("x"), vec![]),
+    );
+    let mut lhs = Expr::const_(nn("Opt", "rec"), vec![Level::one()]);
+    for arg in [
+        a_ty(),
+        Expr::const_(n("OM"), vec![]),
+        Expr::const_(n("om"), vec![]),
+        some_x,
+    ] {
+        lhs = Expr::app(lhs, arg);
+    }
+    let om_x = Expr::app(Expr::const_(n("om"), vec![]), Expr::const_(n("x"), vec![]));
+    assert!(
+        check_def_eq(&env, &[], &lhs, &om_x, Budget::DEFAULT).is_accepted(),
+        "the rule receives the FIELD x, not the leading parameter"
+    );
+    let om_a = Expr::app(Expr::const_(n("om"), vec![]), a_ty());
+    assert_eq!(
+        reject_class(&check_def_eq(&env, &[], &lhs, &om_a, Budget::DEFAULT)),
+        Some(RejectClass::NotDefEq),
+        "…and NOT the parameter AT (the fields-offset mutant's output)"
     );
 }

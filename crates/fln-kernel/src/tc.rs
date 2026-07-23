@@ -1,14 +1,17 @@
 //! K1 bootstrap: the certified checker's typing, reduction, and defeq core
 //! (bead franken_lean-zht; every rule tagged to KERNEL_CONTRACT.md).
 //!
-//! Slice scope (recorded on the bead): the non-inductive judgment fragment —
-//! KR-100..112 typing, whnf with beta/zeta/mdata/proj/delta (KR-200..204),
-//! defeq with quick/bindings/levels/proof-irrelevance/lazy-delta/function-eta/
-//! app-congruence (KR-300..312 subset), and declaration admission for axioms,
-//! definitions, and theorems (KR-970..974). Iota/quot/K (KR-316/317/955), Nat/String
-//! acceleration (KR-313/314), structure eta (KR-903), opaque/mutual admission, and
-//! receipts are follow-up slices; none of their absence widens acceptance — an
-//! unimplemented reduction can only make defeq FAIL (a rejection), never succeed.
+//! Slice scope (recorded on beads franken_lean-zht + franken_lean-5p2):
+//! KR-100..112 typing, whnf with beta/zeta/mdata/proj/delta (KR-200..204) and
+//! recursor dispatch (KR-205) — quotient computation (KR-955), inductive iota
+//! (KR-316) with K conversion (KR-317), Nat-literal-to-constructor, and
+//! structure-eta coercion — defeq with quick/bindings/levels/proof-irrelevance/
+//! lazy-delta/function-eta/app-congruence (KR-300..312 subset), and declaration
+//! admission for axioms, definitions, and theorems (KR-970..974). Nat/String
+//! acceleration (KR-313/314), unit-like eta (KR-315), structure eta in defeq
+//! (KR-903), opaque/mutual admission, and receipts are follow-up slices; none of
+//! their absence widens acceptance — an unimplemented reduction can only make
+//! defeq FAIL (a rejection), never succeed.
 //!
 //! Traversal discipline (§8.2c): every recursive descent charges the step budget
 //! and carries an explicit depth that is checked BEFORE descending, so
@@ -16,10 +19,12 @@
 //! fault. Flag pruning (loose-bvar ranges, has-level-param) keeps substitution
 //! linear in the touched region only.
 
-use fln_core::expr::{Expr, ExprNode, FVarId};
+use fln_core::expr::{Expr, ExprNode, FVarId, Literal, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;
-use fln_env::constants::{ConstantInfo, DefinitionSafety, ReducibilityHints};
+use fln_env::constants::{
+    ConstantInfo, DefinitionSafety, QuotKind, RecursorVal, ReducibilityHints,
+};
 use fln_env::environment::Environment;
 
 use crate::verdict::{Budget, Consumption, ExhaustionReason, RejectClass};
@@ -305,15 +310,8 @@ impl<'a> TypeChecker<'a> {
             }
             ExprNode::App { .. } => {
                 // Collect the spine, whnf the head, then KR-202 batched beta.
-                let mut args: Vec<Expr> = Vec::new();
-                let mut head = e.clone();
-                while let ExprNode::App { f, a } = head.node() {
-                    args.push(a.clone());
-                    let next = f.clone();
-                    head = next;
-                }
-                args.reverse();
-                let head = self.whnf_core(&head, depth + 1)?;
+                let (head0, args) = app_spine(e);
+                let head = self.whnf_core(&head0, depth + 1)?;
                 if matches!(head.node(), ExprNode::Lam { .. }) {
                     let mut current = head;
                     let mut consumed = 0usize;
@@ -333,12 +331,21 @@ impl<'a> TypeChecker<'a> {
                         current = Expr::app(current, arg.clone());
                     }
                     self.whnf_core(&current, depth + 1)?
+                } else if head == head0 {
+                    // KR-205: the head is stable — try quotient computation, then
+                    // inductive iota, on the original application.
+                    match self.reduce_recursor(e, depth + 1)? {
+                        Some(reduced) => self.whnf_core(&reduced, depth + 1)?,
+                        None => e.clone(),
+                    }
                 } else {
+                    // The head changed (let-fvar zeta, mdata strip): rebuild and
+                    // continue, as the pin re-enters whnf_core on the update.
                     let mut rebuilt = head;
                     for arg in args {
                         rebuilt = Expr::app(rebuilt, arg);
                     }
-                    rebuilt
+                    self.whnf_core(&rebuilt, depth + 1)?
                 }
             }
             ExprNode::Proj {
@@ -429,6 +436,295 @@ impl<'a> TypeChecker<'a> {
             }
             _ => None,
         }
+    }
+
+    // ---- recursor reduction (KR-205/316/317/955) ---------------------------------------
+
+    /// KR-205 (`reduce_recursor`): when an application head is stable, try
+    /// quotient computation first, then inductive iota. `None` means no rule
+    /// fires — the term is simply stuck, never an error.
+    fn reduce_recursor(&mut self, e: &Expr, depth: u32) -> KResult<Option<Expr>> {
+        self.step(depth)?;
+        if let Some(reduced) = self.quot_reduce_rec(e, depth)? {
+            return Ok(Some(reduced));
+        }
+        self.inductive_reduce_rec(e, depth)
+    }
+
+    /// KR-955 (`quot_reduce_rec`): `Quot.lift f h (Quot.mk r a) ⟶ f a` (mk at
+    /// argument 5, f at 3); `Quot.ind p (Quot.mk r a) ⟶ p a` (mk at 4, p at 3);
+    /// trailing arguments preserved. Dispatch is by the head constant's
+    /// environment kind (`QuotKind::Lift`/`Ind`, scrutinee head `QuotKind::Ctor`
+    /// with exactly three arguments), so the lane is active exactly when
+    /// quotients are initialized in this environment.
+    fn quot_reduce_rec(&mut self, e: &Expr, depth: u32) -> KResult<Option<Expr>> {
+        let (head, args) = app_spine(e);
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(None);
+        };
+        let kind = match self.env.find(name) {
+            Some(ConstantInfo::Quot(quot)) => quot.kind,
+            _ => return Ok(None),
+        };
+        let (mk_pos, arg_pos) = match kind {
+            QuotKind::Lift => (5usize, 3usize),
+            QuotKind::Ind => (4, 3),
+            QuotKind::Type | QuotKind::Ctor => return Ok(None),
+        };
+        if args.len() <= mk_pos {
+            return Ok(None);
+        }
+        let mk = self.whnf(&args[mk_pos], depth + 1)?;
+        let (mk_head, mk_args) = app_spine(&mk);
+        let ExprNode::Const { name: mk_name, .. } = mk_head.node() else {
+            return Ok(None);
+        };
+        let mk_is_quot_ctor = matches!(
+            self.env.find(mk_name),
+            Some(ConstantInfo::Quot(quot)) if quot.kind == QuotKind::Ctor
+        );
+        if !mk_is_quot_ctor || mk_args.len() != 3 {
+            return Ok(None);
+        }
+        // `Quot.mk r a`'s last argument is the underlying element.
+        let mut reduced = Expr::app(args[arg_pos].clone(), mk_args[2].clone());
+        for extra in &args[mk_pos + 1..] {
+            reduced = Expr::app(reduced, extra.clone());
+        }
+        Ok(Some(reduced))
+    }
+
+    /// KR-316 (`inductive_reduce_rec`): a recursor application fires when its
+    /// major premise — at `nparams + nmotives + nminors + nindices` — reduces to
+    /// a constructor of the right inductive, after K conversion (KR-317) and
+    /// Nat-literal-to-constructor / structure-eta coercion. The matching rule's
+    /// right-hand side is instantiated with the recursor's levels and applied to
+    /// params+motives+minors from the recursor spine, the constructor's fields,
+    /// and the trailing arguments. String-literal expansion (KR-314) is a
+    /// follow-up slice: an unexpanded literal only fails to reduce
+    /// (under-acceptance), never over-accepts.
+    fn inductive_reduce_rec(&mut self, e: &Expr, depth: u32) -> KResult<Option<Expr>> {
+        let (head, rec_args) = app_spine(e);
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Rec(rec)) = self.env.find(name) else {
+            return Ok(None);
+        };
+        let rec = rec.clone();
+        let levels = levels.clone();
+        let major_idx =
+            (rec.num_params + rec.num_motives + rec.num_minors + rec.num_indices) as usize;
+        if rec_args.len() <= major_idx {
+            return Ok(None);
+        }
+        let mut major = rec_args[major_idx].clone();
+        if rec.k {
+            major = self.major_to_cnstr_when_k(&rec, &major, depth)?;
+        }
+        major = self.whnf(&major, depth + 1)?;
+        match major.node() {
+            ExprNode::Lit {
+                literal: Literal::Nat(value),
+            } => {
+                major = nat_lit_to_constructor(value);
+            }
+            ExprNode::Lit {
+                literal: Literal::Str(_),
+            } => return Ok(None),
+            _ => major = self.major_to_cnstr_when_structure(&rec, &major, depth)?,
+        }
+        let (major_head, major_args) = app_spine(&major);
+        let ExprNode::Const {
+            name: ctor_name, ..
+        } = major_head.node()
+        else {
+            return Ok(None);
+        };
+        let Some(rule) = rec.rules.iter().find(|rule| &rule.ctor == ctor_name) else {
+            return Ok(None);
+        };
+        let nfields = rule.nfields as usize;
+        if nfields > major_args.len() {
+            return Ok(None);
+        }
+        if levels.len() != rec.base.level_params.len() {
+            return Ok(None);
+        }
+        let mut rhs =
+            self.instantiate_lparams(&rule.rhs, &rec.base.level_params, &levels, depth + 1)?;
+        // Params, motives, and minors come from the recursor application (the
+        // indices are consumed by the motive, never applied to the rule).
+        let from_rec = (rec.num_params + rec.num_motives + rec.num_minors) as usize;
+        for arg in rec_args.iter().take(from_rec) {
+            rhs = Expr::app(rhs, arg.clone());
+        }
+        // The constructor's parameter count can differ from the recursor's under
+        // nested inductives: the fields are always the LAST `nfields` arguments.
+        for field in &major_args[major_args.len() - nfields..] {
+            rhs = Expr::app(rhs, field.clone());
+        }
+        for extra in &rec_args[major_idx + 1..] {
+            rhs = Expr::app(rhs, extra.clone());
+        }
+        Ok(Some(rhs))
+    }
+
+    /// `recursor_val::get_major_induct` (declaration.cpp:145): walk `major_idx`
+    /// binders of the recursor's type; the next binder's domain head names the
+    /// inductive of the major premise.
+    fn recursor_major_induct(&mut self, rec: &RecursorVal, depth: u32) -> KResult<Option<Name>> {
+        let major_idx = rec.num_params + rec.num_motives + rec.num_minors + rec.num_indices;
+        let mut telescope = rec.base.type_.clone();
+        for _ in 0..major_idx {
+            self.step(depth)?;
+            let ExprNode::ForallE { body, .. } = telescope.node() else {
+                return Ok(None);
+            };
+            telescope = body.clone();
+        }
+        let ExprNode::ForallE { binder_type, .. } = telescope.node() else {
+            return Ok(None);
+        };
+        let (head, _) = app_spine(binder_type);
+        match head.node() {
+            ExprNode::Const { name, .. } => Ok(Some(name.clone())),
+            _ => Ok(None),
+        }
+    }
+
+    /// KR-317 (`to_cnstr_when_K`): a K-flagged recursor replaces any major
+    /// premise whose (whnf'd, inferred) type has the recursor's inductive at its
+    /// head with the nullary constructor of that type — gated on the constructed
+    /// term's type being defeq to the major's. Any gate failure returns the
+    /// original major unchanged (reduction without matching the syntactic proof).
+    fn major_to_cnstr_when_k(
+        &mut self,
+        rec: &RecursorVal,
+        major: &Expr,
+        depth: u32,
+    ) -> KResult<Expr> {
+        let Some(major_induct) = self.recursor_major_induct(rec, depth)? else {
+            return Ok(major.clone());
+        };
+        let app_type = match self.infer(major, depth) {
+            Ok(type_) => type_,
+            Err(Stop::Reject(..)) => return Ok(major.clone()),
+            Err(stop) => return Err(stop),
+        };
+        let app_type = self.whnf(&app_type, depth + 1)?;
+        let (type_head, type_args) = app_spine(&app_type);
+        let ExprNode::Const {
+            name: type_name,
+            levels: type_levels,
+        } = type_head.node()
+        else {
+            return Ok(major.clone());
+        };
+        if type_name != &major_induct {
+            return Ok(major.clone());
+        }
+        // `mk_nullary_cnstr`: the FIRST constructor, applied to the type's params.
+        let ctor_name = match self.env.find(type_name) {
+            Some(ConstantInfo::Induct(ind)) => match ind.ctors.first() {
+                Some(ctor_name) => ctor_name.clone(),
+                None => return Ok(major.clone()),
+            },
+            _ => return Ok(major.clone()),
+        };
+        let mut new_ctor = Expr::const_(ctor_name, type_levels.clone());
+        for arg in type_args.iter().take(rec.num_params as usize) {
+            new_ctor = Expr::app(new_ctor, arg.clone());
+        }
+        let new_type = match self.infer(&new_ctor, depth) {
+            Ok(type_) => type_,
+            Err(Stop::Reject(..)) => return Ok(major.clone()),
+            Err(stop) => return Err(stop),
+        };
+        if !self.is_def_eq(&app_type, &new_type, depth + 1)? {
+            return Ok(major.clone());
+        }
+        Ok(new_ctor)
+    }
+
+    /// KR-316's structure-eta coercion (`to_cnstr_when_structure`): a major of a
+    /// one-constructor, index-free, non-recursive, non-Prop structure type that
+    /// is not already a constructor application becomes
+    /// `mk params (proj 0 major) … (proj n-1 major)`. Any gate failure returns
+    /// the original major unchanged.
+    fn major_to_cnstr_when_structure(
+        &mut self,
+        rec: &RecursorVal,
+        major: &Expr,
+        depth: u32,
+    ) -> KResult<Expr> {
+        let Some(induct_name) = self.recursor_major_induct(rec, depth)? else {
+            return Ok(major.clone());
+        };
+        match self.env.find(&induct_name) {
+            Some(ConstantInfo::Induct(ind))
+                if ind.ctors.len() == 1 && ind.num_indices == 0 && !ind.is_rec => {}
+            _ => return Ok(major.clone()),
+        }
+        let (major_head, _) = app_spine(major);
+        if let ExprNode::Const { name, .. } = major_head.node()
+            && matches!(self.env.find(name), Some(ConstantInfo::Ctor(_)))
+        {
+            return Ok(major.clone());
+        }
+        let e_type = match self.infer(major, depth) {
+            Ok(type_) => type_,
+            Err(Stop::Reject(..)) => return Ok(major.clone()),
+            Err(stop) => return Err(stop),
+        };
+        let e_type = self.whnf(&e_type, depth + 1)?;
+        let (type_head, type_args) = app_spine(&e_type);
+        let ExprNode::Const {
+            name: type_name,
+            levels: type_levels,
+        } = type_head.node()
+        else {
+            return Ok(major.clone());
+        };
+        if type_name != &induct_name {
+            return Ok(major.clone());
+        }
+        // Prop-valued structures are excluded (proof irrelevance covers them).
+        let type_sort = match self.infer(&e_type, depth) {
+            Ok(sort) => sort,
+            Err(Stop::Reject(..)) => return Ok(major.clone()),
+            Err(stop) => return Err(stop),
+        };
+        let type_sort = self.whnf(&type_sort, depth + 1)?;
+        if matches!(type_sort.node(), ExprNode::Sort { level } if level.is_equiv(&Level::zero())) {
+            return Ok(major.clone());
+        }
+        // `expand_eta_struct`: ctor params from the type, then one proj per field.
+        let (ctor_name, ctor_num_params, num_fields) = {
+            let ctor_name = match self.env.find(&induct_name) {
+                Some(ConstantInfo::Induct(ind)) => match ind.ctors.first() {
+                    Some(ctor_name) => ctor_name.clone(),
+                    None => return Ok(major.clone()),
+                },
+                _ => return Ok(major.clone()),
+            };
+            match self.env.find(&ctor_name) {
+                Some(ConstantInfo::Ctor(ctor)) => (
+                    ctor_name,
+                    ctor.num_params as usize,
+                    u64::from(ctor.num_fields),
+                ),
+                _ => return Ok(major.clone()),
+            }
+        };
+        let mut expanded = Expr::const_(ctor_name, type_levels.clone());
+        for arg in type_args.iter().take(ctor_num_params) {
+            expanded = Expr::app(expanded, arg.clone());
+        }
+        for i in 0..num_fields {
+            expanded = Expr::app(expanded, Expr::proj(induct_name.clone(), i, major.clone()));
+        }
+        Ok(expanded)
     }
 
     // ---- defeq (KR-300..312 subset) ----------------------------------------------------
@@ -1157,6 +1453,42 @@ impl<'a> TypeChecker<'a> {
         }
         Ok(result)
     }
+}
+
+/// Split an application spine into `(head, args-left-to-right)`.
+fn app_spine(e: &Expr) -> (Expr, Vec<Expr>) {
+    let mut args: Vec<Expr> = Vec::new();
+    let mut head = e.clone();
+    while let ExprNode::App { f, a } = head.node() {
+        args.push(a.clone());
+        let next = f.clone();
+        head = next;
+    }
+    args.reverse();
+    (head, args)
+}
+
+/// `nat_lit_to_constructor` (inductive.cpp:1191): `0 ⟶ Nat.zero`,
+/// `n ⟶ Nat.succ (n-1 : literal)` for `n > 0`. The decrement is a plain limb
+/// borrow walk — value identity only, no bignum-arithmetic dependency.
+fn nat_lit_to_constructor(value: &NatLit) -> Expr {
+    let nat = Name::str(Name::anonymous(), "Nat");
+    if value.to_u64() == Some(0) {
+        return Expr::const_(Name::str(nat, "zero"), Vec::new());
+    }
+    let mut limbs = value.limbs_le().to_vec();
+    for limb in limbs.iter_mut() {
+        if *limb > 0 {
+            *limb -= 1;
+            break;
+        }
+        *limb = u64::MAX;
+    }
+    let pred = NatLit::from_limbs_le(limbs);
+    Expr::app(
+        Expr::const_(Name::str(nat, "succ"), Vec::new()),
+        Expr::lit(Literal::Nat(pred)),
+    )
 }
 
 /// Level-parameter substitution (pure, structural).

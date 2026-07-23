@@ -10,9 +10,10 @@
 //! receipt and literal slices); zero I/O, zero threads, zero global mutable state,
 //! zero plugin hooks; the ≤ 12 KLOC covenant is CI-enforced by structure-guard.
 //!
-//! K1 slice scope (recorded on the bead): the non-inductive judgment fragment of
-//! KERNEL_CONTRACT.md — typing KR-100..112, whnf KR-200..204, defeq subset
-//! KR-300..312, admission KR-970..974 for axioms/definitions/theorems. Every
+//! K1 slice scope (beads franken_lean-zht + franken_lean-5p2): typing
+//! KR-100..112, whnf KR-200..205 with recursor computation — quotient reduction
+//! KR-955, inductive iota KR-316, K conversion KR-317 — defeq subset KR-300..312,
+//! admission KR-970..974 for axioms/definitions/theorems. Every
 //! exhaustion is a typed [`verdict::Verdict::Inconclusive`] carrying its
 //! consumption profile (FL-INV-07); an unimplemented reduction can only cause a
 //! rejection, never an acceptance.
