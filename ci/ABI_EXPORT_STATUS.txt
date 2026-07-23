@@ -44,21 +44,21 @@ row lean_apply_8 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closu
 row lean_apply_9 | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
 row lean_apply_m | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
 row lean_apply_n | Unsupported | franken_lean-7xe | census (fln-rt::abi) | closure application needs the Golem apply machinery
-row lean_array_get_panic | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_array_mk | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_array_push | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_array_set_panic | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_array_to_list | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_array_get_panic | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | panic_fn with the pin's exact message (object.cpp:499-501)
+row lean_array_mk | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | native List walk (upstream delegates to Lean-compiled lean_list_to_array); same ownership balance, gauntlet-differenced
+row lean_array_push | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | exclusivity fast path + exact (cap+1)*2 growth law (object.cpp:2674-2715)
+row lean_array_set_panic | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | dec(v) then panic_fn with the pin's exact message (object.cpp:503-506)
+row lean_array_to_list | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | native cons-chain build (upstream delegates to Lean-compiled impl); gauntlet-differenced
 row lean_big_int64_to_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
 row lean_big_int_to_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
 row lean_big_int_to_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
 row lean_big_size_t_to_int | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
 row lean_big_uint64_to_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
 row lean_big_usize_to_nat | Unsupported | fln-bignum shim | census (fln-rt::abi) | kernel-grade bignum arithmetic (Crucible workstream)
-row lean_byte_array_data | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_byte_array_data | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | sarray to boxed-UInt8 array (object.cpp:2562-2573)
 row lean_byte_array_hash | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_byte_array_mk | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_byte_array_push | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_byte_array_mk | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | boxed-UInt8 array to sarray (object.cpp:2549-2560)
+row lean_byte_array_push | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | ensure-capacity x2 growth + ensure-exclusive + append (object.cpp:2526-2582)
 row lean_copy_byte_array | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_copy_expand_array | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_copy_expand_array_nonlinear | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
@@ -201,12 +201,12 @@ row lean_st_ref_set | Unsupported | franken_lean-83r | census (fln-rt::abi) | la
 row lean_st_ref_swap | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_append | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_compare | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_string_data | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_data | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | next_utf8 decode incl. invalid-byte fallback; consumes via dec_ref exactly as upstream
 row lean_string_eq_cold | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | byte compare over m_size bytes
-row lean_string_hash | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_hash | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | MurmurHash64A over content bytes, seed 11 (hash.cpp:15-59, object.cpp:2450-2454)
 row lean_string_lt | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_memcmp | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
-row lean_string_mk | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
+row lean_string_mk | CompatWrapper | crates/fln-unsafe-abi/src/export.rs | export parity suites (tests.rs export_*); stage0 gauntlet lane (marrow_stage0_gauntlet.sh) | List Char UTF-8 encode via the pin's push_unicode_scalar (utf8.cpp:300-320)
 row lean_string_of_usize | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_push | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins
 row lean_string_utf8_extract | Unsupported | franken_lean-83r | census (fln-rt::abi) | later export slice over the existing object-model twins

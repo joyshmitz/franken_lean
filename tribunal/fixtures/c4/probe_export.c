@@ -109,6 +109,77 @@ static void facts_mode(void) {
     lean_inc(p); /* persistent objects are never counted */
     fact("rc.persistent.after_inc", p->m_rc);
     /* deliberately leaked, exactly as compact-region residents are */
+
+    /* ---- slice 2: List ⇄ Array through the exported conversions */
+    lean_object *lst = lean_box(0);
+    for (int i = 3; i >= 1; i--) { /* [10, 20, 30] */
+        lean_object *cell = lean_alloc_ctor(1, 2, 0);
+        lean_ctor_set(cell, 0, lean_box(10 * i));
+        lean_ctor_set(cell, 1, lst);
+        lst = cell;
+    }
+    lean_object *am = lean_array_mk(lst);
+    fact("array_mk.size", (long long)lean_array_size(am));
+    fact("array_mk.capacity", (long long)lean_array_capacity(am));
+    fact("array_mk.elem0", (long long)lean_unbox(lean_array_cptr(am)[0]));
+    fact("array_mk.elem2", (long long)lean_unbox(lean_array_cptr(am)[2]));
+    lean_object *back = lean_array_to_list(am);
+    long long list_sum = 0, list_len = 0;
+    for (lean_object *c2 = back; !lean_is_scalar(c2); c2 = lean_ctor_get(c2, 1)) {
+        list_sum += lean_unbox(lean_ctor_get(c2, 0));
+        list_len++;
+    }
+    fact("array_to_list.len", list_len);
+    fact("array_to_list.sum", list_sum);
+    lean_dec(back);
+
+    /* ---- slice 2: the exact push growth laws */
+    lean_object *pa = lean_alloc_array(0, 0);
+    for (int i = 0; i < 3; i++) pa = lean_array_push(pa, lean_box(i));
+    fact("array_push.size", (long long)lean_array_size(pa));
+    fact("array_push.capacity", (long long)lean_array_capacity(pa));
+    lean_inc(pa); /* shared push takes the nonlinear copy path */
+    lean_object *pb = lean_array_push(pa, lean_box(9));
+    fact("array_push.shared.orig_size", (long long)lean_array_size(pa));
+    fact("array_push.shared.new_size", (long long)lean_array_size(pb));
+    fact("array_push.shared.new_capacity", (long long)lean_array_capacity(pb));
+    lean_dec(pb);
+    lean_dec(pa);
+
+    /* ---- slice 2: byte arrays */
+    lean_object *bsrc = lean_alloc_array(3, 3);
+    lean_array_cptr(bsrc)[0] = lean_box(7);
+    lean_array_cptr(bsrc)[1] = lean_box(8);
+    lean_array_cptr(bsrc)[2] = lean_box(9);
+    lean_object *bm = lean_byte_array_mk(bsrc);
+    fact("byte_array_mk.size", (long long)lean_sarray_size(bm));
+    fact("byte_array_mk.bytesum", bytesum((char const *)lean_sarray_cptr(bm), 3));
+    bm = lean_byte_array_push(bm, 0xAB);
+    fact("byte_array_push.size", (long long)lean_sarray_size(bm));
+    fact("byte_array_push.capacity", (long long)lean_sarray_capacity(bm));
+    lean_object *bd = lean_byte_array_data(bm);
+    fact("byte_array_data.size", (long long)lean_array_size(bd));
+    fact("byte_array_data.elem3", (long long)lean_unbox(lean_array_cptr(bd)[3]));
+    lean_dec(bd);
+
+    /* ---- slice 2: String ⇄ List Char + the hash */
+    lean_object *sm = lean_mk_string("h\xc3\xa9llo");
+    uint64_t hh = lean_string_hash(sm);
+    fact("string_hash.hi", (long long)(hh >> 32));
+    fact("string_hash.lo", (long long)(hh & 0xFFFFFFFFu));
+    lean_inc(sm);
+    lean_object *chars = lean_string_data(sm);
+    long long char_len = 0, char_sum = 0;
+    for (lean_object *c3 = chars; !lean_is_scalar(c3); c3 = lean_ctor_get(c3, 1)) {
+        char_sum += lean_unbox(lean_ctor_get(c3, 0));
+        char_len++;
+    }
+    fact("string_data.len", char_len);
+    fact("string_data.codesum", char_sum);
+    lean_object *sm2 = lean_string_mk(chars);
+    fact("string_mk.roundtrip_eq", lean_string_eq(sm, sm2));
+    lean_dec(sm);
+    lean_dec(sm2);
 }
 
 int main(int argc, char **argv) {

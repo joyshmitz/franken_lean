@@ -727,6 +727,474 @@ pub(crate) extern "C" fn export_lean_string_eq_cold(
     }
 }
 
+// ---- slice 2: array / byte-array / string-conversion families ----------------
+// Demand-driven growth (stage0 demand audit): exact ports of the upstream
+// bodies. Where upstream delegates to Lean-compiled helpers
+// (`lean_list_to_array` / `lean_array_to_list_impl`), the twin walks the
+// List cells natively — same observable result, proven by the gauntlet
+// differential against libleanshared.
+
+/// `lean_inc` shape for raw children.
+///
+/// # Safety
+/// `o` valid object pointer or boxed scalar.
+// UNSAFE-LEDGER: FLN-UL-0113
+#[allow(unsafe_code)]
+unsafe fn inc(o: *mut LeanObject) {
+    if !is_scalar(o) {
+        // SAFETY: live non-scalar object per caller contract.
+        unsafe { rc::inc_ref_n(o, 1) };
+    }
+}
+
+/// `lean_dec` shape for raw children.
+///
+/// # Safety
+/// `o` valid object pointer or boxed scalar; one owned reference yielded.
+// UNSAFE-LEDGER: FLN-UL-0114
+#[allow(unsafe_code)]
+unsafe fn dec(o: *mut LeanObject) {
+    if !is_scalar(o) {
+        // SAFETY: live non-scalar object; caller yields one reference.
+        unsafe { rc::dec_ref(o) };
+    }
+}
+
+/// `lean_is_exclusive` (`lean.h:612-618`): single-threaded and rc == 1.
+///
+/// # Safety
+/// `o` live non-scalar object.
+// UNSAFE-LEDGER: FLN-UL-0115
+#[allow(unsafe_code)]
+unsafe fn is_exclusive(o: *mut LeanObject) -> bool {
+    // SAFETY: header read on a live object.
+    let h = unsafe { rc::read_header(o) };
+    h.rc == 1
+}
+
+/// Array object-slot base (`lean_array_cptr`, `lean.h:863`).
+///
+/// # Safety
+/// `o` live array object.
+// UNSAFE-LEDGER: FLN-UL-0116
+#[allow(unsafe_code)]
+unsafe fn array_data(o: *mut LeanObject) -> *mut *mut LeanObject {
+    use crate::layout::LeanArrayObject;
+    // SAFETY: repr(C) mirror; m_data follows the fixed fields.
+    unsafe { (&raw mut (*o.cast::<LeanArrayObject>()).m_data).cast::<*mut LeanObject>() }
+}
+
+/// `lean_copy_expand_array` (`object.cpp:2674-2697`): copy with optional
+/// `(cap+1)*2` growth; an exclusive source transfers element ownership and
+/// its block is released without touching the children.
+///
+/// # Safety
+/// `a` live array whose reference the caller yields.
+// UNSAFE-LEDGER: FLN-UL-0117
+#[allow(unsafe_code)]
+unsafe fn copy_expand_array(a: *mut LeanObject, expand: bool) -> *mut LeanObject {
+    // SAFETY: salient reads/writes within both arrays' allocations; the
+    // exclusive arm releases only the source BLOCK (children transferred),
+    // the shared arm retains each child before yielding the source ref.
+    unsafe {
+        let (sz, mut cap) = object::array_fields(a);
+        if expand {
+            cap = (cap + 1) * 2;
+        }
+        let r = object::alloc_array(sz, cap);
+        let src = array_data(a);
+        let dst = array_data(r);
+        if is_exclusive(a) {
+            core::ptr::copy_nonoverlapping(src, dst, sz);
+            let bytes = rc::object_byte_size(a);
+            membrane::release_with_size(a, bytes, "export.copy_expand_array");
+        } else {
+            for i in 0..sz {
+                let child = src.add(i).read();
+                dst.add(i).write(child);
+                inc(child);
+            }
+            rc::dec_ref(a);
+        }
+        r
+    }
+}
+
+/// `lean_copy_sarray` (`object.cpp:2514-2524`).
+///
+/// # Safety
+/// `a` live scalar array whose reference the caller yields.
+// UNSAFE-LEDGER: FLN-UL-0118
+#[allow(unsafe_code)]
+unsafe fn copy_sarray(a: *mut LeanObject, cap: usize) -> *mut LeanObject {
+    // SAFETY: byte copy of the salient prefix; the new array's fields are
+    // set by the constructor; the source reference is yielded via dec.
+    unsafe {
+        let (esz, sz, _, src) = object::sarray_fields(a);
+        let r = object::alloc_sarray(esz, sz, cap);
+        let (_, _, _, dst) = object::sarray_fields(r);
+        core::ptr::copy_nonoverlapping(src, dst, usize::from(esz) * sz);
+        rc::dec_ref(a);
+        r
+    }
+}
+
+/// `lean_sarray_ensure_capacity` + `lean_sarray_ensure_exclusive`
+/// (`object.cpp:2526-2544`), composed in the push order.
+///
+/// # Safety
+/// `a` live scalar array whose reference the caller yields.
+// UNSAFE-LEDGER: FLN-UL-0119
+#[allow(unsafe_code)]
+unsafe fn sarray_ensure_pushable(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: delegated salient reads and copies.
+    unsafe {
+        let (_, sz, cap, _) = object::sarray_fields(a);
+        let min_cap = sz + 1;
+        let a = if min_cap <= cap {
+            a
+        } else {
+            copy_sarray(a, min_cap * 2)
+        };
+        if is_exclusive(a) {
+            a
+        } else {
+            let (_, _, cap, _) = object::sarray_fields(a);
+            copy_sarray(a, cap)
+        }
+    }
+}
+
+/// `MurmurHash64A` (`hash.cpp:15-56`) — the pin's `hash_str` core, exact
+/// wrapping arithmetic.
+fn murmur64a(data: &[u8], seed: u64) -> u64 {
+    const M: u64 = 0xc6a4_a793_5bd1_e995;
+    const R: u32 = 47;
+    let len = data.len();
+    let mut h = seed ^ (len as u64).wrapping_mul(M);
+    let (chunks, tail) = data.as_chunks::<8>();
+    for chunk in chunks {
+        let mut k = u64::from_le_bytes(*chunk);
+        k = k.wrapping_mul(M);
+        k ^= k >> R;
+        k = k.wrapping_mul(M);
+        h ^= k;
+        h = h.wrapping_mul(M);
+    }
+    if !tail.is_empty() {
+        for (i, byte) in tail.iter().enumerate() {
+            h ^= u64::from(*byte) << (8 * i);
+        }
+        h = h.wrapping_mul(M);
+    }
+    h ^= h >> R;
+    h = h.wrapping_mul(M);
+    h ^= h >> R;
+    h
+}
+
+/// `push_unicode_scalar` (`utf8.cpp:300-320`): UTF-8 encode, no validation
+/// (Char scalars are valid by construction upstream and here).
+fn push_unicode_scalar(out: &mut Vec<u8>, code: u32) {
+    if code < 0x80 {
+        out.push(code as u8);
+    } else if code < 0x800 {
+        out.push(((code >> 6) & 0x1F) as u8 | 0xC0);
+        out.push((code & 0x3F) as u8 | 0x80);
+    } else if code < 0x10000 {
+        out.push(((code >> 12) & 0x0F) as u8 | 0xE0);
+        out.push(((code >> 6) & 0x3F) as u8 | 0x80);
+        out.push((code & 0x3F) as u8 | 0x80);
+    } else {
+        out.push(((code >> 18) & 0x07) as u8 | 0xF0);
+        out.push(((code >> 12) & 0x3F) as u8 | 0x80);
+        out.push(((code >> 6) & 0x3F) as u8 | 0x80);
+        out.push((code & 0x3F) as u8 | 0x80);
+    }
+}
+
+/// `next_utf8` (`utf8.cpp:167-208`) including the invalid-byte fallback
+/// (advance one, return the raw byte — bug-compatible).
+fn next_utf8(s: &[u8], i: &mut usize) -> u32 {
+    let size = s.len();
+    let c = u32::from(s[*i]);
+    if c & 0x80 == 0 {
+        *i += 1;
+        return c;
+    }
+    if c & 0xE0 == 0xC0 && *i + 1 < size {
+        let c1 = u32::from(s[*i + 1]);
+        let r = ((c & 0x1F) << 6) | (c1 & 0x3F);
+        if r >= 0x80 {
+            *i += 2;
+            return r;
+        }
+    }
+    if c & 0xF0 == 0xE0 && *i + 2 < size {
+        let c1 = u32::from(s[*i + 1]);
+        let c2 = u32::from(s[*i + 2]);
+        let r = ((c & 0x0F) << 12) | ((c1 & 0x3F) << 6) | (c2 & 0x3F);
+        if r >= 0x800 && !(0xD800..=0xDFFF).contains(&r) {
+            *i += 3;
+            return r;
+        }
+    }
+    if c & 0xF8 == 0xF0 && *i + 3 < size {
+        let c1 = u32::from(s[*i + 1]);
+        let c2 = u32::from(s[*i + 2]);
+        let c3 = u32::from(s[*i + 3]);
+        let r = ((c & 0x07) << 18) | ((c1 & 0x3F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F);
+        if (0x10000..=0x10FFFF).contains(&r) {
+            *i += 4;
+            return r;
+        }
+    }
+    *i += 1;
+    c
+}
+
+/// `lean_array_push` (`object.cpp:2703-2715`): exclusivity fast path, the
+/// exact growth policy otherwise.
+// UNSAFE-LEDGER: FLN-UL-0120
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_array_push")]
+pub(crate) extern "C" fn export_lean_array_push(
+    a: *mut LeanObject,
+    v: *mut LeanObject,
+) -> *mut LeanObject {
+    use crate::layout::LeanArrayObject;
+    // SAFETY: live array; the chosen target always has cap > size by the
+    // upstream law; the slot write is an initialization write.
+    unsafe {
+        let r = if is_exclusive(a) {
+            let (sz, cap) = object::array_fields(a);
+            if cap > sz {
+                a
+            } else {
+                copy_expand_array(a, true)
+            }
+        } else {
+            let (sz, cap) = object::array_fields(a);
+            copy_expand_array(a, cap < 2 * sz + 1)
+        };
+        let (sz, _) = object::array_fields(r);
+        array_data(r).add(sz).write(v);
+        (&raw mut (*r.cast::<LeanArrayObject>()).m_size).write(sz + 1);
+        r
+    }
+}
+
+/// `lean_array_mk` (`object.cpp:490-492`): List → Array. Upstream calls the
+/// Lean-compiled `lean_list_to_array`; the twin walks the cons cells
+/// natively (nil = boxed 0, cons = ctor tag 1 of (head, tail)) with the
+/// same ownership balance: the array takes one retained reference per
+/// element, then the list is released.
+// UNSAFE-LEDGER: FLN-UL-0121
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_array_mk")]
+pub(crate) extern "C" fn export_lean_array_mk(lst: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: cons cells are live ctors; children are borrowed during the
+    // walk and retained before the list yields its references.
+    unsafe {
+        let mut n = 0usize;
+        let mut cur = lst;
+        while !is_scalar(cur) {
+            n += 1;
+            cur = object::ctor_get(cur, 1);
+        }
+        let r = object::alloc_array(n, n);
+        let dst = array_data(r);
+        let mut cur = lst;
+        let mut i = 0usize;
+        while !is_scalar(cur) {
+            let head = object::ctor_get(cur, 0);
+            inc(head);
+            dst.add(i).write(head);
+            i += 1;
+            cur = object::ctor_get(cur, 1);
+        }
+        dec(lst);
+        r
+    }
+}
+
+/// `lean_array_to_list` (`object.cpp:494-496`): Array → List, built from the
+/// end exactly like `string_to_list_core` builds cons chains; each element
+/// is retained before the array yields its references.
+// UNSAFE-LEDGER: FLN-UL-0122
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_array_to_list")]
+pub(crate) extern "C" fn export_lean_array_to_list(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: salient reads within the array; each fresh cons cell's slots
+    // are fully initialized before the next iteration.
+    unsafe {
+        let (sz, _) = object::array_fields(a);
+        let src = array_data(a);
+        let mut r = crate::tagged::boxi(0);
+        for i in (0..sz).rev() {
+            let head = src.add(i).read();
+            inc(head);
+            let cell = object::alloc_ctor(1, 2, 0);
+            object::ctor_set(cell, 0, head);
+            object::ctor_set(cell, 1, r);
+            r = cell;
+        }
+        dec(a);
+        r
+    }
+}
+
+/// `lean_array_get_panic` (`object.cpp:499-501`).
+// UNSAFE-LEDGER: FLN-UL-0123
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_array_get_panic")]
+pub(crate) extern "C" fn export_lean_array_get_panic(
+    default_val: *mut LeanObject,
+) -> *mut LeanObject {
+    let msg = export_lean_mk_ascii_string_unchecked(c"Error: index out of bounds".as_ptr());
+    export_lean_panic_fn(default_val, msg)
+}
+
+/// `lean_array_set_panic` (`object.cpp:503-506`).
+// UNSAFE-LEDGER: FLN-UL-0124
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_array_set_panic")]
+pub(crate) extern "C" fn export_lean_array_set_panic(
+    a: *mut LeanObject,
+    v: *mut LeanObject,
+) -> *mut LeanObject {
+    // SAFETY: v's reference is yielded exactly as upstream's lean_dec.
+    unsafe { dec(v) };
+    let msg = export_lean_mk_ascii_string_unchecked(c"Error: index out of bounds".as_ptr());
+    export_lean_panic_fn(a, msg)
+}
+
+/// `lean_byte_array_mk` (`object.cpp:2549-2560`): Array of boxed UInt8 →
+/// ByteArray.
+// UNSAFE-LEDGER: FLN-UL-0125
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_byte_array_mk")]
+pub(crate) extern "C" fn export_lean_byte_array_mk(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: elements are boxed scalars (unbox is address arithmetic); the
+    // array reference is yielded after the copy.
+    unsafe {
+        let (sz, _) = object::array_fields(a);
+        let src = array_data(a);
+        let r = object::alloc_sarray(1, sz, sz);
+        let (_, _, _, dst) = object::sarray_fields(r);
+        for i in 0..sz {
+            dst.add(i)
+                .write(crate::tagged::unbox(src.add(i).read()) as u8);
+        }
+        dec(a);
+        r
+    }
+}
+
+/// `lean_byte_array_data` (`object.cpp:2562-2573`): ByteArray → Array of
+/// boxed UInt8.
+// UNSAFE-LEDGER: FLN-UL-0126
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_byte_array_data")]
+pub(crate) extern "C" fn export_lean_byte_array_data(a: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: salient byte reads; every array slot initialized with a boxed
+    // scalar before the source yields its reference.
+    unsafe {
+        let (_, sz, _, src) = object::sarray_fields(a);
+        let r = object::alloc_array(sz, sz);
+        let dst = array_data(r);
+        for i in 0..sz {
+            dst.add(i)
+                .write(crate::tagged::boxi(usize::from(src.add(i).read())));
+        }
+        dec(a);
+        r
+    }
+}
+
+/// `lean_byte_array_push` (`object.cpp:2575-2582`): ensure capacity (×2
+/// growth), ensure exclusivity, append.
+// UNSAFE-LEDGER: FLN-UL-0127
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_byte_array_push")]
+pub(crate) extern "C" fn export_lean_byte_array_push(a: *mut LeanObject, b: u8) -> *mut LeanObject {
+    use crate::layout::LeanSarrayObject;
+    // SAFETY: the pushable target has cap > size by construction; the byte
+    // write is an initialization write.
+    unsafe {
+        let r = sarray_ensure_pushable(a);
+        let (_, sz, _, dst) = object::sarray_fields(r);
+        dst.add(sz).write(b);
+        (&raw mut (*r.cast::<LeanSarrayObject>()).m_size).write(sz + 1);
+        r
+    }
+}
+
+/// `lean_string_mk` (`object.cpp`): List Char → String (UTF-8 encode with
+/// the pin's exact byte emitter).
+// UNSAFE-LEDGER: FLN-UL-0128
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_mk")]
+pub(crate) extern "C" fn export_lean_string_mk(cs: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: cons cells are live ctors with boxed-scalar Char heads.
+    unsafe {
+        let mut bytes = Vec::new();
+        let mut len = 0usize;
+        let mut cur = cs;
+        while !is_scalar(cur) {
+            let code = crate::tagged::unbox(object::ctor_get(cur, 0)) as u32;
+            push_unicode_scalar(&mut bytes, code);
+            cur = object::ctor_get(cur, 1);
+            len += 1;
+        }
+        dec(cs);
+        object::mk_string_unchecked(&bytes, len)
+    }
+}
+
+/// `lean_string_data` (`object.cpp`): String → List Char, decoded with the
+/// pin's `next_utf8` (including its invalid-byte fallback), consuming the
+/// string via `lean_dec_ref` exactly as upstream.
+// UNSAFE-LEDGER: FLN-UL-0129
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_data")]
+pub(crate) extern "C" fn export_lean_string_data(s: *mut LeanObject) -> *mut LeanObject {
+    // SAFETY: salient string bytes copied before the reference is yielded;
+    // fresh cons cells fully initialized.
+    unsafe {
+        let (size, data) = string_size_and_data(s);
+        let content = core::slice::from_raw_parts(data, size.saturating_sub(1)).to_vec();
+        rc::dec_ref(s);
+        let mut codes = Vec::new();
+        let mut i = 0usize;
+        while i < content.len() {
+            codes.push(next_utf8(&content, &mut i));
+        }
+        let mut r = crate::tagged::boxi(0);
+        for code in codes.iter().rev() {
+            let cell = object::alloc_ctor(1, 2, 0);
+            object::ctor_set(cell, 0, crate::tagged::boxi(*code as usize));
+            object::ctor_set(cell, 1, r);
+            r = cell;
+        }
+        r
+    }
+}
+
+/// `lean_string_hash` (`object.cpp:2450-2454`): MurmurHash64A over the
+/// content bytes with seed 11.
+// UNSAFE-LEDGER: FLN-UL-0130
+#[allow(unsafe_code)]
+#[unsafe(export_name = "lean_string_hash")]
+pub(crate) extern "C" fn export_lean_string_hash(s: *mut LeanObject) -> u64 {
+    // SAFETY: salient string bytes, borrowed.
+    unsafe {
+        let (size, data) = string_size_and_data(s);
+        let bytes = core::slice::from_raw_parts(data, size.saturating_sub(1));
+        murmur64a(bytes, 11)
+    }
+}
+
 // ---- extern-census symbols (declared by generated C itself, not lean.h) ------
 // The stage0 demand audit surfaced these: generated C emits its own extern
 // declarations for @[extern] runtime symbols (contracts/extern_census.tsv

@@ -1005,3 +1005,130 @@ fn export_platform_and_byte_array_roundtrip() {
         export_lean_dec_ref_cold(s2);
     }
 }
+
+// ================================================================ slice 2: array/byte-array/string-conversion exports
+
+#[test]
+fn export_array_list_roundtrip_and_push_laws() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_array_mk, export_lean_array_push, export_lean_array_to_list,
+        export_lean_dec_ref_cold,
+    };
+    // UNSAFE-LEDGER: FLN-UL-0131
+    #[allow(unsafe_code)]
+    unsafe {
+        // List [10, 20, 30] (boxed) -> Array -> List roundtrip.
+        let mut lst = tagged::boxi(0);
+        for v in [30usize, 20, 10] {
+            let cell = crate::object::alloc_ctor(1, 2, 0);
+            crate::object::ctor_set(cell, 0, tagged::boxi(v));
+            crate::object::ctor_set(cell, 1, lst);
+            lst = cell;
+        }
+        let a = export_lean_array_mk(lst);
+        let (sz, cap) = crate::object::array_fields(a);
+        assert_eq!((sz, cap), (3, 3));
+        assert_eq!(tagged::unbox(crate::object::array_get(a, 0)), 10);
+        assert_eq!(tagged::unbox(crate::object::array_get(a, 2)), 30);
+        let back = export_lean_array_to_list(a);
+        let mut cur = back;
+        let mut seen = Vec::new();
+        while !tagged::is_scalar(cur) {
+            seen.push(tagged::unbox(crate::object::ctor_get(cur, 0)));
+            cur = crate::object::ctor_get(cur, 1);
+        }
+        assert_eq!(seen, vec![10, 20, 30]);
+        export_lean_dec_ref_cold(back);
+
+        // Push growth law from (0,0): (cap+1)*2 exactly when full (exclusive).
+        let mut arr = crate::object::alloc_array(0, 0);
+        for (i, expect_cap) in [(0usize, 2usize), (1, 2), (2, 6)] {
+            arr = export_lean_array_push(arr, tagged::boxi(i));
+            let (s, c) = crate::object::array_fields(arr);
+            assert_eq!((s, c), (i + 1, expect_cap), "push {i}");
+        }
+        // Shared push: retain, push -> nonlinear copy, original untouched.
+        crate::rc::inc_ref_n(arr, 1);
+        let pushed = export_lean_array_push(arr, tagged::boxi(9));
+        assert_ne!(pushed, arr, "shared push copies");
+        assert_eq!(crate::object::array_fields(arr).0, 3);
+        let (psz, pcap) = crate::object::array_fields(pushed);
+        assert_eq!((psz, pcap), (4, 14), "nonlinear expand law (6+1)*2");
+        export_lean_dec_ref_cold(pushed);
+        export_lean_dec_ref_cold(arr);
+    }
+}
+
+#[test]
+fn export_byte_array_families_match_pin_laws() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_byte_array_data, export_lean_byte_array_mk, export_lean_byte_array_push,
+        export_lean_dec_ref_cold,
+    };
+    // UNSAFE-LEDGER: FLN-UL-0132
+    #[allow(unsafe_code)]
+    unsafe {
+        // Array of boxed bytes -> ByteArray -> Array roundtrip.
+        let a = crate::object::alloc_array(3, 3);
+        for (i, b) in [7usize, 8, 9].into_iter().enumerate() {
+            crate::object::array_set_core(a, i, tagged::boxi(b));
+        }
+        let ba = export_lean_byte_array_mk(a);
+        let (elem, sz, _, data) = crate::object::sarray_fields(ba);
+        assert_eq!((elem, sz), (1, 3));
+        assert_eq!(
+            core::slice::from_raw_parts(data, 3),
+            &[7, 8, 9],
+            "byte content"
+        );
+        let arr2 = export_lean_byte_array_data(ba);
+        assert_eq!(tagged::unbox(crate::object::array_get(arr2, 1)), 8);
+        export_lean_dec_ref_cold(arr2);
+
+        // Push growth: (size+1)*2 capacity when full.
+        let mut b = crate::object::alloc_sarray(1, 0, 0);
+        b = export_lean_byte_array_push(b, 0xAB);
+        let (_, s1, c1, _) = crate::object::sarray_fields(b);
+        assert_eq!((s1, c1), (1, 2), "min_cap*2 growth");
+        b = export_lean_byte_array_push(b, 0xCD);
+        let (_, s2, c2, d2) = crate::object::sarray_fields(b);
+        assert_eq!((s2, c2), (2, 2));
+        assert_eq!(core::slice::from_raw_parts(d2, 2), &[0xAB, 0xCD]);
+        export_lean_dec_ref_cold(b);
+    }
+}
+
+#[test]
+fn export_string_list_roundtrip_and_hash() {
+    let _g = lock();
+    use crate::export::{
+        export_lean_dec_ref_cold, export_lean_mk_string, export_lean_string_data,
+        export_lean_string_eq_cold, export_lean_string_hash, export_lean_string_mk,
+    };
+    // UNSAFE-LEDGER: FLN-UL-0133
+    #[allow(unsafe_code)]
+    unsafe {
+        let s = export_lean_mk_string(c"h\u{e9}llo".as_ptr());
+        crate::rc::inc_ref_n(s, 1);
+        let lst = export_lean_string_data(s); // consumes one ref
+        let mut codes = Vec::new();
+        let mut cur = lst;
+        while !tagged::is_scalar(cur) {
+            codes.push(tagged::unbox(crate::object::ctor_get(cur, 0)) as u32);
+            cur = crate::object::ctor_get(cur, 1);
+        }
+        assert_eq!(codes, vec![0x68, 0xE9, 0x6C, 0x6C, 0x6F]);
+        let s2 = export_lean_string_mk(lst); // consumes the list
+        assert!(export_lean_string_eq_cold(s, s2));
+        // Hash: deterministic, content-sensitive (exact parity vs the
+        // Reference is pinned by the gauntlet differential).
+        let t = export_lean_mk_string(c"h\u{e9}llp".as_ptr());
+        assert_eq!(export_lean_string_hash(s), export_lean_string_hash(s2));
+        assert_ne!(export_lean_string_hash(s), export_lean_string_hash(t));
+        for o in [s, s2, t] {
+            export_lean_dec_ref_cold(o);
+        }
+    }
+}
