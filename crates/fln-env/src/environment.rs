@@ -45,6 +45,18 @@ fn quot_kind_tag(kind: QuotKind) -> u8 {
     }
 }
 
+/// Write a mutual-block membership list into declaration identity.
+///
+/// The order and multiplicity are semantic input. Keep this as one forward pass:
+/// no sorting, deduplication, or structure proportional to the containing
+/// [`Environment`] belongs in declaration identity.
+fn write_mutual_membership(w: &mut CanonWriter, members: &[Name]) {
+    w.u64(members.len() as u64);
+    for member in members {
+        member.write_body(w);
+    }
+}
+
 impl PKey for Name {
     fn key_hash(&self) -> u64 {
         // The stored Reference-observable hash; collisions are handled by the trie's
@@ -274,25 +286,16 @@ impl Environment {
                     }
                 }
                 w.u8(definition_safety_tag(v.safety));
-                w.u64(v.all.len() as u64);
-                for n in &v.all {
-                    n.write_body(&mut w);
-                }
+                write_mutual_membership(&mut w, &v.all);
             }
             ConstantInfo::Thm(v) => {
                 v.value.write_body(&mut w);
-                w.u64(v.all.len() as u64);
-                for n in &v.all {
-                    n.write_body(&mut w);
-                }
+                write_mutual_membership(&mut w, &v.all);
             }
             ConstantInfo::Opaque(v) => {
                 v.value.write_body(&mut w);
                 w.bool(v.is_unsafe);
-                w.u64(v.all.len() as u64);
-                for n in &v.all {
-                    n.write_body(&mut w);
-                }
+                write_mutual_membership(&mut w, &v.all);
             }
             ConstantInfo::Quot(v) => w.u8(quot_kind_tag(v.kind)),
             ConstantInfo::Induct(v) => {
@@ -310,10 +313,7 @@ impl Environment {
                 // (as it is for `Defn`/`Thm`): two inductives identical except for
                 // their block grouping are distinct declarations and must not share
                 // a content digest.
-                w.u64(v.all.len() as u64);
-                for n in &v.all {
-                    n.write_body(&mut w);
-                }
+                write_mutual_membership(&mut w, &v.all);
             }
             ConstantInfo::Ctor(v) => {
                 v.induct.write_body(&mut w);
@@ -336,10 +336,7 @@ impl Environment {
                     rule.rhs.write_body(&mut w);
                 }
                 // The mutual block is content here too (mirrors `Defn`/`Thm`).
-                w.u64(v.all.len() as u64);
-                for n in &v.all {
-                    n.write_body(&mut w);
-                }
+                write_mutual_membership(&mut w, &v.all);
             }
         }
         hash(Domain::DeclContent, &w.into_bytes())
@@ -370,7 +367,10 @@ impl Environment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::{AxiomVal, ConstantVal};
+    use crate::constants::{
+        AxiomVal, ConstantVal, DefinitionVal, InductiveVal, OpaqueVal, RecursorRule, RecursorVal,
+        TheoremVal,
+    };
     use fln_core::expr::Expr;
     use fln_core::level::Level;
     use fln_core::options::DataValue;
@@ -388,6 +388,227 @@ mod tests {
             },
             is_unsafe: false,
         })
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum AllBearingKind {
+        Definition,
+        Theorem,
+        Opaque,
+        Inductive,
+        Recursor,
+    }
+
+    impl AllBearingKind {
+        const ALL: [AllBearingKind; 5] = [
+            AllBearingKind::Definition,
+            AllBearingKind::Theorem,
+            AllBearingKind::Opaque,
+            AllBearingKind::Inductive,
+            AllBearingKind::Recursor,
+        ];
+
+        const fn label(self) -> &'static str {
+            match self {
+                AllBearingKind::Definition => "definition",
+                AllBearingKind::Theorem => "theorem",
+                AllBearingKind::Opaque => "opaque",
+                AllBearingKind::Inductive => "inductive",
+                AllBearingKind::Recursor => "recursor",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum MembershipModel {
+        Canonical,
+        DropList,
+        OmitCount,
+        SortMembers,
+    }
+
+    fn all_bearing_decl(kind: AllBearingKind, all: Vec<Name>) -> ConstantInfo {
+        let body = || Expr::const_(n("body"), vec![Level::param(n("u"))]);
+        let base = || ConstantVal {
+            name: n("d"),
+            level_params: vec![n("u")],
+            type_: Expr::sort(Level::param(n("u"))),
+        };
+        match kind {
+            AllBearingKind::Definition => ConstantInfo::Defn(DefinitionVal {
+                base: base(),
+                value: body(),
+                hints: ReducibilityHints::Regular(7),
+                safety: DefinitionSafety::Partial,
+                all,
+            }),
+            AllBearingKind::Theorem => ConstantInfo::Thm(TheoremVal {
+                base: base(),
+                value: body(),
+                all,
+            }),
+            AllBearingKind::Opaque => ConstantInfo::Opaque(OpaqueVal {
+                base: base(),
+                value: body(),
+                is_unsafe: true,
+                all,
+            }),
+            AllBearingKind::Inductive => ConstantInfo::Induct(InductiveVal {
+                base: base(),
+                num_params: 2,
+                num_indices: 1,
+                all,
+                ctors: vec![n("mk"), n("mkAlt")],
+                num_nested: 3,
+                is_rec: true,
+                is_unsafe: true,
+                is_reflexive: true,
+            }),
+            AllBearingKind::Recursor => ConstantInfo::Rec(RecursorVal {
+                base: base(),
+                all,
+                num_params: 2,
+                num_indices: 1,
+                num_motives: 1,
+                num_minors: 2,
+                rules: vec![
+                    RecursorRule {
+                        ctor: n("mk"),
+                        nfields: 3,
+                        rhs: body(),
+                    },
+                    RecursorRule {
+                        ctor: n("mkAlt"),
+                        nfields: 4,
+                        rhs: Expr::const_(n("bodyAlt"), vec![Level::zero()]),
+                    },
+                ],
+                k: true,
+                is_unsafe: true,
+            }),
+        }
+    }
+
+    fn write_membership_model(w: &mut CanonWriter, members: &[Name], model: MembershipModel) {
+        match model {
+            MembershipModel::Canonical => {
+                w.u64(members.len() as u64);
+                for member in members {
+                    member.write_body(w);
+                }
+            }
+            MembershipModel::DropList => {}
+            MembershipModel::OmitCount => {
+                for member in members {
+                    member.write_body(w);
+                }
+            }
+            MembershipModel::SortMembers => {
+                let mut sorted = members.to_vec();
+                sorted.sort();
+                w.u64(sorted.len() as u64);
+                for member in &sorted {
+                    member.write_body(w);
+                }
+            }
+        }
+    }
+
+    /// Control-flow-independent declaration layout model for the five variants
+    /// carrying mutual-block membership. It intentionally shares only the primitive
+    /// canonical codecs and registered hash implementation with production.
+    fn modeled_all_bearing_digest(
+        info: &ConstantInfo,
+        membership_model: MembershipModel,
+        domain: Domain,
+    ) -> Digest {
+        let mut w = CanonWriter::new();
+        let kind_name = match info {
+            ConstantInfo::Defn(_) => "definition",
+            ConstantInfo::Thm(_) => "theorem",
+            ConstantInfo::Opaque(_) => "opaque",
+            ConstantInfo::Induct(_) => "inductive",
+            ConstantInfo::Rec(_) => "recursor",
+            _ => unreachable!("the model accepts only all-bearing declarations"),
+        };
+        w.str(kind_name);
+        info.name().write_body(&mut w);
+        let base = info.constant_val();
+        w.u64(base.level_params.len() as u64);
+        for parameter in &base.level_params {
+            parameter.write_body(&mut w);
+        }
+        base.type_.write_body(&mut w);
+        match info {
+            ConstantInfo::Defn(value) => {
+                value.value.write_body(&mut w);
+                match value.hints {
+                    ReducibilityHints::Opaque => w.u8(0),
+                    ReducibilityHints::Abbrev => w.u8(1),
+                    ReducibilityHints::Regular(height) => {
+                        w.u8(2);
+                        w.u32(height);
+                    }
+                }
+                let safety_tag = match value.safety {
+                    DefinitionSafety::Unsafe => 0,
+                    DefinitionSafety::Safe => 1,
+                    DefinitionSafety::Partial => 2,
+                };
+                w.u8(safety_tag);
+                write_membership_model(&mut w, &value.all, membership_model);
+            }
+            ConstantInfo::Thm(value) => {
+                value.value.write_body(&mut w);
+                write_membership_model(&mut w, &value.all, membership_model);
+            }
+            ConstantInfo::Opaque(value) => {
+                value.value.write_body(&mut w);
+                w.bool(value.is_unsafe);
+                write_membership_model(&mut w, &value.all, membership_model);
+            }
+            ConstantInfo::Induct(value) => {
+                w.u32(value.num_params);
+                w.u32(value.num_indices);
+                w.u32(value.num_nested);
+                w.bool(value.is_rec);
+                w.bool(value.is_unsafe);
+                w.bool(value.is_reflexive);
+                w.u64(value.ctors.len() as u64);
+                for ctor in &value.ctors {
+                    ctor.write_body(&mut w);
+                }
+                write_membership_model(&mut w, &value.all, membership_model);
+            }
+            ConstantInfo::Rec(value) => {
+                w.u32(value.num_params);
+                w.u32(value.num_indices);
+                w.u32(value.num_motives);
+                w.u32(value.num_minors);
+                w.bool(value.k);
+                w.bool(value.is_unsafe);
+                w.u64(value.rules.len() as u64);
+                for rule in &value.rules {
+                    rule.ctor.write_body(&mut w);
+                    w.u32(rule.nfields);
+                    rule.rhs.write_body(&mut w);
+                }
+                write_membership_model(&mut w, &value.all, membership_model);
+            }
+            _ => unreachable!("the model accepts only all-bearing declarations"),
+        }
+        hash(domain, &w.into_bytes())
+    }
+
+    fn canonical_name_body_bytes(names: &[Name]) -> usize {
+        names
+            .iter()
+            .map(|name| {
+                let mut w = CanonWriter::new();
+                name.write_body(&mut w);
+                w.into_bytes().len()
+            })
+            .sum()
     }
 
     fn descriptor(name: &str) -> ExtensionDescriptor {
@@ -742,113 +963,322 @@ mod tests {
 
     #[test]
     fn mutual_block_membership_changes_the_content_digest() {
-        use crate::constants::{
-            DefinitionSafety, DefinitionVal, InductiveVal, OpaqueVal, RecursorRule, RecursorVal,
-            ReducibilityHints, TheoremVal,
-        };
-        // Every kind that carries an `all` (mutual block) must fold it into its
-        // content digest: two otherwise-identical declarations that differ only in
-        // their block grouping are distinct and must not collide (a per-decl CAS
-        // keyed on this digest would otherwise return a stale `all`).
-        let body = || Expr::sort(Level::zero());
-        let ty = || ConstantVal {
-            name: n("d"),
-            level_params: vec![],
-            type_: Expr::sort(Level::zero()),
-        };
+        const LARGE_MEMBER_COUNT: usize = 4_096;
+        let large_members: Vec<Name> = (0..LARGE_MEMBER_COUNT)
+            .map(|index| Name::num(n("member"), index as u64))
+            .collect();
+        let boundary_cases = vec![
+            ("empty", Vec::new()),
+            ("singleton", vec![n("d")]),
+            ("repeated", vec![n("d"), n("d")]),
+            ("ordered", vec![n("d"), n("e")]),
+            ("reordered", vec![n("e"), n("d")]),
+            ("renamed", vec![n("d"), n("f")]),
+            ("declared_large", large_members),
+        ];
+        let options = KVMap::new();
 
-        let defn = |all: Vec<Name>| {
-            ConstantInfo::Defn(DefinitionVal {
-                base: ty(),
-                value: body(),
-                hints: ReducibilityHints::Opaque,
-                safety: DefinitionSafety::Safe,
-                all,
-            })
-        };
-        let thm = |all: Vec<Name>| {
-            ConstantInfo::Thm(TheoremVal {
-                base: ty(),
-                value: body(),
-                all,
-            })
-        };
-        let opaque = |all: Vec<Name>| {
-            ConstantInfo::Opaque(OpaqueVal {
-                base: ty(),
-                value: body(),
-                is_unsafe: false,
-                all,
-            })
-        };
-        let induct = |all: Vec<Name>| {
-            ConstantInfo::Induct(InductiveVal {
-                base: ty(),
-                num_params: 0,
-                num_indices: 0,
-                all,
-                ctors: vec![n("mk")],
-                num_nested: 0,
-                is_rec: false,
-                is_unsafe: false,
-                is_reflexive: false,
-            })
-        };
-        let rec = |all: Vec<Name>| {
-            ConstantInfo::Rec(RecursorVal {
-                base: ty(),
-                all,
-                num_params: 0,
-                num_indices: 0,
-                num_motives: 1,
-                num_minors: 1,
-                rules: vec![RecursorRule {
-                    ctor: n("mk"),
-                    nfields: 0,
-                    rhs: body(),
-                }],
-                k: false,
-                is_unsafe: false,
-            })
-        };
+        for kind in AllBearingKind::ALL {
+            let mut digests = Vec::with_capacity(boundary_cases.len());
+            for (case, members) in &boundary_cases {
+                let info = all_bearing_decl(kind, members.clone());
+                let actual = Environment::decl_content_digest(&info);
+                let expected = modeled_all_bearing_digest(
+                    &info,
+                    MembershipModel::Canonical,
+                    Domain::DeclContent,
+                );
+                assert_eq!(
+                    actual,
+                    expected,
+                    "{} {case} membership diverged from the independent canonical model",
+                    kind.label()
+                );
 
-        for (kind, make) in [
-            ("definition", &defn as &dyn Fn(Vec<Name>) -> ConstantInfo),
-            ("theorem", &thm),
-            ("opaque", &opaque),
-            ("inductive", &induct),
-            ("recursor", &rec),
-        ] {
-            let solo = Environment::decl_content_digest(&make(vec![n("d")]));
-            let grouped = Environment::decl_content_digest(&make(vec![n("d"), n("e")]));
-            let reordered = Environment::decl_content_digest(&make(vec![n("e"), n("d")]));
-            let renamed = Environment::decl_content_digest(&make(vec![n("d"), n("f")]));
+                let rebuilt = all_bearing_decl(kind, members.clone());
+                assert_eq!(
+                    actual,
+                    Environment::decl_content_digest(&rebuilt),
+                    "{} {case} membership was not repeatable",
+                    kind.label()
+                );
+
+                let environment = Environment::new()
+                    .add_decl(info)
+                    .expect("fixture declaration is valid");
+                let actual_root = environment.logical_root(&options);
+                let mut expected_root = LogicalRootBuilder::new();
+                expected_root.add_decl(rebuilt.name(), actual);
+                expected_root.set_options(&options);
+                assert_eq!(
+                    actual_root,
+                    expected_root.finalize(),
+                    "{} {case} digest did not propagate exactly into the logical root",
+                    kind.label()
+                );
+                let repeated_root = Environment::new()
+                    .add_decl(rebuilt)
+                    .expect("repeated fixture declaration is valid")
+                    .logical_root(&options);
+                assert_eq!(
+                    actual_root,
+                    repeated_root,
+                    "{} {case} logical root was not repeatable",
+                    kind.label()
+                );
+                digests.push(actual);
+            }
+
             assert_ne!(
-                solo, grouped,
-                "{kind} mutual-block membership must change the content digest"
+                digests[0],
+                digests[1],
+                "{} must distinguish empty and singleton membership",
+                kind.label()
             );
             assert_ne!(
-                grouped, reordered,
-                "{kind} mutual-block order must change the content digest"
+                digests[1],
+                digests[2],
+                "{} must preserve repeated membership",
+                kind.label()
             );
             assert_ne!(
-                grouped, renamed,
-                "{kind} mutual-block names must change the content digest"
+                digests[1],
+                digests[3],
+                "{} must distinguish solo and grouped membership",
+                kind.label()
+            );
+            assert_ne!(
+                digests[2],
+                digests[3],
+                "{} must distinguish multiplicity and member identity",
+                kind.label()
+            );
+            assert_ne!(
+                digests[3],
+                digests[4],
+                "{} must preserve membership order",
+                kind.label()
+            );
+            assert_ne!(
+                digests[3],
+                digests[5],
+                "{} must preserve member names",
+                kind.label()
+            );
+            assert_ne!(
+                digests[5],
+                digests[6],
+                "{} must cover the declared large-member boundary",
+                kind.label()
+            );
+            eprintln!(
+                "{{\"schema\":\"fln.unit.mutual-membership-boundaries\",\"version\":1,\
+                 \"bead\":\"fln-amv.1\",\"claim_type\":\"bounded_model\",\
+                 \"kind\":\"{}\",\"case_count\":7,\"large_member_count\":4096,\
+                 \"empty_digest\":\"{}\",\"solo_digest\":\"{}\",\
+                 \"grouped_digest\":\"{}\",\"reordered_digest\":\"{}\",\
+                 \"large_digest\":\"{}\",\"root_propagation\":\"exact\",\
+                 \"repeatability\":\"pass\",\"status\":\"pass\"}}",
+                kind.label(),
+                digests[0],
+                digests[1],
+                digests[3],
+                digests[4],
+                digests[6]
             );
         }
 
-        let options = KVMap::new();
-        let solo = Environment::new()
-            .add_decl(opaque(vec![n("d")]))
-            .expect("solo opaque declaration is valid");
-        let grouped = Environment::new()
-            .add_decl(opaque(vec![n("d"), n("e")]))
-            .expect("grouped opaque declaration is valid");
+        let opaque_solo = Environment::decl_content_digest(&all_bearing_decl(
+            AllBearingKind::Opaque,
+            vec![n("d")],
+        ));
+        let opaque_grouped = Environment::decl_content_digest(&all_bearing_decl(
+            AllBearingKind::Opaque,
+            vec![n("d"), n("e")],
+        ));
         assert_ne!(
-            solo.logical_root(&options),
-            grouped.logical_root(&options),
-            "opaque mutual-block membership must propagate into logical snapshot identity"
+            opaque_solo, opaque_grouped,
+            "OpaqueVal.all must distinguish the original solo-versus-grouped regression"
         );
+    }
+
+    #[test]
+    fn mutual_block_membership_named_mutants_are_discriminated() {
+        let witness = vec![n("e"), n("d"), n("e"), n("f")];
+        let options = KVMap::new();
+
+        for kind in AllBearingKind::ALL {
+            let info = all_bearing_decl(kind, witness.clone());
+            let canonical = Environment::decl_content_digest(&info);
+            for (mutation, model) in [
+                ("drop_membership", MembershipModel::DropList),
+                ("omit_member_count", MembershipModel::OmitCount),
+                ("reorder_membership", MembershipModel::SortMembers),
+            ] {
+                let mutated = modeled_all_bearing_digest(&info, model, Domain::DeclContent);
+                assert_ne!(
+                    canonical,
+                    mutated,
+                    "{mutation} mutant survived for {}",
+                    kind.label()
+                );
+            }
+
+            let wrong_domain =
+                modeled_all_bearing_digest(&info, MembershipModel::Canonical, Domain::LogicalRoot);
+            assert_ne!(
+                canonical,
+                wrong_domain,
+                "wrong_digest_domain mutant survived for {}",
+                kind.label()
+            );
+
+            let actual_root = Environment::new()
+                .add_decl(info.clone())
+                .expect("fixture declaration is valid")
+                .logical_root(&options);
+            let dropped_digest =
+                modeled_all_bearing_digest(&info, MembershipModel::DropList, Domain::DeclContent);
+            let mut dropped_root = LogicalRootBuilder::new();
+            dropped_root.add_decl(info.name(), dropped_digest);
+            dropped_root.set_options(&options);
+            assert_ne!(
+                actual_root,
+                dropped_root.finalize(),
+                "fail_to_propagate_membership mutant survived for {}",
+                kind.label()
+            );
+            eprintln!(
+                "{{\"schema\":\"fln.unit.mutual-membership-mutants\",\"version\":1,\
+                 \"bead\":\"fln-amv.1\",\"claim_type\":\"bounded_model\",\
+                 \"kind\":\"{}\",\"witness_member_count\":4,\
+                 \"canonical_digest\":\"{canonical}\",\"logical_root\":\"{actual_root}\",\
+                 \"mutations\":[\"drop_membership\",\"omit_member_count\",\
+                 \"reorder_membership\",\"wrong_digest_domain\",\
+                 \"fail_to_propagate_membership\"],\"killed\":5,\
+                 \"status\":\"pass\"}}",
+                kind.label()
+            );
+        }
+    }
+
+    #[test]
+    fn mutual_block_membership_matches_model_for_generated_cases() {
+        const GENERATED_CASES: usize = 96;
+        const MAX_GENERATED_MEMBERS: usize = 48;
+        let mut assertions = 0usize;
+
+        for case_index in 0..GENERATED_CASES {
+            let member_count = (case_index * 17) % (MAX_GENERATED_MEMBERS + 1);
+            let mut members: Vec<Name> = (0..member_count)
+                .map(|member_index| {
+                    let root = if (case_index + member_index) % 2 == 0 {
+                        n("left")
+                    } else {
+                        n("right")
+                    };
+                    let numbered =
+                        Name::num(root, ((case_index * 13 + member_index * 7) % 11) as u64);
+                    if (case_index + member_index) % 3 == 0 {
+                        Name::str(numbered, "leaf")
+                    } else {
+                        numbered
+                    }
+                })
+                .collect();
+
+            if members.len() > 1 && case_index % 3 == 0 {
+                let repeated = members[0].clone();
+                let last = members.len() - 1;
+                members[last] = repeated;
+            }
+            if !members.is_empty() {
+                match case_index % 4 {
+                    1 => members.reverse(),
+                    2 => {
+                        let shift = case_index % members.len();
+                        members.rotate_left(shift);
+                    }
+                    3 => {
+                        let shift = (case_index * 3) % members.len();
+                        members.rotate_right(shift);
+                    }
+                    _ => {}
+                }
+            }
+
+            for kind in AllBearingKind::ALL {
+                let info = all_bearing_decl(kind, members.clone());
+                let actual = Environment::decl_content_digest(&info);
+                let expected = modeled_all_bearing_digest(
+                    &info,
+                    MembershipModel::Canonical,
+                    Domain::DeclContent,
+                );
+                assert_eq!(
+                    actual,
+                    expected,
+                    "generated case {case_index} diverged for {}",
+                    kind.label()
+                );
+                assert_eq!(
+                    actual,
+                    Environment::decl_content_digest(&all_bearing_decl(kind, members.clone())),
+                    "generated case {case_index} was not repeatable for {}",
+                    kind.label()
+                );
+                assertions += 2;
+            }
+        }
+
+        eprintln!(
+            "{{\"schema\":\"fln.unit.mutual-membership-generated\",\"version\":1,\
+             \"bead\":\"fln-amv.1\",\"claim_type\":\"bounded_model\",\
+             \"generated_cases\":{GENERATED_CASES},\"variant_count\":5,\
+             \"max_member_count\":{MAX_GENERATED_MEMBERS},\
+             \"assertions\":{assertions},\"name_depth_max\":3,\
+             \"features\":[\"duplicates\",\"string_components\",\"numeric_components\",\
+             \"reversal\",\"rotation\"],\"status\":\"pass\"}}"
+        );
+    }
+
+    #[test]
+    fn mutual_membership_writer_has_canonical_stream_shape() {
+        for member_count in [0usize, 1, 32, 4_096] {
+            let members: Vec<Name> = (0..member_count)
+                .map(|index| Name::num(n("member"), index as u64))
+                .collect();
+            let canonical_member_bytes = canonical_name_body_bytes(&members);
+
+            let mut actual = CanonWriter::new();
+            write_mutual_membership(&mut actual, &members);
+            let actual = actual.into_bytes();
+
+            let mut expected = CanonWriter::new();
+            write_membership_model(&mut expected, &members, MembershipModel::Canonical);
+            let expected = expected.into_bytes();
+
+            assert_eq!(
+                actual, expected,
+                "membership writer must be exactly count plus one ordered body per member"
+            );
+            assert_eq!(
+                actual.len(),
+                8 + canonical_member_bytes,
+                "membership stream work must grow with count-prefix plus canonical member bytes"
+            );
+            eprintln!(
+                "{{\"schema\":\"fln.unit.mutual-membership-work\",\"version\":1,\
+                 \"bead\":\"fln-amv.1\",\"claim_type\":\"bounded_model\",\
+                 \"evidence\":\"canonical_stream_shape\",\
+                 \"member_count\":{member_count},\
+                 \"canonical_member_bytes\":{canonical_member_bytes},\
+                 \"expected_stream_bytes\":{},\"observed_stream_bytes\":{},\
+                 \"status\":\"pass\"}}",
+                8 + canonical_member_bytes,
+                actual.len()
+            );
+        }
     }
 
     #[test]
