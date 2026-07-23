@@ -28,7 +28,8 @@ use crate::pmap::{PKey, PMap};
 
 /// Stable `Domain::DeclContent` tags. These are schema values, not Rust enum
 /// discriminants: changing them requires an explicit identity/epoch decision.
-fn definition_safety_tag(safety: DefinitionSafety) -> u8 {
+#[forbid(clippy::as_conversions)]
+const fn definition_safety_tag(safety: DefinitionSafety) -> u8 {
     match safety {
         DefinitionSafety::Unsafe => 0,
         DefinitionSafety::Safe => 1,
@@ -36,7 +37,8 @@ fn definition_safety_tag(safety: DefinitionSafety) -> u8 {
     }
 }
 
-fn quot_kind_tag(kind: QuotKind) -> u8 {
+#[forbid(clippy::as_conversions)]
+const fn quot_kind_tag(kind: QuotKind) -> u8 {
     match kind {
         QuotKind::Type => 0,
         QuotKind::Ctor => 1,
@@ -45,13 +47,21 @@ fn quot_kind_tag(kind: QuotKind) -> u8 {
     }
 }
 
+/// Lossless on FrankenLean's certified Rust targets, whose pointer widths are at
+/// most 64 bits. This conversion stays outside the enum-tag cast prohibition so
+/// that the policy does not introduce a fallible or panicking length path.
+#[allow(clippy::as_conversions)]
+const fn usize_to_u64(value: usize) -> u64 {
+    value as u64
+}
+
 /// Write a mutual-block membership list into declaration identity.
 ///
 /// The order and multiplicity are semantic input. Keep this as one forward pass:
 /// no sorting, deduplication, or structure proportional to the containing
 /// [`Environment`] belongs in declaration identity.
 fn write_mutual_membership(w: &mut CanonWriter, members: &[Name]) {
-    w.u64(members.len() as u64);
+    w.u64(usize_to_u64(members.len()));
     for member in members {
         member.write_body(w);
     }
@@ -263,12 +273,13 @@ impl Environment {
     /// The canonical content digest of one constant (Domain::DeclContent): the
     /// deterministic projection the logical root aggregates. Byte-level olean parity
     /// is the codec's business; this digest is FrankenLean's own identity.
+    #[forbid(clippy::as_conversions)]
     pub fn decl_content_digest(info: &ConstantInfo) -> Digest {
         let mut w = CanonWriter::new();
         w.str(info.kind_name());
         info.name().write_body(&mut w);
         let base = info.constant_val();
-        w.u64(base.level_params.len() as u64);
+        w.u64(usize_to_u64(base.level_params.len()));
         for p in &base.level_params {
             p.write_body(&mut w);
         }
@@ -305,7 +316,7 @@ impl Environment {
                 w.bool(v.is_rec);
                 w.bool(v.is_unsafe);
                 w.bool(v.is_reflexive);
-                w.u64(v.ctors.len() as u64);
+                w.u64(usize_to_u64(v.ctors.len()));
                 for n in &v.ctors {
                     n.write_body(&mut w);
                 }
@@ -329,7 +340,7 @@ impl Environment {
                 w.u32(v.num_minors);
                 w.bool(v.k);
                 w.bool(v.is_unsafe);
-                w.u64(v.rules.len() as u64);
+                w.u64(usize_to_u64(v.rules.len()));
                 for rule in &v.rules {
                     rule.ctor.write_body(&mut w);
                     w.u32(rule.nfields);
@@ -368,12 +379,13 @@ impl Environment {
 mod tests {
     use super::*;
     use crate::constants::{
-        AxiomVal, ConstantVal, DefinitionVal, InductiveVal, OpaqueVal, RecursorRule, RecursorVal,
-        TheoremVal,
+        AxiomVal, ConstantVal, DefinitionVal, InductiveVal, OpaqueVal, QuotVal, RecursorRule,
+        RecursorVal, TheoremVal,
     };
     use fln_core::expr::Expr;
     use fln_core::level::Level;
     use fln_core::options::DataValue;
+    use std::collections::HashSet;
 
     fn n(s: &str) -> Name {
         Name::str(Name::anonymous(), s)
@@ -388,6 +400,334 @@ mod tests {
             },
             is_unsafe: false,
         })
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DeclarationTagCase {
+        Definition(DefinitionSafety),
+        Quotient(QuotKind),
+    }
+
+    impl DeclarationTagCase {
+        const ALL: [DeclarationTagCase; 7] = [
+            DeclarationTagCase::Definition(DefinitionSafety::Unsafe),
+            DeclarationTagCase::Definition(DefinitionSafety::Safe),
+            DeclarationTagCase::Definition(DefinitionSafety::Partial),
+            DeclarationTagCase::Quotient(QuotKind::Type),
+            DeclarationTagCase::Quotient(QuotKind::Ctor),
+            DeclarationTagCase::Quotient(QuotKind::Lift),
+            DeclarationTagCase::Quotient(QuotKind::Ind),
+        ];
+
+        const fn family(self) -> &'static str {
+            match self {
+                DeclarationTagCase::Definition(_) => "definition_safety",
+                DeclarationTagCase::Quotient(_) => "quot_kind",
+            }
+        }
+
+        const fn variant(self) -> &'static str {
+            match self {
+                DeclarationTagCase::Definition(DefinitionSafety::Unsafe) => "unsafe",
+                DeclarationTagCase::Definition(DefinitionSafety::Safe) => "safe",
+                DeclarationTagCase::Definition(DefinitionSafety::Partial) => "partial",
+                DeclarationTagCase::Quotient(QuotKind::Type) => "type",
+                DeclarationTagCase::Quotient(QuotKind::Ctor) => "ctor",
+                DeclarationTagCase::Quotient(QuotKind::Lift) => "lift",
+                DeclarationTagCase::Quotient(QuotKind::Ind) => "ind",
+            }
+        }
+
+        const fn kind_name(self) -> &'static str {
+            match self {
+                DeclarationTagCase::Definition(_) => "definition",
+                DeclarationTagCase::Quotient(_) => "quotient",
+            }
+        }
+
+        const fn canonical_tag(self) -> u8 {
+            match self {
+                DeclarationTagCase::Definition(DefinitionSafety::Unsafe) => 0,
+                DeclarationTagCase::Definition(DefinitionSafety::Safe) => 1,
+                DeclarationTagCase::Definition(DefinitionSafety::Partial) => 2,
+                DeclarationTagCase::Quotient(QuotKind::Type) => 0,
+                DeclarationTagCase::Quotient(QuotKind::Ctor) => 1,
+                DeclarationTagCase::Quotient(QuotKind::Lift) => 2,
+                DeclarationTagCase::Quotient(QuotKind::Ind) => 3,
+            }
+        }
+
+        const fn production_tag(self) -> u8 {
+            match self {
+                DeclarationTagCase::Definition(safety) => definition_safety_tag(safety),
+                DeclarationTagCase::Quotient(kind) => quot_kind_tag(kind),
+            }
+        }
+
+        /// Frozen `rich-same-name-v1` complete-stream goldens. These constants
+        /// prevent coordinated drift in both the production encoder and the
+        /// independent in-file model from silently redefining declaration identity.
+        const fn golden_stream_bytes(self) -> usize {
+            match self {
+                DeclarationTagCase::Definition(_) => 286,
+                DeclarationTagCase::Quotient(_) => 157,
+            }
+        }
+
+        const fn golden_stream_hash(self) -> &'static str {
+            match self {
+                DeclarationTagCase::Definition(DefinitionSafety::Unsafe) => {
+                    "157d1d61733828db775de4ee898c84ab608f57ca609965b7d8aba3ef9e3a1a5e"
+                }
+                DeclarationTagCase::Definition(DefinitionSafety::Safe) => {
+                    "e3a242872a3ffd8c515331f5821c1b42f81780060413feb33f2d63ca8aeb697d"
+                }
+                DeclarationTagCase::Definition(DefinitionSafety::Partial) => {
+                    "00a37c5b26ce2df45b79a0e5ddc0b32fe7ba3fd16e2267a8b199a3a2a5421f52"
+                }
+                DeclarationTagCase::Quotient(QuotKind::Type) => {
+                    "d85f3e7116bf264784bad45e2d9a9acc9ad69ca15c2387f73d390b51c1a52674"
+                }
+                DeclarationTagCase::Quotient(QuotKind::Ctor) => {
+                    "7a209bee80a459d0eddd0e82ced0b96345895dfdf11cb420729783eff42fe0a0"
+                }
+                DeclarationTagCase::Quotient(QuotKind::Lift) => {
+                    "706326aa022cfa4b76f80ea32c04ad0aef70d796da8762b86771b3b4d42937ad"
+                }
+                DeclarationTagCase::Quotient(QuotKind::Ind) => {
+                    "32cecea0df45330f5ea249486eb8c0dd4ff236dc27ca90e79122de9f7e3d365a"
+                }
+            }
+        }
+
+        const fn golden_digest(self) -> &'static str {
+            match self {
+                DeclarationTagCase::Definition(DefinitionSafety::Unsafe) => {
+                    "e6e48d3267b42c87425ac704373120f0c4624c591f6c3218412cdfd5464443ab"
+                }
+                DeclarationTagCase::Definition(DefinitionSafety::Safe) => {
+                    "5995ca5cc9f678192cb1700abb6bc18a87af673a6f3285cc9d55caa9b20bb6b0"
+                }
+                DeclarationTagCase::Definition(DefinitionSafety::Partial) => {
+                    "5a313316b29da1dab36b88cd02d1d52b96b025a3cb6b9682d0ba10eb59ae76d1"
+                }
+                DeclarationTagCase::Quotient(QuotKind::Type) => {
+                    "64a010c5b799b51b464f4394db8f06a4d7f0c8f98a89bc634cddf3936f3a431f"
+                }
+                DeclarationTagCase::Quotient(QuotKind::Ctor) => {
+                    "d8fc3394629ba859ee37b56dd6d937d787aa86b607b02941091a8699983e0589"
+                }
+                DeclarationTagCase::Quotient(QuotKind::Lift) => {
+                    "804e0ddc5baea6f095d63662b95d303a11c7f33cc92c8d5c77efeb96df021706"
+                }
+                DeclarationTagCase::Quotient(QuotKind::Ind) => {
+                    "7e0d5346e053845bda23a4fb2f3edf80f7daa3f86898a129d66d0531e0e22066"
+                }
+            }
+        }
+
+        const fn golden_root(self) -> &'static str {
+            match self {
+                DeclarationTagCase::Definition(DefinitionSafety::Unsafe) => {
+                    "87d17589cf2a1222d19498e2c4b398107043556cf546281992f223cb9f5a94a9"
+                }
+                DeclarationTagCase::Definition(DefinitionSafety::Safe) => {
+                    "69a4eda482d75712ead5edea8d70692319ac48b9b532b9944bd681e5d94b19ac"
+                }
+                DeclarationTagCase::Definition(DefinitionSafety::Partial) => {
+                    "d234cc1f558ec38a8a8c6ba090236f2239dcd3694b38ea955262cb709016ec47"
+                }
+                DeclarationTagCase::Quotient(QuotKind::Type) => {
+                    "4bf46c6cd5c5282272a303bed04d36d4a5c3d84684b3b588e821564368e10a54"
+                }
+                DeclarationTagCase::Quotient(QuotKind::Ctor) => {
+                    "05b8fe41a9783da42b03c43ec645d7fd239f924ac1996c2112819d7046aa26fe"
+                }
+                DeclarationTagCase::Quotient(QuotKind::Lift) => {
+                    "08dc046203aec4b81143baad0afcebd7655e77e9a4fc813d61fd67fb304edae5"
+                }
+                DeclarationTagCase::Quotient(QuotKind::Ind) => {
+                    "4edbf7598d4cbc73861526c523b02b126a13eaaa29e5f16b6a4a5b55e39b6414"
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DeclarationTagDigestModel {
+        Canonical,
+        OmitTag,
+        DebugText,
+        CastAfterSourceReorder,
+        MoveTagAcrossAdjacentField,
+        WrongDomain,
+    }
+
+    fn tagged_declaration(case: DeclarationTagCase, unique_name: bool) -> ConstantInfo {
+        let name = if unique_name {
+            format!("tagged.{}.{}", case.family(), case.variant())
+        } else {
+            "tagged".to_owned()
+        };
+        let name = Name::str(Name::anonymous(), name);
+        let base = ConstantVal {
+            name: name.clone(),
+            level_params: vec![n("u"), n("v")],
+            type_: Expr::app(
+                Expr::sort(Level::param(n("u"))),
+                Expr::const_(n("carrier"), vec![Level::param(n("v"))]),
+            ),
+        };
+        match case {
+            DeclarationTagCase::Definition(safety) => ConstantInfo::Defn(DefinitionVal {
+                base,
+                value: Expr::app(
+                    Expr::const_(n("body"), vec![Level::param(n("u"))]),
+                    Expr::sort(Level::param(n("v"))),
+                ),
+                hints: ReducibilityHints::Regular(0xa1b2_c3d4),
+                safety,
+                all: vec![name, n("peer")],
+            }),
+            DeclarationTagCase::Quotient(kind) => ConstantInfo::Quot(QuotVal { base, kind }),
+        }
+    }
+
+    fn write_modeled_declaration_tag(
+        w: &mut CanonWriter,
+        case: DeclarationTagCase,
+        model: DeclarationTagDigestModel,
+    ) {
+        match model {
+            DeclarationTagDigestModel::OmitTag => {}
+            DeclarationTagDigestModel::DebugText => w.str(case.variant()),
+            DeclarationTagDigestModel::CastAfterSourceReorder => {
+                let source_order_tag = match case {
+                    DeclarationTagCase::Definition(DefinitionSafety::Unsafe) => 1,
+                    DeclarationTagCase::Definition(DefinitionSafety::Safe) => 2,
+                    DeclarationTagCase::Definition(DefinitionSafety::Partial) => 0,
+                    DeclarationTagCase::Quotient(QuotKind::Type) => 1,
+                    DeclarationTagCase::Quotient(QuotKind::Ctor) => 2,
+                    DeclarationTagCase::Quotient(QuotKind::Lift) => 3,
+                    DeclarationTagCase::Quotient(QuotKind::Ind) => 0,
+                };
+                w.u8(source_order_tag);
+            }
+            DeclarationTagDigestModel::Canonical
+            | DeclarationTagDigestModel::MoveTagAcrossAdjacentField
+            | DeclarationTagDigestModel::WrongDomain => w.u8(case.canonical_tag()),
+        }
+    }
+
+    /// Control-flow-independent model of the complete Definition/Quotient
+    /// declaration streams. It intentionally avoids production kind/base/tag and
+    /// mutual-membership helpers.
+    fn modeled_tagged_declaration_bytes(
+        case: DeclarationTagCase,
+        info: &ConstantInfo,
+        model: DeclarationTagDigestModel,
+    ) -> Vec<u8> {
+        let base = match (case, info) {
+            (DeclarationTagCase::Definition(_), ConstantInfo::Defn(value)) => &value.base,
+            (DeclarationTagCase::Quotient(_), ConstantInfo::Quot(value)) => &value.base,
+            _ => unreachable!("tagged declaration case and fixture must agree"),
+        };
+        let mut w = CanonWriter::new();
+        w.str(case.kind_name());
+        base.name.write_body(&mut w);
+        w.u64(usize_to_u64(base.level_params.len()));
+        for parameter in &base.level_params {
+            parameter.write_body(&mut w);
+        }
+        if matches!(
+            (case, model),
+            (
+                DeclarationTagCase::Quotient(_),
+                DeclarationTagDigestModel::MoveTagAcrossAdjacentField
+            )
+        ) {
+            write_modeled_declaration_tag(&mut w, case, model);
+        }
+        base.type_.write_body(&mut w);
+        match (case, info) {
+            (DeclarationTagCase::Definition(_), ConstantInfo::Defn(value)) => {
+                value.value.write_body(&mut w);
+                let move_tag_across_adjacent_field =
+                    matches!(model, DeclarationTagDigestModel::MoveTagAcrossAdjacentField);
+                if move_tag_across_adjacent_field {
+                    write_modeled_declaration_tag(&mut w, case, model);
+                }
+                match value.hints {
+                    ReducibilityHints::Opaque => w.u8(0),
+                    ReducibilityHints::Abbrev => w.u8(1),
+                    ReducibilityHints::Regular(height) => {
+                        w.u8(2);
+                        w.u32(height);
+                    }
+                }
+                if !move_tag_across_adjacent_field {
+                    write_modeled_declaration_tag(&mut w, case, model);
+                }
+                w.u64(usize_to_u64(value.all.len()));
+                for member in &value.all {
+                    member.write_body(&mut w);
+                }
+            }
+            (DeclarationTagCase::Quotient(_), ConstantInfo::Quot(_)) => {
+                if !matches!(model, DeclarationTagDigestModel::MoveTagAcrossAdjacentField) {
+                    write_modeled_declaration_tag(&mut w, case, model);
+                }
+            }
+            _ => unreachable!("tagged declaration case and fixture must agree"),
+        }
+        w.into_bytes()
+    }
+
+    fn modeled_tagged_declaration_digest(
+        case: DeclarationTagCase,
+        info: &ConstantInfo,
+        model: DeclarationTagDigestModel,
+    ) -> Digest {
+        let bytes = modeled_tagged_declaration_bytes(case, info, model);
+        let domain = if matches!(model, DeclarationTagDigestModel::WrongDomain) {
+            Domain::Fixture
+        } else {
+            Domain::DeclContent
+        };
+        hash(domain, &bytes)
+    }
+
+    fn tagged_environment(cases: impl IntoIterator<Item = DeclarationTagCase>) -> Environment {
+        let mut environment = Environment::new();
+        for case in cases {
+            environment = environment
+                .add_decl(tagged_declaration(case, true))
+                .expect("tagged declaration fixture builds");
+        }
+        environment
+    }
+
+    fn permuted_tag_cases(
+        cases: &[DeclarationTagCase],
+        worker_index: usize,
+    ) -> Vec<DeclarationTagCase> {
+        let start = worker_index % cases.len();
+        let step = 1 + (worker_index / cases.len()) % (cases.len() - 1);
+        (0..cases.len())
+            .map(|offset| cases[(start + offset * step) % cases.len()])
+            .collect()
+    }
+
+    fn tag_case_order_id(cases: &[DeclarationTagCase]) -> Digest {
+        let mut w = CanonWriter::new();
+        w.str("fln.test.declaration-tag-order");
+        w.u16(1);
+        w.u64(usize_to_u64(cases.len()));
+        for case in cases {
+            w.str(case.family());
+            w.str(case.variant());
+        }
+        hash(Domain::Fixture, &w.into_bytes())
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -492,7 +832,7 @@ mod tests {
     fn write_membership_model(w: &mut CanonWriter, members: &[Name], model: MembershipModel) {
         match model {
             MembershipModel::Canonical => {
-                w.u64(members.len() as u64);
+                w.u64(usize_to_u64(members.len()));
                 for member in members {
                     member.write_body(w);
                 }
@@ -506,7 +846,7 @@ mod tests {
             MembershipModel::SortMembers => {
                 let mut sorted = members.to_vec();
                 sorted.sort();
-                w.u64(sorted.len() as u64);
+                w.u64(usize_to_u64(sorted.len()));
                 for member in &sorted {
                     member.write_body(w);
                 }
@@ -534,7 +874,7 @@ mod tests {
         w.str(kind_name);
         info.name().write_body(&mut w);
         let base = info.constant_val();
-        w.u64(base.level_params.len() as u64);
+        w.u64(usize_to_u64(base.level_params.len()));
         for parameter in &base.level_params {
             parameter.write_body(&mut w);
         }
@@ -574,7 +914,7 @@ mod tests {
                 w.bool(value.is_rec);
                 w.bool(value.is_unsafe);
                 w.bool(value.is_reflexive);
-                w.u64(value.ctors.len() as u64);
+                w.u64(usize_to_u64(value.ctors.len()));
                 for ctor in &value.ctors {
                     ctor.write_body(&mut w);
                 }
@@ -587,7 +927,7 @@ mod tests {
                 w.u32(value.num_minors);
                 w.bool(value.k);
                 w.bool(value.is_unsafe);
-                w.u64(value.rules.len() as u64);
+                w.u64(usize_to_u64(value.rules.len()));
                 for rule in &value.rules {
                     rule.ctor.write_body(&mut w);
                     w.u32(rule.nfields);
@@ -903,69 +1243,556 @@ mod tests {
     }
 
     #[test]
-    fn declaration_identity_enum_tags_are_explicit_and_distinct() {
-        use crate::constants::{DefinitionVal, QuotVal};
+    fn declaration_identity_tag_policy_is_const_exhaustive_and_cast_free() {
+        const DEFINITION_TAGS: [u8; 3] = [
+            definition_safety_tag(DefinitionSafety::Unsafe),
+            definition_safety_tag(DefinitionSafety::Safe),
+            definition_safety_tag(DefinitionSafety::Partial),
+        ];
+        const QUOTIENT_TAGS: [u8; 4] = [
+            quot_kind_tag(QuotKind::Type),
+            quot_kind_tag(QuotKind::Ctor),
+            quot_kind_tag(QuotKind::Lift),
+            quot_kind_tag(QuotKind::Ind),
+        ];
+        assert_eq!(DEFINITION_TAGS, [0, 1, 2]);
+        assert_eq!(QUOTIENT_TAGS, [0, 1, 2, 3]);
+        for case in DeclarationTagCase::ALL {
+            assert_eq!(
+                case.production_tag(),
+                case.canonical_tag(),
+                "production and independently frozen tag tables diverged for {}/{}",
+                case.family(),
+                case.variant()
+            );
+        }
+        eprintln!(
+            "{{\"schema\":\"fln.unit.declaration-tag-work\",\"version\":1,\
+             \"bead\":\"fln-amv.12\",\"claim_type\":\"bounded_model\",\
+             \"scenario\":\"closed-tag-projection-policy\",\
+             \"claim_scope\":\"closed_enum_tag_projection_only\",\
+             \"evidence\":\"const_exhaustive_match_plus_forbid_as_conversions\",\
+             \"definition_variant_count\":3,\"quotient_variant_count\":4,\
+             \"tag_helper_output_bytes\":1,\
+             \"tag_helper_input_dependent_iterations\":0,\
+             \"tag_helper_owned_allocations\":0,\
+             \"tag_helper_independent_cancellation_points\":0,\
+             \"tag_helper_separate_resource_limit_required\":false,\
+             \"enclosing_decl_content_budget_claim\":\"not_made\",\
+             \"enclosing_decl_content_budget_api\":\"absent\",\
+             \"resource_followup\":\"franken_lean-j8h\",\
+             \"status\":\"pass\"}}"
+        );
+    }
 
-        assert_eq!(definition_safety_tag(DefinitionSafety::Unsafe), 0);
-        assert_eq!(definition_safety_tag(DefinitionSafety::Safe), 1);
-        assert_eq!(definition_safety_tag(DefinitionSafety::Partial), 2);
-        assert_eq!(quot_kind_tag(QuotKind::Type), 0);
-        assert_eq!(quot_kind_tag(QuotKind::Ctor), 1);
-        assert_eq!(quot_kind_tag(QuotKind::Lift), 2);
-        assert_eq!(quot_kind_tag(QuotKind::Ind), 3);
-
-        let base = || ConstantVal {
-            name: n("tagged"),
-            level_params: vec![],
-            type_: Expr::sort(Level::zero()),
-        };
-        let definition = |safety| {
-            ConstantInfo::Defn(DefinitionVal {
-                base: base(),
-                value: Expr::sort(Level::zero()),
-                hints: ReducibilityHints::Opaque,
-                safety,
-                all: vec![n("tagged")],
-            })
-        };
-        let quotient = |kind| ConstantInfo::Quot(QuotVal { base: base(), kind });
-        let assert_pairwise_distinct = |infos: Vec<ConstantInfo>| {
-            let digests: Vec<Digest> = infos.iter().map(Environment::decl_content_digest).collect();
-            for (index, lhs) in digests.iter().enumerate() {
-                for rhs in &digests[index + 1..] {
-                    assert_ne!(lhs, rhs, "distinct schema tags must change identity");
-                }
-            }
-        };
-        assert_pairwise_distinct(vec![
-            definition(DefinitionSafety::Unsafe),
-            definition(DefinitionSafety::Safe),
-            definition(DefinitionSafety::Partial),
-        ]);
-        assert_pairwise_distinct(vec![
-            quotient(QuotKind::Type),
-            quotient(QuotKind::Ctor),
-            quotient(QuotKind::Lift),
-            quotient(QuotKind::Ind),
-        ]);
-
+    #[test]
+    fn declaration_identity_tag_matrix_matches_independent_model_and_roots() {
         let options = KVMap::new();
-        let root = Environment::new()
-            .add_decl(definition(DefinitionSafety::Safe))
-            .expect("tagged definition is valid")
-            .logical_root(&options);
-        let repeated = Environment::new()
-            .add_decl(definition(DefinitionSafety::Safe))
-            .expect("same tagged definition is valid")
-            .logical_root(&options);
-        assert_eq!(root, repeated, "explicit tags are stable across rebuilds");
+        let mut rows = Vec::with_capacity(DeclarationTagCase::ALL.len());
+        for case in DeclarationTagCase::ALL {
+            let info = tagged_declaration(case, false);
+            let canonical_bytes =
+                modeled_tagged_declaration_bytes(case, &info, DeclarationTagDigestModel::Canonical);
+            let expected_digest = hash(Domain::DeclContent, &canonical_bytes);
+            let actual_digest = Environment::decl_content_digest(&info);
+            assert_eq!(
+                actual_digest,
+                expected_digest,
+                "production declaration identity diverged from the independent model for {}/{}",
+                case.family(),
+                case.variant()
+            );
+            let repeated_digest =
+                Environment::decl_content_digest(&tagged_declaration(case, false));
+            assert_eq!(
+                actual_digest,
+                repeated_digest,
+                "declaration digest was not repeatable for {}/{}",
+                case.family(),
+                case.variant()
+            );
+
+            let environment = Environment::new()
+                .add_decl(info.clone())
+                .expect("single tagged declaration fixture builds");
+            let actual_root = environment.logical_root(&options);
+            let mut expected_root_builder = LogicalRootBuilder::new();
+            expected_root_builder.add_decl(info.name(), expected_digest);
+            expected_root_builder.set_options(&options);
+            let expected_root = expected_root_builder.finalize();
+            assert_eq!(
+                actual_root, expected_root,
+                "tagged declaration digest did not propagate exactly into the logical root"
+            );
+            let repeated_root = Environment::new()
+                .add_decl(tagged_declaration(case, false))
+                .expect("repeated tagged declaration fixture builds")
+                .logical_root(&options);
+            assert_eq!(
+                actual_root,
+                repeated_root,
+                "logical root was not repeatable for {}/{}",
+                case.family(),
+                case.variant()
+            );
+
+            let modeled_stream_hash = hash(Domain::Fixture, &canonical_bytes);
+            assert_eq!(
+                canonical_bytes.len(),
+                case.golden_stream_bytes(),
+                "complete modeled stream byte count drifted for {}/{}",
+                case.family(),
+                case.variant()
+            );
+            assert_eq!(
+                modeled_stream_hash.to_hex(),
+                case.golden_stream_hash(),
+                "complete modeled stream hash drifted for {}/{}",
+                case.family(),
+                case.variant()
+            );
+            assert_eq!(
+                actual_digest.to_hex(),
+                case.golden_digest(),
+                "declaration digest golden drifted for {}/{}",
+                case.family(),
+                case.variant()
+            );
+            assert_eq!(
+                actual_root.0.to_hex(),
+                case.golden_root(),
+                "logical root golden drifted for {}/{}",
+                case.family(),
+                case.variant()
+            );
+            eprintln!(
+                "{{\"schema\":\"fln.unit.declaration-tag-identity\",\"version\":1,\
+                 \"bead\":\"fln-amv.12\",\"claim_type\":\"bounded_model\",\
+                 \"scenario\":\"rich-same-name-seven-row-matrix\",\
+                 \"family\":\"{}\",\"variant\":\"{}\",\"canonical_tag\":{},\
+                 \"fixture_id\":\"rich-same-name-v1\",\
+                 \"modeled_canonical_stream_bytes\":{},\
+                 \"modeled_canonical_stream_hash\":\"{modeled_stream_hash}\",\
+                 \"expected_digest\":\"{expected_digest}\",\
+                 \"actual_digest\":\"{actual_digest}\",\
+                 \"repeated_digest\":\"{repeated_digest}\",\
+                 \"expected_root\":\"{expected_root}\",\
+                 \"actual_root\":\"{actual_root}\",\
+                 \"repeated_root\":\"{repeated_root}\",\
+                 \"frozen_stream_digest_root_goldens\":\"match\",\
+                 \"root_propagation\":\"exact\",\"status\":\"pass\"}}",
+                case.family(),
+                case.variant(),
+                case.canonical_tag(),
+                canonical_bytes.len()
+            );
+            rows.push((case, actual_digest));
+        }
+
+        let unique_digests: HashSet<_> = rows.iter().map(|(_, digest)| *digest).collect();
+        assert_eq!(
+            unique_digests.len(),
+            DeclarationTagCase::ALL.len(),
+            "all seven declaration tag cases must have distinct content identity"
+        );
+        let mut pairwise_comparisons = 0usize;
+        for (index, (lhs_case, lhs_digest)) in rows.iter().enumerate() {
+            for (rhs_case, rhs_digest) in &rows[index + 1..] {
+                assert_ne!(
+                    lhs_digest,
+                    rhs_digest,
+                    "distinct tag cases aliased: {}/{} and {}/{}",
+                    lhs_case.family(),
+                    lhs_case.variant(),
+                    rhs_case.family(),
+                    rhs_case.variant()
+                );
+                pairwise_comparisons += 1;
+            }
+        }
+        assert_eq!(pairwise_comparisons, 21);
+        eprintln!(
+            "{{\"schema\":\"fln.unit.declaration-tag-identity-summary\",\"version\":1,\
+             \"bead\":\"fln-amv.12\",\"claim_type\":\"bounded_model\",\
+             \"scenario\":\"rich-same-name-seven-row-matrix\",\
+             \"case_count\":7,\"unique_digest_count\":7,\
+             \"pairwise_comparisons\":{pairwise_comparisons},\
+             \"expected_pairwise_comparisons\":21,\
+             \"model\":\"independent-complete-definition-quotient-stream-v1\",\
+             \"root_propagation\":\"production-environment-exact\",\
+             \"status\":\"pass\"}}"
+        );
+    }
+
+    #[test]
+    fn declaration_identity_tag_named_mutants_are_discriminated() {
+        let options = KVMap::new();
+        let mut digest_discriminations = 0usize;
+        let mut root_propagation_discriminations = 0usize;
+        for case in DeclarationTagCase::ALL {
+            let info = tagged_declaration(case, false);
+            let canonical_bytes =
+                modeled_tagged_declaration_bytes(case, &info, DeclarationTagDigestModel::Canonical);
+            let canonical_digest = Environment::decl_content_digest(&info);
+            assert_eq!(
+                canonical_digest,
+                hash(Domain::DeclContent, &canonical_bytes),
+                "production digest must equal the independent canonical stream model"
+            );
+            let canonical_stream_hash = hash(Domain::Fixture, &canonical_bytes);
+            let canonical_environment = Environment::new()
+                .add_decl(info.clone())
+                .expect("single tagged declaration fixture builds");
+            let canonical_root = canonical_environment.logical_root(&options);
+            let mut canonical_model_root_builder = LogicalRootBuilder::new();
+            canonical_model_root_builder.add_decl(info.name(), canonical_digest);
+            canonical_model_root_builder.set_options(&options);
+            assert_eq!(
+                canonical_root,
+                canonical_model_root_builder.finalize(),
+                "production logical root must propagate the canonical modeled digest exactly"
+            );
+
+            for (mutation, model) in [
+                ("omit_tag", DeclarationTagDigestModel::OmitTag),
+                ("debug_text", DeclarationTagDigestModel::DebugText),
+                (
+                    "cast_after_source_reorder",
+                    DeclarationTagDigestModel::CastAfterSourceReorder,
+                ),
+                (
+                    "move_tag_across_adjacent_field",
+                    DeclarationTagDigestModel::MoveTagAcrossAdjacentField,
+                ),
+                ("wrong_domain", DeclarationTagDigestModel::WrongDomain),
+            ] {
+                let mutated_bytes = modeled_tagged_declaration_bytes(case, &info, model);
+                let mutated_digest = modeled_tagged_declaration_digest(case, &info, model);
+                assert_ne!(
+                    canonical_digest,
+                    mutated_digest,
+                    "{mutation} mutant survived for {}/{}",
+                    case.family(),
+                    case.variant()
+                );
+                match model {
+                    DeclarationTagDigestModel::OmitTag => {
+                        assert_eq!(
+                            canonical_bytes.len(),
+                            mutated_bytes.len() + 1,
+                            "omitting the fixed tag must remove exactly one byte"
+                        );
+                        assert_ne!(
+                            mutated_bytes, canonical_bytes,
+                            "omitting the fixed tag must change the modeled stream"
+                        );
+                    }
+                    DeclarationTagDigestModel::DebugText => {
+                        assert_eq!(
+                            mutated_bytes.len(),
+                            canonical_bytes.len() + 7 + case.variant().len(),
+                            "debug text must replace one byte with a length-prefixed variant"
+                        );
+                        assert_ne!(
+                            mutated_bytes, canonical_bytes,
+                            "debug text must change the modeled stream"
+                        );
+                    }
+                    DeclarationTagDigestModel::CastAfterSourceReorder
+                    | DeclarationTagDigestModel::MoveTagAcrossAdjacentField => {
+                        assert_eq!(
+                            mutated_bytes.len(),
+                            canonical_bytes.len(),
+                            "{mutation} must isolate value/order rather than stream size"
+                        );
+                        assert_ne!(
+                            mutated_bytes, canonical_bytes,
+                            "{mutation} must change bytes while preserving stream size"
+                        );
+                    }
+                    DeclarationTagDigestModel::WrongDomain => {
+                        assert_eq!(
+                            mutated_bytes, canonical_bytes,
+                            "wrong-domain mutation must change only domain separation"
+                        );
+                    }
+                    DeclarationTagDigestModel::Canonical => {
+                        unreachable!("canonical is not a mutation")
+                    }
+                }
+
+                let mutated_stream_hash = hash(Domain::Fixture, &mutated_bytes);
+                let mut mutated_root_builder = LogicalRootBuilder::new();
+                mutated_root_builder.add_decl(info.name(), mutated_digest);
+                mutated_root_builder.set_options(&options);
+                let mutated_root = mutated_root_builder.finalize();
+                assert_ne!(
+                    canonical_root,
+                    mutated_root,
+                    "{mutation} root-propagation mutant survived for {}/{}",
+                    case.family(),
+                    case.variant()
+                );
+                digest_discriminations += 1;
+                root_propagation_discriminations += 1;
+                eprintln!(
+                    "{{\"schema\":\"fln.unit.declaration-tag-mutant\",\"version\":1,\
+                     \"bead\":\"fln-amv.12\",\"claim_type\":\"bounded_model\",\
+                     \"scenario\":\"named-tag-identity-mutants\",\
+                     \"family\":\"{}\",\"variant\":\"{}\",\
+                     \"mutation\":\"{mutation}\",\"canonical_tag\":{},\
+                     \"root_mutation\":\"failed_root_propagation\",\
+                     \"modeled_canonical_stream_bytes\":{},\
+                     \"modeled_mutated_stream_bytes\":{},\
+                     \"modeled_canonical_stream_hash\":\"{canonical_stream_hash}\",\
+                     \"modeled_mutated_stream_hash\":\"{mutated_stream_hash}\",\
+                     \"canonical_digest\":\"{canonical_digest}\",\
+                     \"mutated_digest\":\"{mutated_digest}\",\
+                     \"production_canonical_root\":\"{canonical_root}\",\
+                     \"modeled_mutated_root\":\"{mutated_root}\",\
+                     \"expected_digest_relation\":\"different\",\
+                     \"actual_digest_relation\":\"different\",\
+                     \"expected_root_relation\":\"different\",\
+                     \"actual_root_relation\":\"different\",\"status\":\"pass\"}}",
+                    case.family(),
+                    case.variant(),
+                    case.canonical_tag(),
+                    canonical_bytes.len(),
+                    mutated_bytes.len()
+                );
+            }
+        }
+        assert_eq!(
+            digest_discriminations, 35,
+            "five digest mutants must be killed for all seven cases"
+        );
+        assert_eq!(
+            root_propagation_discriminations, 35,
+            "all five digest mutants must propagate to distinct roots for all seven cases"
+        );
+        eprintln!(
+            "{{\"schema\":\"fln.unit.declaration-tag-mutants-summary\",\"version\":1,\
+             \"bead\":\"fln-amv.12\",\"claim_type\":\"bounded_model\",\
+             \"scenario\":\"named-tag-identity-mutants\",\
+             \"case_count\":7,\"digest_mutation_classes\":5,\
+             \"root_mutation_class\":\"failed_root_propagation\",\
+             \"root_propagation_input_classes\":5,\
+             \"digest_discriminations\":{digest_discriminations},\
+             \"root_propagation_discriminations\":{root_propagation_discriminations},\
+             \"total_discriminations\":{},\"status\":\"pass\"}}",
+            digest_discriminations + root_propagation_discriminations
+        );
+    }
+
+    #[test]
+    fn declaration_identity_tag_is_stable_across_1_8_32_concurrent_complete_builds() {
+        let cases = DeclarationTagCase::ALL.to_vec();
+        let options = KVMap::new();
+        let canonical_environment = tagged_environment(cases.iter().copied());
+
+        let mut expected_root_builder = LogicalRootBuilder::new();
+        for case in cases.iter().copied() {
+            let info = tagged_declaration(case, true);
+            let digest = modeled_tagged_declaration_digest(
+                case,
+                &info,
+                DeclarationTagDigestModel::Canonical,
+            );
+            expected_root_builder.add_decl(info.name(), digest);
+        }
+        expected_root_builder.set_options(&options);
+        let expected_root = expected_root_builder.finalize();
+        assert_eq!(
+            canonical_environment.logical_root(&options),
+            expected_root,
+            "canonical seven-declaration environment diverged from the aggregate model"
+        );
+
+        let omitted_root = tagged_environment(cases.iter().copied().skip(1)).logical_root(&options);
+        assert_ne!(
+            omitted_root, expected_root,
+            "omitting one tagged declaration must change the aggregate root"
+        );
+        let mut source_order_root_builder = LogicalRootBuilder::new();
+        for (index, case) in cases.iter().copied().enumerate() {
+            let info = tagged_declaration(case, true);
+            let model = if index == 0 {
+                DeclarationTagDigestModel::CastAfterSourceReorder
+            } else {
+                DeclarationTagDigestModel::Canonical
+            };
+            source_order_root_builder.add_decl(
+                info.name(),
+                modeled_tagged_declaration_digest(case, &info, model),
+            );
+        }
+        source_order_root_builder.set_options(&options);
+        let source_order_root = source_order_root_builder.finalize();
+        assert_ne!(
+            source_order_root, expected_root,
+            "one source-order-dependent tag must change the aggregate root"
+        );
+
+        for worker_count in [1usize, 8, 32] {
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..worker_count)
+                    .map(|worker_index| {
+                        let permutation = permuted_tag_cases(&cases, worker_index);
+                        scope.spawn(move || {
+                            let order_id = tag_case_order_id(&permutation);
+                            let raw_order = permutation
+                                .iter()
+                                .map(|case| (case.family(), case.variant()))
+                                .collect::<Vec<_>>();
+                            let environment = tagged_environment(permutation.iter().copied());
+                            let root = environment.logical_root(&KVMap::new());
+                            (order_id, raw_order, environment, root)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("declaration tag worker joins"))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(results.len(), worker_count);
+            let order_ids: HashSet<_> = results
+                .iter()
+                .map(|(order_id, _, _, _)| *order_id)
+                .collect();
+            let raw_orders: HashSet<_> = results
+                .iter()
+                .map(|(_, raw_order, _, _)| raw_order.clone())
+                .collect();
+            let distinct_full_permutations = raw_orders.len();
+            assert_eq!(
+                distinct_full_permutations, worker_count,
+                "every worker must receive a distinct raw seven-case permutation"
+            );
+            assert_eq!(
+                order_ids.len(),
+                distinct_full_permutations,
+                "hashed order ids must preserve the measured raw permutation cardinality"
+            );
+
+            let mut worker_roots = Vec::with_capacity(results.len());
+            for (worker_index, (order_id, raw_order, environment, actual_root)) in
+                results.iter().enumerate()
+            {
+                assert_eq!(
+                    raw_order.len(),
+                    DeclarationTagCase::ALL.len(),
+                    "every worker order must contain all seven declaration-tag cases"
+                );
+                let raw_input_order_labels = raw_order
+                    .iter()
+                    .map(|(family, variant)| format!("{family}/{variant}"))
+                    .collect::<Vec<_>>()
+                    .join(">");
+                assert_eq!(
+                    environment, &canonical_environment,
+                    "{worker_count}-worker environment diverged for order {order_id}"
+                );
+                assert_eq!(
+                    *actual_root, expected_root,
+                    "{worker_count}-worker root diverged for order {order_id}"
+                );
+                assert_eq!(
+                    environment.logical_root(&options),
+                    *actual_root,
+                    "worker root was not repeatable"
+                );
+                for case in cases.iter().copied() {
+                    let expected_info = tagged_declaration(case, true);
+                    let actual_info = environment
+                        .find(expected_info.name())
+                        .expect("worker retains every tagged declaration");
+                    assert_eq!(actual_info, &expected_info);
+                    assert_eq!(
+                        Environment::decl_content_digest(actual_info),
+                        modeled_tagged_declaration_digest(
+                            case,
+                            &expected_info,
+                            DeclarationTagDigestModel::Canonical,
+                        ),
+                        "worker declaration digest diverged for {}/{}",
+                        case.family(),
+                        case.variant()
+                    );
+                }
+                worker_roots.push(*actual_root);
+                eprintln!(
+                    "{{\"schema\":\"fln.unit.declaration-tag-concurrent-build\",\
+                     \"version\":1,\"bead\":\"fln-amv.12\",\
+                     \"claim_type\":\"bounded_model\",\
+                     \"scenario\":\"complete-environment-thread-matrix\",\
+                     \"invariant_relation\":\"supports-local-environment-identity-slice\",\
+                     \"gate_relation\":\"partial-component-evidence\",\
+                     \"execution_model\":\"independent_complete_build_per_worker\",\
+                     \"concurrent_worker_count\":{worker_count},\
+                     \"worker_index\":{worker_index},\
+                     \"input_order_id\":\"{order_id}\",\
+                     \"raw_input_order_case_count\":{},\
+                     \"raw_input_order_labels\":\"{raw_input_order_labels}\",\
+                     \"declaration_cases\":7,\"actual_root\":\"{actual_root}\",\
+                     \"expected_root\":\"{expected_root}\",\
+                     \"full_environment_equal\":true,\
+                     \"per_name_digest_equal\":true,\"status\":\"pass\"}}",
+                    raw_order.len()
+                );
+            }
+
+            let mut sorted_order_ids: Vec<_> = order_ids.into_iter().collect();
+            sorted_order_ids.sort_unstable();
+            let mut order_set_writer = CanonWriter::new();
+            order_set_writer.str("fln.test.declaration-tag-order-set");
+            order_set_writer.u16(1);
+            order_set_writer.u64(usize_to_u64(sorted_order_ids.len()));
+            for order_id in sorted_order_ids {
+                order_set_writer.bytes(&order_id.0);
+            }
+            let order_set_hash = hash(Domain::Fixture, &order_set_writer.into_bytes());
+
+            worker_roots.sort_unstable();
+            let mut root_set_writer = CanonWriter::new();
+            root_set_writer.str("fln.test.declaration-tag-worker-roots");
+            root_set_writer.u16(1);
+            root_set_writer.u64(usize_to_u64(worker_roots.len()));
+            for root in worker_roots {
+                root_set_writer.bytes(&root.0.0);
+            }
+            let worker_roots_hash = hash(Domain::Fixture, &root_set_writer.into_bytes());
+            eprintln!(
+                "{{\"schema\":\"fln.unit.declaration-tag-concurrent-build-summary\",\
+                 \"version\":1,\"bead\":\"fln-amv.12\",\
+                 \"claim_type\":\"bounded_model\",\
+                 \"scenario\":\"complete-environment-thread-matrix\",\
+                 \"invariant_relation\":\"supports-local-environment-identity-slice\",\
+                 \"gate_relation\":\"partial-component-evidence\",\
+                 \"permutation_scheme\":\"affine-modulo-seven-v1\",\
+                 \"concurrent_worker_count\":{worker_count},\
+                 \"productive_workers\":{},\"distinct_full_permutations\":{},\
+                 \"declaration_cases_per_worker\":7,\
+                 \"order_set_hash\":\"{order_set_hash}\",\
+                 \"worker_roots_hash\":\"{worker_roots_hash}\",\
+                 \"expected_root\":\"{expected_root}\",\
+                 \"omitted_declaration_root\":\"{omitted_root}\",\
+                 \"source_order_mutant_root\":\"{source_order_root}\",\
+                 \"full_environment_equal\":true,\
+                 \"per_name_digest_equal\":true,\
+                 \"omission_negative_control\":\"pass\",\
+                 \"source_order_negative_control\":\"pass\",\"status\":\"pass\"}}",
+                results.len(),
+                distinct_full_permutations
+            );
+        }
     }
 
     #[test]
     fn mutual_block_membership_changes_the_content_digest() {
         const LARGE_MEMBER_COUNT: usize = 4_096;
         let large_members: Vec<Name> = (0..LARGE_MEMBER_COUNT)
-            .map(|index| Name::num(n("member"), index as u64))
+            .map(|index| Name::num(n("member"), usize_to_u64(index)))
             .collect();
         let boundary_cases = vec![
             ("empty", Vec::new()),
@@ -1177,8 +2004,10 @@ mod tests {
                     } else {
                         n("right")
                     };
-                    let numbered =
-                        Name::num(root, ((case_index * 13 + member_index * 7) % 11) as u64);
+                    let numbered = Name::num(
+                        root,
+                        usize_to_u64((case_index * 13 + member_index * 7) % 11),
+                    );
                     if (case_index + member_index) % 3 == 0 {
                         Name::str(numbered, "leaf")
                     } else {
@@ -1246,7 +2075,7 @@ mod tests {
     fn mutual_membership_writer_has_canonical_stream_shape() {
         for member_count in [0usize, 1, 32, 4_096] {
             let members: Vec<Name> = (0..member_count)
-                .map(|index| Name::num(n("member"), index as u64))
+                .map(|index| Name::num(n("member"), usize_to_u64(index)))
                 .collect();
             let canonical_member_bytes = canonical_name_body_bytes(&members);
 
