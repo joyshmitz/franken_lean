@@ -95,3 +95,9 @@ row FLN-UL-0059 | crates/fln-unsafe-region/src/mapping.rs | as_slice: mapping li
 row FLN-UL-0060 | crates/fln-unsafe-region/src/mapping.rs | as_mut_slice: exclusivity via &mut self; refused after seal (typed Sealed) | CoW write tests; seal refusal test | typed Sealed error | no admission
 row FLN-UL-0061 | crates/fln-unsafe-region/src/mapping.rs | seal: owned range, &mut self proves no live borrow while protections narrow | seal tests; e2e hardened trap lane | typed Sys error on mprotect failure | no admission
 row FLN-UL-0062 | crates/fln-unsafe-region/src/mapping.rs | Drop munmap: owned range, borrows ended by drop rules | every suite's teardown | munmap failure unreachable for well-formed mappings; ignored in Drop | no admission
+
+# ---- bead fln-wgp slice 2: hardened trap-on-write drill (test apparatus) ----
+# The probe below is the one deliberate invariant VIOLATION in the ledger: it
+# exists to prove the seal trap fires. It is an example binary built only by
+# the Tribunal lane, never linked into any production artifact.
+row FLN-UL-0063 | crates/fln-unsafe-region/examples/region_trap_probe.rs | NONE (deliberate violation): one volatile store into a sealed mapping so the hardware trap is proven; volatile so the store cannot be elided | e2e hardened trap lane (marrow_region_load lane 7) asserts the child dies by SIGSEGV | a surviving write is reported (exit 5) and the lane fails loudly | no admission; drill-only child process, nothing trusted after the store

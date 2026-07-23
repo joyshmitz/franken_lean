@@ -2,10 +2,13 @@
 # marrow_region_load.sh — compacted regions end to end (bead fln-wgp, §6.4):
 # real pinned-toolchain oleans load via mmap + relocation and materialize as
 # live objects; page sharing across two consumers is measured with real
-# kernel accounting; corrupted regions fault typed (never panic); and the
-# atomic staging drill proves a crash never half-publishes a region.
+# kernel accounting; corrupted regions fault typed (never panic); the atomic
+# staging drill proves a crash never half-publishes a region; and the
+# hardened trap-on-write drill proves a sealed region kills a raw writer
+# with SIGSEGV while the safe surface refuses typed (region hygiene).
 #
-# No-mock lane: real olean fixtures, real mmap/smaps, real process kills.
+# No-mock lane: real olean fixtures, real mmap/smaps, real process kills,
+# real hardware traps.
 
 set -euo pipefail
 
@@ -49,7 +52,7 @@ else
 fi
 
 # ---- lane 2: build the drivers ----------------------------------------------
-if CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --offline -q -p fln-rt --examples >"$ART_DIR/build.log" 2>&1; then
+if CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --offline -q -p fln-rt -p fln-unsafe-region --examples >"$ART_DIR/build.log" 2>&1; then
     emit build_drivers passed "\"artifact\":\"build.log\""
 else
     emit build_drivers failed "\"artifact\":\"build.log\""
@@ -159,6 +162,71 @@ if "$LOAD" "$ROOT/tribunal/fixtures/c3/Init.SizeOfLemmas.olean" \
     fi
 else
     emit staging_recovery failed "\"artifact\":\"rebuild.err\""
+    fail_run
+fi
+
+# ---- lane 7: hardened trap-on-write drill (region hygiene) ------------------
+note "lane 7: hardened trap-on-write drill"
+TRAP="$BUILD_TARGET/debug/examples/region_trap_probe"
+FIX="$ROOT/tribunal/fixtures/c3/Init.SizeOfLemmas.olean"
+pre_sum=$(cksum <"$FIX")
+
+# Positive control: a sealed mapping stays fully readable.
+if "$TRAP" "$FIX" no-write >"$ART_DIR/trap_read.ndjson" 2>"$ART_DIR/trap_read.err"; then
+    emit trap_read_control passed "\"artifact\":\"trap_read.ndjson\""
+else
+    emit trap_read_control failed "\"artifact\":\"trap_read.err\""
+    fail_run
+fi
+
+# Typed refusal: the safe surface refuses sealed mutation (FL-INV-07 plane).
+if "$TRAP" "$FIX" safe-write >"$ART_DIR/trap_safe.ndjson" 2>"$ART_DIR/trap_safe.err" \
+    && grep -q '"ok":true' "$ART_DIR/trap_safe.ndjson"; then
+    emit trap_typed_refusal passed "\"artifact\":\"trap_safe.ndjson\""
+else
+    emit trap_typed_refusal failed "\"artifact\":\"trap_safe.ndjson\""
+    fail_run
+fi
+
+# The trap itself: a raw write into the sealed mapping — the move a buggy
+# plugin or JIT stub would make through the membrane — must die by SIGSEGV
+# (rc 128+11), after the probe logged that it reached the write.
+set +e
+"$TRAP" "$FIX" raw-write >"$ART_DIR/trap_raw.ndjson" 2>"$ART_DIR/trap_raw.err"
+trap_rc=$?
+set -e
+if [ "$trap_rc" -ne 139 ]; then
+    emit trap_on_write failed "\"detail\":\"expected SIGSEGV (rc 139), got rc $trap_rc\""
+    fail_run
+fi
+if grep -q "panicked" "$ART_DIR/trap_raw.err"; then
+    emit trap_on_write failed "\"detail\":\"trap path panicked instead of faulting\""
+    fail_run
+fi
+if ! grep -q '"attempting_raw_write"' "$ART_DIR/trap_raw.ndjson"; then
+    emit trap_on_write failed "\"detail\":\"probe died before reaching the write\""
+    fail_run
+fi
+emit trap_on_write passed "\"signal\":11,\"rc\":$trap_rc,\"artifact\":\"trap_raw.ndjson\""
+
+# Isolation: the crashed writer changed nothing — the artifact is
+# byte-identical (CoW + the trap) and reloads with the lane-3 object count.
+post_sum=$(cksum <"$FIX")
+if [ "$pre_sum" != "$post_sum" ]; then
+    emit trap_isolation failed "\"detail\":\"artifact bytes changed under the trap drill\""
+    fail_run
+fi
+if "$LOAD" "$FIX" >"$ART_DIR/trap_reload.ndjson" 2>"$ART_DIR/trap_reload.err"; then
+    lane3_objects=$(grep -o '"objects":[0-9]*' "$ART_DIR/load_Init.SizeOfLemmas.olean.ndjson" | cut -d: -f2)
+    trap_objects=$(grep -o '"objects":[0-9]*' "$ART_DIR/trap_reload.ndjson" | cut -d: -f2)
+    if [ "$trap_objects" = "$lane3_objects" ]; then
+        emit trap_isolation passed "\"objects\":$trap_objects,\"artifact\":\"trap_reload.ndjson\""
+    else
+        emit trap_isolation failed "\"detail\":\"object count drifted after the drill: $lane3_objects vs $trap_objects\""
+        fail_run
+    fi
+else
+    emit trap_isolation failed "\"artifact\":\"trap_reload.err\""
     fail_run
 fi
 

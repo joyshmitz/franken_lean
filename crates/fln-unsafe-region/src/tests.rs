@@ -69,6 +69,46 @@ fn seal_refuses_mutation_and_double_seal() {
     assert_eq!(m.as_slice()[1], 2);
 }
 
+/// The permission string for the VMA starting exactly at `addr`, from
+/// /proc/self/maps (e.g. "rw-p"). Safe kernel-side observation of what
+/// mprotect actually did — no signal handling required.
+fn vma_perms(addr: usize) -> String {
+    let maps = std::fs::read_to_string("/proc/self/maps").expect("maps readable");
+    let prefix = format!("{addr:x}-");
+    for line in maps.lines() {
+        if line.starts_with(&prefix) {
+            return line
+                .split_whitespace()
+                .nth(1)
+                .expect("maps line has perms")
+                .to_string();
+        }
+    }
+    panic!("no VMA starts at {addr:#x}");
+}
+
+#[test]
+fn seal_narrows_kernel_protection_to_read_only() {
+    // The trap-on-write law's kernel-side half (fln-wgp slice 2): seal must
+    // actually narrow the VMA to read-only — a seal that only flips the Rust
+    // flag (the mutable-published-region mutant) fails here, and the e2e
+    // raw-write drill proves the resulting hardware trap.
+    let path = scratch("prot", &[9u8; 100]); // deliberately not page-sized
+    let mut m = RegionMapping::map_file_private(&path).expect("map");
+    assert!(
+        vma_perms(m.addr()).starts_with("rw"),
+        "pre-seal mapping must be read-write"
+    );
+    m.seal().expect("seal");
+    assert_eq!(
+        vma_perms(m.addr()),
+        "r--p",
+        "sealed mapping must be read-only and private in the kernel's own accounting"
+    );
+    // The whole rounded range is one read-only VMA: reads anywhere stay valid.
+    assert_eq!(m.as_slice()[99], 9);
+}
+
 #[test]
 fn at_base_fast_path_and_occupied_fallback() {
     let path = scratch("atbase", &[3u8; 4096]);
