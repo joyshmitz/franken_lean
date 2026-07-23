@@ -25,6 +25,7 @@ import os
 import platform
 import re
 import resource
+import select
 import signal
 import stat
 import subprocess
@@ -177,6 +178,17 @@ ENVIRONMENT_COLLISION_FIELDS = {
 MAX_RECORD_BYTES = 1_048_576
 MAX_LOG_BYTES = 67_108_864
 MAX_EXEC_STATUS_BYTES = 4096
+STOPPED_GATE_READY_TOKEN = b"fln-private-ready-v1\n"
+STOPPED_GATE_RELEASE_TOKEN = b"fln-private-release-v1\n"
+SUPERVISOR_TEST_FAULT_POINTS = {
+    "none",
+    "capture_stdout",
+    "capture_stderr",
+    "metadata_parent_open",
+    "readiness_publication",
+    "thread_start_stdout",
+    "thread_start_stderr",
+}
 PROCESS_GROUP_FREEZE_ATTEMPTS = 8
 PROCESS_GROUP_FREEZE_TIMEOUT_S = 10.0
 PROCESS_GROUP_KILL_ATTEMPTS = 2000
@@ -660,7 +672,7 @@ class BoundedCapture:
             "retained_bytes": retained,
             "head_bytes": head,
             "tail_bytes": tail,
-            "truncated": self.truncated,
+            "truncated": self.truncated or retained != self.total,
         }
 
 
@@ -678,6 +690,238 @@ def drain(pipe: Any, capture: BoundedCapture, errors: list[str], label: str) -> 
             pipe.close()
         except OSError as error:
             errors.append(f"{label} close failed: {error}")
+
+
+class StoppedExecProcess:
+    """Minimal Popen-compatible handle for a target forked inert before exec."""
+
+    def __init__(self, pid: int, stdout_descriptor: int, stderr_descriptor: int):
+        self.pid = pid
+        try:
+            self.stdout = os.fdopen(stdout_descriptor, "rb", buffering=0)
+        except BaseException:
+            os.close(stdout_descriptor)
+            os.close(stderr_descriptor)
+            raise
+        try:
+            self.stderr = os.fdopen(stderr_descriptor, "rb", buffering=0)
+        except BaseException:
+            self.stdout.close()
+            os.close(stderr_descriptor)
+            raise
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
+        except InterruptedError:
+            return None
+        if waited_pid == 0:
+            return None
+        if waited_pid != self.pid:
+            raise EvidenceError("reaped an unexpected stopped-exec child")
+        self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self.returncode is not None:
+            return self.returncode
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            try:
+                if deadline is None:
+                    waited_pid, status = os.waitpid(self.pid, 0)
+                else:
+                    waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            if waited_pid == self.pid:
+                self.returncode = os.waitstatus_to_exitcode(status)
+                return self.returncode
+            if waited_pid != 0:
+                raise EvidenceError("reaped an unexpected stopped-exec child")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.pid, timeout)
+            time.sleep(0.005)
+
+    def kill(self) -> None:
+        if self.poll() is not None:
+            return
+        try:
+            os.kill(self.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def spawn_stopped_exec(
+    argv: Sequence[str],
+    cwd: Path,
+    expected_parent_pid: int,
+    *,
+    target_signal_mask: set[signal.Signals],
+    test_before_stop_delay_ms: int = 0,
+    test_gate_mode: str = "normal",
+) -> tuple[StoppedExecProcess, int, int, int]:
+    """Fork an inert future target with no intervening interpreter or user exec."""
+    try:
+        task_ids = {
+            int(entry.name)
+            for entry in Path("/proc/self/task").iterdir()
+            if entry.name.isdecimal()
+        }
+    except OSError as error:
+        raise EvidenceError("cannot prove stopped-target fork thread state") from error
+    if threading.active_count() != 1 or task_ids != {os.getpid()}:
+        raise EvidenceError("stopped target fork requires a single-threaded supervisor")
+    opened_descriptors: list[int] = []
+    try:
+        stdout_read, stdout_write = os.pipe2(os.O_CLOEXEC)
+        opened_descriptors.extend((stdout_read, stdout_write))
+        stderr_read, stderr_write = os.pipe2(os.O_CLOEXEC)
+        opened_descriptors.extend((stderr_read, stderr_write))
+        exec_read, exec_write = os.pipe2(os.O_CLOEXEC)
+        opened_descriptors.extend((exec_read, exec_write))
+        gate_ready_read, gate_ready_write = os.pipe2(os.O_CLOEXEC)
+        opened_descriptors.extend((gate_ready_read, gate_ready_write))
+        gate_release_read, gate_release_write = os.pipe2(os.O_CLOEXEC)
+        opened_descriptors.extend((gate_release_read, gate_release_write))
+        null_descriptor = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+        opened_descriptors.append(null_descriptor)
+    except BaseException:
+        for descriptor in opened_descriptors:
+            os.close(descriptor)
+        raise
+    try:
+        child_pid = os.fork()
+    except BaseException:
+        for descriptor in opened_descriptors:
+            os.close(descriptor)
+        raise
+    if child_pid == 0:
+        try:
+            default_signals = {
+                signal.SIGHUP,
+                signal.SIGINT,
+                signal.SIGTERM,
+                signal.SIGPIPE,
+            }
+            for signal_name in ("SIGXFZ", "SIGXFSZ"):
+                candidate = getattr(signal, signal_name, None)
+                if candidate is not None:
+                    default_signals.add(candidate)
+            for signum in default_signals:
+                signal.signal(signum, signal.SIG_DFL)
+            os.dup2(null_descriptor, 0, inheritable=True)
+            os.dup2(stdout_write, 1, inheritable=True)
+            os.dup2(stderr_write, 2, inheritable=True)
+            os.dup2(exec_write, 3, inheritable=False)
+            retained_descriptors = {gate_ready_write, gate_release_read}
+            for raw_descriptor in os.listdir("/proc/self/fd"):
+                descriptor = int(raw_descriptor)
+                if descriptor > 3 and descriptor not in retained_descriptors:
+                    try:
+                        os.close(descriptor)
+                    except OSError as error:
+                        if error.errno != errno.EBADF:
+                            raise
+            os.setsid()
+            arm_parent_death_kill(expected_parent_pid)
+            os.chdir(cwd)
+            if test_before_stop_delay_ms:
+                time.sleep(test_before_stop_delay_ms / 1000)
+            if test_gate_mode == "exit_before_stop":
+                os._exit(SETUP_FAILURE)
+            ready_view = memoryview(STOPPED_GATE_READY_TOKEN)
+            while ready_view:
+                written = os.write(gate_ready_write, ready_view)
+                if written <= 0:
+                    raise EvidenceError("private gate readiness made no progress")
+                ready_view = ready_view[written:]
+            os.close(gate_ready_write)
+            if test_gate_mode == "never_stop":
+                while True:
+                    time.sleep(60)
+            os.kill(os.getpid(), signal.SIGSTOP)
+        except BaseException:
+            os._exit(SETUP_FAILURE)
+        if test_gate_mode == "die_after_stop":
+            os.kill(os.getpid(), signal.SIGKILL)
+        try:
+            release = bytearray()
+            while len(release) <= len(STOPPED_GATE_RELEASE_TOKEN):
+                block = os.read(
+                    gate_release_read,
+                    len(STOPPED_GATE_RELEASE_TOKEN) + 1 - len(release),
+                )
+                if not block:
+                    break
+                release.extend(block)
+            os.close(gate_release_read)
+            if bytes(release) != STOPPED_GATE_RELEASE_TOKEN:
+                raise EvidenceError("private stopped-target release token mismatch")
+            signal.pthread_sigmask(signal.SIG_SETMASK, target_signal_mask)
+            os.execvp(argv[0], list(argv))
+            raise EvidenceError("stopped target exec unexpectedly returned")
+        except BaseException as error:
+            try:
+                write_exec_failure_status(3, error)
+            except BaseException:
+                pass
+            try:
+                os.close(3)
+            except OSError:
+                pass
+            os._exit(SETUP_FAILURE)
+    try:
+        for descriptor in (
+            stdout_write,
+            stderr_write,
+            exec_write,
+            gate_ready_write,
+            gate_release_read,
+            null_descriptor,
+        ):
+            os.close(descriptor)
+        process = StoppedExecProcess(child_pid, stdout_read, stderr_read)
+    except BaseException as construction_error:
+        for descriptor in (
+            stdout_read,
+            stderr_read,
+            exec_read,
+            gate_ready_read,
+            gate_release_write,
+            stdout_write,
+            stderr_write,
+            exec_write,
+            gate_ready_write,
+            gate_release_read,
+            null_descriptor,
+        ):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        cleanup_deadline = time.monotonic() + 2.0
+        while time.monotonic() < cleanup_deadline:
+            try:
+                waited_pid, _status = os.waitpid(child_pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            except ChildProcessError:
+                raise construction_error
+            if waited_pid == child_pid:
+                raise construction_error
+            time.sleep(0.005)
+        raise EvidenceError(
+            "stopped-target construction failed and child did not reap in time"
+        ) from construction_error
+    return process, exec_read, gate_ready_read, gate_release_write
 
 
 def write_exec_failure_status(descriptor: int, error: BaseException) -> None:
@@ -732,37 +976,64 @@ def proc_stat_facts(pid: int) -> tuple[str, int, int] | None:
         raise EvidenceError(f"malformed Linux stat facts for process {pid}") from error
 
 
-def enable_child_subreaper() -> None:
-    """Make orphaned grandchildren observable and reapable by this supervisor."""
+def child_subreaper_enabled() -> bool:
+    """Return this process's Linux child-subreaper state."""
     if sys.platform != "linux":
         raise EvidenceError("process-tree supervision currently requires Linux")
     libc = ctypes.CDLL(None, use_errno=True)
-    # Linux prctl(PR_SET_CHILD_SUBREAPER, 1). This affects only this short-lived
-    # supervisor process and lets it contain double-fork/setsid descendants.
-    if libc.prctl(36, 1, 0, 0, 0) != 0:
+    current = ctypes.c_int()
+    # Linux prctl(PR_GET_CHILD_SUBREAPER, &current).
+    if libc.prctl(37, ctypes.byref(current), 0, 0, 0) != 0:
         error_number = ctypes.get_errno()
-        raise EvidenceError(f"cannot enable child subreaper: errno {error_number}")
+        raise EvidenceError(
+            f"cannot inspect child subreaper state: errno {error_number}"
+        )
+    return current.value != 0
 
 
-def arm_parent_death_kill(expected_parent_pid: int) -> None:
-    """Kill this process if its exact launching parent exits."""
+def set_child_subreaper(enabled: bool) -> None:
+    """Set this process's Linux child-subreaper state."""
+    if sys.platform != "linux":
+        raise EvidenceError("process-tree supervision currently requires Linux")
+    libc = ctypes.CDLL(None, use_errno=True)
+    # Linux prctl(PR_SET_CHILD_SUBREAPER, enabled).
+    if libc.prctl(36, int(enabled), 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise EvidenceError(f"cannot set child subreaper state: errno {error_number}")
+
+
+def enable_child_subreaper() -> None:
+    """Make orphaned grandchildren observable and reapable by this supervisor."""
+    if not child_subreaper_enabled():
+        set_child_subreaper(True)
+
+
+def arm_parent_death_signal(expected_parent_pid: int, signum: int) -> None:
+    """Deliver a fixed signal if this process's exact launching parent exits."""
     if sys.platform != "linux":
         raise EvidenceError("parent-death containment currently requires Linux")
     if expected_parent_pid <= 1 or expected_parent_pid == os.getpid():
         raise EvidenceError("parent-death identity is malformed")
+    if signum <= 0 or signum >= signal.NSIG:
+        raise EvidenceError("parent-death signal is malformed")
     if os.getppid() != expected_parent_pid:
         raise EvidenceError("launcher parent changed before parent-death binding")
     libc = ctypes.CDLL(None, use_errno=True)
-    # Linux prctl(PR_SET_PDEATHSIG, SIGKILL). The second parent check closes the
+    # Linux prctl(PR_SET_PDEATHSIG, signum). The second parent check closes the
     # race where the parent exits after the first check but before prctl.
-    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+    if libc.prctl(1, signum, 0, 0, 0) != 0:
         error_number = ctypes.get_errno()
         raise EvidenceError(
             f"cannot arm launcher parent-death signal: errno {error_number}"
         )
     if os.getppid() != expected_parent_pid:
-        os.kill(os.getpid(), signal.SIGKILL)
+        os.kill(os.getpid(), signum)
         raise EvidenceError("launcher parent changed during parent-death binding")
+
+
+def arm_parent_death_kill(expected_parent_pid: int) -> None:
+    """Kill this process if its exact launching parent exits."""
+    arm_parent_death_signal(expected_parent_pid, signal.SIGKILL)
 
 
 def proc_children(pid: int) -> set[int]:
@@ -903,9 +1174,10 @@ def admit_stopped_session_leader_until(
     expected_parent_pid: int,
     deadline: float,
     *,
+    gate_ready_descriptor: int,
     cancelled: Callable[[], bool] | None = None,
 ) -> tuple[int, int]:
-    """Bind one direct child and prove it is inert before target execution."""
+    """Bind one direct child and prove its private setup gate plus stopped state."""
     try:
         handle = bind_direct_child_until(
             pid,
@@ -924,9 +1196,29 @@ def admit_stopped_session_leader_until(
             ) from error
         raise
     try:
+        gate_ready = bytearray()
+        gate_ready_eof = False
         while True:
             if cancelled is not None and cancelled():
                 raise SetupCancelledError("cancelled before stopped-child admission")
+            while not gate_ready_eof:
+                try:
+                    block = os.read(
+                        gate_ready_descriptor,
+                        len(STOPPED_GATE_READY_TOKEN) + 1 - len(gate_ready),
+                    )
+                except BlockingIOError:
+                    break
+                except InterruptedError:
+                    continue
+                if not block:
+                    gate_ready_eof = True
+                    break
+                gate_ready.extend(block)
+                if len(gate_ready) > len(STOPPED_GATE_READY_TOKEN):
+                    raise EvidenceError("private gate readiness token exceeded bound")
+            if gate_ready_eof and bytes(gate_ready) != STOPPED_GATE_READY_TOKEN:
+                raise EvidenceError("private gate readiness token mismatch")
             facts = proc_stat_facts(pid)
             if (
                 facts is None
@@ -942,7 +1234,13 @@ def admit_stopped_session_leader_until(
                     "stopped child disappeared before session admission"
                 ) from error
             if (
-                facts[0] in {"T", "t"}
+                gate_ready_eof
+                and facts[0] == "t"
+            ):
+                raise EvidenceError("ptrace stop cannot satisfy stopped-target admission")
+            if (
+                gate_ready_eof
+                and facts[0] == "T"
                 and facts[1] == pid
                 and session_id == pid
                 and time.monotonic() < deadline
@@ -1065,7 +1363,7 @@ def graceful_signal_targets(
 
 
 def terminate_tree(
-    proc: subprocess.Popen[bytes],
+    proc: Any,
     first_signal: int,
     grace_s: float,
     known: ProcessHandles,
@@ -1130,7 +1428,7 @@ def terminate_tree(
     return term_sent, kill_sent, survivors
 
 
-def run_supervised(
+def _run_supervised_impl(
     *,
     argv: Sequence[str],
     cwd: Path,
@@ -1153,6 +1451,10 @@ def run_supervised(
     test_terminal_ready_path: Path | None = None,
     guardian_identity: tuple[int, int] | None = None,
     initial_signal_mask: set[signal.Signals] | None = None,
+    test_before_stop_delay_ms: int = 0,
+    test_before_release_delay_ms: int = 0,
+    test_gate_mode: str = "normal",
+    test_fault_point: str = "none",
 ) -> int:
     if not argv:
         raise EvidenceError("supervisor requires a non-empty argv")
@@ -1171,6 +1473,32 @@ def run_supervised(
         )
     if test_terminal_delay_ms < 0:
         raise EvidenceError("test terminal delay must be non-negative")
+    if cancel_after_ms is not None and cancel_after_ms < 0:
+        raise EvidenceError("cancel-after-ms must be non-negative")
+    if test_before_stop_delay_ms < 0:
+        raise EvidenceError("test before-stop delay must be non-negative")
+    if test_before_release_delay_ms < 0:
+        raise EvidenceError("test before-release delay must be non-negative")
+    if test_gate_mode not in {
+        "normal",
+        "exit_before_stop",
+        "never_stop",
+        "die_after_stop",
+    }:
+        raise EvidenceError("unknown stopped-gate test mode")
+    if test_fault_point not in SUPERVISOR_TEST_FAULT_POINTS:
+        raise EvidenceError("unknown supervisor fault point")
+    if (
+        test_before_stop_delay_ms != 0
+        or test_before_release_delay_ms != 0
+        or test_gate_mode != "normal"
+        or test_terminal_delay_ms != 0
+        or test_terminal_ready_path is not None
+        or test_fault_point != "none"
+    ) and not planted:
+        raise EvidenceError("supervisor fault controls require --planted evidence")
+    if initial_signal_mask is None:
+        raise EvidenceError("supervisor requires an explicit target signal mask")
     if test_terminal_ready_path is not None:
         test_terminal_ready_path = require_within(
             test_terminal_ready_path,
@@ -1189,13 +1517,24 @@ def run_supervised(
             "semantic failure exits must be unique integers from 1 through 255"
         )
     artifact_root = lexical_absolute(artifact_root)
+    artifact_paths: list[Path] = []
     for label, path in (
         ("metadata", metadata_path),
         ("stdout", stdout_path),
         ("stderr", stderr_path),
         ("readiness", readiness_path),
     ):
-        require_within(path, artifact_root, label=label)
+        artifact_paths.append(require_within(path, artifact_root, label=label))
+    if len({path.parent for path in artifact_paths}) != 1:
+        raise EvidenceError("supervisor artifacts must share one directory")
+    if len({path.name for path in artifact_paths}) != len(artifact_paths):
+        raise EvidenceError("supervisor artifact paths must be distinct")
+    for artifact_path in artifact_paths:
+        try:
+            artifact_path.lstat()
+        except FileNotFoundError:
+            continue
+        raise EvidenceError(f"supervisor artifact already exists: {artifact_path}")
 
     started_ns = time.monotonic_ns()
     started_utc = utc_now()
@@ -1207,25 +1546,38 @@ def run_supervised(
     termination_reason: str | None = None
     term_sent = False
     kill_sent = False
-    proc: subprocess.Popen[bytes] | None = None
+    proc: StoppedExecProcess | None = None
     out_thread: threading.Thread | None = None
     err_thread: threading.Thread | None = None
+    out_thread_started = False
+    err_thread_started = False
     exec_status_read: int | None = None
     exec_status_write: int | None = None
+    gate_ready_read: int | None = None
+    gate_release_write: int | None = None
     exec_status_buffer = bytearray()
     exec_status_complete = False
+    exec_success_observed_live = False
     target_exec_failure: dict[str, Any] | None = None
     child_exit: int | None = None
     child_signal: str | None = None
     readiness_ns: int | None = None
     release_decision_ns: int | None = None
+    setup_deadline_ns = started_ns + setup_timeout_ms * 1_000_000
     execution_started_ns: int | None = None
     setup_finished_ns: int | None = None
+    child_terminal_observed_ns: int | None = None
     child_reaped_ns: int | None = None
+    synthetic_cancel_deadline_ns: int | None = None
+    termination_decision_ns: int | None = None
     watched_signals = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+    supervisor_runtime_signal_mask = set(initial_signal_mask).difference(
+        watched_signals
+    )
     old_handlers: dict[int, Any] = {
         signum: signal.getsignal(signum) for signum in watched_signals
     }
+    old_sigchld_handler = signal.getsignal(signal.SIGCHLD)
     known_descendants: ProcessHandles = {}
     survivors: list[int] = []
     readiness_published = False
@@ -1246,7 +1598,8 @@ def run_supervised(
             cancel_signal = signum
 
     def poll_exec_status() -> None:
-        nonlocal exec_status_complete, target_exec_failure
+        nonlocal exec_status_complete, exec_success_observed_live
+        nonlocal target_exec_failure
         if exec_status_read is None or exec_status_complete:
             return
         while True:
@@ -1269,98 +1622,152 @@ def run_supervised(
                     ):
                         raise EvidenceError("malformed target exec failure status")
                     target_exec_failure = status
+                elif proc is not None and proc.poll() is None:
+                    exec_success_observed_live = True
                 return
             exec_status_buffer.extend(block)
             if len(exec_status_buffer) > MAX_EXEC_STATUS_BYTES:
                 raise EvidenceError("target exec status exceeded its protocol bound")
 
     def join_drainers() -> None:
-        for thread in (out_thread, err_thread):
-            if thread is not None:
-                thread.join(max(1.0, grace_ms / 1000 + 1.0))
+        streams = (
+            (out_thread, out_thread_started, proc.stdout if proc is not None else None),
+            (err_thread, err_thread_started, proc.stderr if proc is not None else None),
+        )
+        for thread, started, stream in streams:
+            if thread is not None and started:
+                try:
+                    thread.join(max(1.0, grace_ms / 1000 + 1.0))
+                except RuntimeError as error:
+                    errors.append(f"capture drainer join failed: {error}")
+            elif stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except OSError as error:
+                    errors.append(f"unstarted capture stream close failed: {error}")
         if any(
-            thread is not None and thread.is_alive()
-            for thread in (out_thread, err_thread)
+            thread is not None and started and thread.is_alive()
+            for thread, started in (
+                (out_thread, out_thread_started),
+                (err_thread, err_thread_started),
+            )
         ):
             errors.append("capture drainer did not terminate after child exit")
 
     def cleanup_failed_child(first_signal: int) -> None:
         nonlocal term_sent, kill_sent, survivors, child_exit, child_signal
-        nonlocal child_reaped_ns
+        nonlocal child_reaped_ns, child_terminal_observed_ns
+        nonlocal gate_ready_read, gate_release_write
         if proc is None:
             return
-        if proc.poll() is None and proc.pid not in known_descendants:
-            # An unreaped direct child keeps its numeric PID reserved. This fallback
-            # is therefore lifetime-safe even when pidfd admission itself failed.
-            if proc.pid in proc_children(supervisor_pid):
+        for descriptor_name, descriptor in (
+            ("private readiness", gate_ready_read),
+            ("private release", gate_release_write),
+        ):
+            if descriptor is not None:
                 try:
+                    os.close(descriptor)
+                except OSError as error:
+                    errors.append(f"{descriptor_name} gate close failed: {error}")
+        gate_ready_read = None
+        gate_release_write = None
+        try:
+            if proc.poll() is None and proc.pid not in known_descendants:
+                # The unreaped direct child keeps its numeric PID reserved. This
+                # fallback is lifetime-safe even if pidfd admission itself failed.
+                if proc.pid in proc_children(supervisor_pid):
                     proc.kill()
                     kill_sent = True
-                except ProcessLookupError:
-                    pass
+                else:
+                    errors.append("failed child lost direct-parent containment")
             else:
-                errors.append("failed child lost direct-parent containment")
-        else:
-            sent_term, sent_kill, remaining = terminate_tree(
-                proc,
-                first_signal,
-                grace_ms / 1000,
-                known_descendants,
-                graceful_root_only=True,
+                sent_term, sent_kill, remaining = terminate_tree(
+                    proc,
+                    first_signal,
+                    grace_ms / 1000,
+                    known_descendants,
+                    graceful_root_only=True,
+                )
+                term_sent = term_sent or sent_term
+                kill_sent = kill_sent or sent_kill
+                survivors = remaining
+        except BaseException as error:
+            errors.append(
+                f"process-tree cleanup failure: {type(error).__name__}: {error}"
             )
-            term_sent = term_sent or sent_term
-            kill_sent = kill_sent or sent_kill
-            survivors = remaining
+            # The direct child PID cannot be reused before this owner reaps it.
+            # If it established the promised private session, its process-group
+            # number is equally reserved and safely contains ordinary descendants.
+            try:
+                facts = proc_stat_facts(proc.pid)
+                if facts is not None and facts[1] == proc.pid:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    kill_sent = True
+            except (OSError, EvidenceError) as fallback_error:
+                errors.append(f"fallback group kill failed: {fallback_error}")
+            try:
+                proc.kill()
+                kill_sent = True
+            except (OSError, EvidenceError) as fallback_error:
+                errors.append(f"fallback child kill failed: {fallback_error}")
         try:
             child_return = proc.wait(timeout=max(1.0, grace_ms / 1000 + 1.0))
+        except (subprocess.TimeoutExpired, ChildProcessError) as error:
+            errors.append(f"child reap failed after supervisor failure: {error}")
+            try:
+                if process_alive(proc.pid):
+                    survivors = sorted(set(survivors) | {proc.pid})
+            except EvidenceError as inspection_error:
+                errors.append(f"failed child liveness check failed: {inspection_error}")
+        else:
             child_reaped_ns = time.monotonic_ns()
+            child_terminal_observed_ns = (
+                child_terminal_observed_ns or child_reaped_ns
+            )
             if child_return < 0:
                 child_signal = signal.Signals(-child_return).name
             else:
                 child_exit = child_return
-        except subprocess.TimeoutExpired:
-            errors.append("child remained live after supervisor failure")
         try:
             poll_exec_status()
         except BaseException as error:
             errors.append(
                 f"exec status collection failure: {type(error).__name__}: {error}"
             )
-        join_drainers()
+        try:
+            join_drainers()
+        except BaseException as error:
+            errors.append(
+                f"capture cleanup failure: {type(error).__name__}: {error}"
+            )
 
     rendered_argv, had_redaction = redacted_argv(argv)
     try:
         enable_child_subreaper()
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
         for signum in watched_signals:
             signal.signal(signum, remember_signal)
-        if initial_signal_mask is not None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, initial_signal_mask)
-        setup_deadline = time.monotonic() + setup_timeout_ms / 1000
-        exec_status_read, exec_status_write = os.pipe2(os.O_CLOEXEC)
-        gate_argv = [
-            sys.executable,
-            str(Path(__file__).resolve(strict=True)),
-            "stopped-exec",
-            "--expected-parent-pid",
-            str(supervisor_pid),
-            "--exec-status-fd",
-            str(exec_status_write),
-            "--",
-            *argv,
-        ]
-        proc = subprocess.Popen(
-            gate_argv,
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            pass_fds=(exec_status_write,),
+        setup_deadline = setup_deadline_ns / 1_000_000_000
+        (
+            proc,
+            exec_status_read,
+            gate_ready_read,
+            gate_release_write,
+        ) = spawn_stopped_exec(
+            argv,
+            cwd,
+            supervisor_pid,
+            target_signal_mask=initial_signal_mask,
+            test_before_stop_delay_ms=test_before_stop_delay_ms,
+            test_gate_mode=test_gate_mode,
         )
-        os.close(exec_status_write)
-        exec_status_write = None
         os.set_blocking(exec_status_read, False)
-        assert proc.stdout is not None and proc.stderr is not None
+        os.set_blocking(gate_ready_read, False)
+        # The child retained the blocked mask across fork. The supervisor can
+        # now observe cancellation without exposing target execution.
+        signal.pthread_sigmask(
+            signal.SIG_SETMASK, supervisor_runtime_signal_mask
+        )
         out_thread = threading.Thread(
             target=drain,
             args=(proc.stdout, stdout_capture, errors, "stdout"),
@@ -1371,21 +1778,30 @@ def run_supervised(
             args=(proc.stderr, stderr_capture, errors, "stderr"),
             daemon=True,
         )
+        if test_fault_point == "thread_start_stdout":
+            raise EvidenceError("injected stdout drainer start failure")
         out_thread.start()
+        out_thread_started = True
+        if test_fault_point == "thread_start_stderr":
+            raise EvidenceError("injected stderr drainer start failure")
         err_thread.start()
+        err_thread_started = True
         child_handle = admit_stopped_session_leader_until(
             proc.pid,
             supervisor_pid,
             setup_deadline,
+            gate_ready_descriptor=gate_ready_read,
             cancelled=lambda: cancel_signal is not None,
         )
         known_descendants[proc.pid] = child_handle
+        os.close(gate_ready_read)
+        gate_ready_read = None
         child_facts = proc_stat_facts(proc.pid)
         supervisor_facts = proc_stat_facts(supervisor_pid)
         wrapper_facts = proc_stat_facts(wrapper_pid)
         if (
             child_facts is None
-            or child_facts[0] not in {"T", "t"}
+            or child_facts[0] != "T"
             or child_facts[1] != proc.pid
             or child_facts[2] != child_handle[0]
             or os.getsid(proc.pid) != proc.pid
@@ -1393,29 +1809,53 @@ def run_supervised(
             or supervisor_facts is None
             or supervisor_facts[2] != supervisor_start_ticks
             or wrapper_facts is None
+            or wrapper_facts[0] == "Z"
             or wrapper_facts[2] != wrapper_start_ticks
+            or (
+                guardian_identity is not None
+                and os.getppid() != wrapper_pid
+            )
         ):
             raise EvidenceError("cannot capture process identity facts for readiness")
-        readiness_ns = time.monotonic_ns()
-        write_new(
-            readiness_path,
-            canonical_json(
-                {
-                    "schema": "fln.supervisor-readiness/2",
-                    "stage_id": stage_id,
-                    "wrapper_pid": wrapper_pid,
-                    "wrapper_start_ticks": wrapper_start_ticks,
-                    "supervisor_pid": supervisor_pid,
-                    "supervisor_start_ticks": supervisor_start_ticks,
-                    "child_pid": proc.pid,
-                    "child_pgid": child_facts[1],
-                    "child_start_ticks": child_facts[2],
-                    "monotonic_ns": readiness_ns,
-                    "status": "ready",
-                }
-            ),
+        candidate_readiness_ns = time.monotonic_ns()
+        readiness_data = canonical_json(
+            {
+                "schema": "fln.supervisor-readiness/3",
+                "stage_id": stage_id,
+                "wrapper_pid": wrapper_pid,
+                "wrapper_start_ticks": wrapper_start_ticks,
+                "supervisor_pid": supervisor_pid,
+                "supervisor_start_ticks": supervisor_start_ticks,
+                "child_pid": proc.pid,
+                "child_pgid": child_facts[1],
+                "child_sid": os.getsid(proc.pid),
+                "child_start_ticks": child_facts[2],
+                "monotonic_ns": candidate_readiness_ns,
+                "status": "ready",
+            }
         )
+        try:
+            if test_fault_point == "readiness_publication":
+                raise EvidenceError("injected readiness publication failure")
+            write_atomic_new(readiness_path, readiness_data)
+        except BaseException as publication_error:
+            try:
+                retained_readiness, _size, _digest = stable_file_facts(
+                    readiness_path, max_bytes=MAX_RECORD_BYTES
+                )
+            except BaseException:
+                raise publication_error
+            if not hmac.compare_digest(retained_readiness, readiness_data):
+                raise publication_error
+            readiness_ns = candidate_readiness_ns
+            readiness_published = True
+            raise EvidenceError(
+                "readiness durability confirmation failed after atomic publication"
+            ) from publication_error
+        readiness_ns = candidate_readiness_ns
         readiness_published = True
+        if test_before_release_delay_ms:
+            time.sleep(test_before_release_delay_ms / 1000)
         previous_release_mask = signal.pthread_sigmask(
             signal.SIG_BLOCK, watched_signals
         )
@@ -1432,57 +1872,150 @@ def run_supervised(
                 )
             if cancel_signal is not None:
                 raise SetupCancelledError("cancellation won before target release")
-            release_decision_ns = time.monotonic_ns()
+            facts = proc_stat_facts(proc.pid)
+            wrapper_facts = proc_stat_facts(wrapper_pid)
             if (
-                time.monotonic() >= setup_deadline
-                or (facts := proc_stat_facts(proc.pid)) is None
-                or facts[0] not in {"T", "t"}
+                facts is None
+                or facts[0] != "T"
                 or facts[1] != proc.pid
                 or facts[2] != child_handle[0]
                 or os.getsid(proc.pid) != proc.pid
                 or proc.pid not in proc_children(supervisor_pid)
-            ):
-                raise SetupTimeoutError(
-                    "stopped-child admission expired before target release"
+                or wrapper_facts is None
+                or wrapper_facts[0] == "Z"
+                or wrapper_facts[2] != wrapper_start_ticks
+                or (
+                    guardian_identity is not None
+                    and os.getppid() != wrapper_pid
                 )
+            ):
+                raise EvidenceError(
+                    "stopped-child identity changed before private release"
+                )
+            candidate_release_decision_ns = time.monotonic_ns()
+            if candidate_release_decision_ns >= setup_deadline_ns:
+                raise SetupTimeoutError(
+                    "stopped-child admission expired before private release"
+                )
+            release_decision_ns = candidate_release_decision_ns
+            release_view = memoryview(STOPPED_GATE_RELEASE_TOKEN)
+            while release_view:
+                written = os.write(gate_release_write, release_view)
+                if written <= 0:
+                    raise EvidenceError("private gate release made no progress")
+                release_view = release_view[written:]
+            os.close(gate_release_write)
+            gate_release_write = None
             if not signal_process_handle(proc.pid, child_handle, signal.SIGCONT):
                 raise EvidenceError("cannot release exact stopped child identity")
             execution_started_ns = time.monotonic_ns()
             setup_finished_ns = execution_started_ns
         finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_release_mask)
+            signal.pthread_sigmask(
+                signal.SIG_SETMASK,
+                (
+                    supervisor_runtime_signal_mask
+                    if execution_started_ns is not None
+                    else previous_release_mask
+                ),
+            )
         deadline_ns = execution_started_ns + timeout_ms * 1_000_000
-        synthetic_cancel_ns = (
+        synthetic_cancel_deadline_ns = (
             execution_started_ns + cancel_after_ms * 1_000_000
             if cancel_after_ms is not None
             else None
         )
-        while proc.poll() is None:
-            poll_exec_status()
-            live_tree_members(proc.pid, known_descendants)
-            now_ns = time.monotonic_ns()
-            if cancel_signal is not None:
-                termination_reason = "signal"
-            elif synthetic_cancel_ns is not None and now_ns >= synthetic_cancel_ns:
-                cancel_signal = signal.SIGTERM
-                termination_reason = "signal"
-            elif stdout_capture.total + stderr_capture.total > output_budget_bytes:
-                termination_reason = "output_budget_exhausted"
-            elif now_ns >= deadline_ns:
-                termination_reason = "timeout"
-            if termination_reason is not None:
-                first = cancel_signal if cancel_signal is not None else signal.SIGTERM
-                term_sent, kill_sent, survivors = terminate_tree(
-                    proc,
-                    first,
-                    grace_ms / 1000,
-                    known_descendants,
-                    graceful_root_only=True,
+        child_event_descriptor = os.dup(child_handle[1])
+        try:
+            child_events = select.poll()
+            child_events.register(
+                child_event_descriptor,
+                select.POLLIN | select.POLLHUP | select.POLLERR,
+            )
+            while True:
+                poll_exec_status()
+                live_tree_members(proc.pid, known_descendants)
+                now_ns = time.monotonic_ns()
+                if cancel_signal is not None:
+                    termination_reason = "signal"
+                elif (
+                    synthetic_cancel_deadline_ns is not None
+                    and now_ns >= synthetic_cancel_deadline_ns
+                ):
+                    cancel_signal = signal.SIGTERM
+                    termination_reason = "signal"
+                elif stdout_capture.total + stderr_capture.total > output_budget_bytes:
+                    termination_reason = "output_budget_exhausted"
+                elif now_ns >= deadline_ns:
+                    termination_reason = "timeout"
+                if termination_reason is not None:
+                    termination_decision_ns = termination_decision_ns or now_ns
+                    first = (
+                        cancel_signal
+                        if cancel_signal is not None
+                        else signal.SIGTERM
+                    )
+                    term_sent, kill_sent, survivors = terminate_tree(
+                        proc,
+                        first,
+                        grace_ms / 1000,
+                        known_descendants,
+                        graceful_root_only=True,
+                    )
+                    break
+                next_deadline_ns = min(
+                    deadline_ns,
+                    (
+                        synthetic_cancel_deadline_ns
+                        if synthetic_cancel_deadline_ns is not None
+                        else deadline_ns
+                    ),
                 )
-                break
-            time.sleep(0.02)
-        child_return = proc.wait()
+                wait_ns = min(20_000_000, max(0, next_deadline_ns - now_ns))
+                wait_ms = (wait_ns + 999_999) // 1_000_000
+                if child_events.poll(wait_ms):
+                    observed_ns = time.monotonic_ns()
+                    child_terminal_observed_ns = observed_ns
+                    if cancel_signal is not None:
+                        termination_reason = "signal"
+                    elif (
+                        synthetic_cancel_deadline_ns is not None
+                        and observed_ns >= synthetic_cancel_deadline_ns
+                    ):
+                        cancel_signal = signal.SIGTERM
+                        termination_reason = "signal"
+                    elif (
+                        stdout_capture.total + stderr_capture.total
+                        > output_budget_bytes
+                    ):
+                        termination_reason = "output_budget_exhausted"
+                    elif observed_ns >= deadline_ns:
+                        termination_reason = "timeout"
+                    if termination_reason is None:
+                        break
+                    termination_decision_ns = (
+                        termination_decision_ns or observed_ns
+                    )
+                    first = (
+                        cancel_signal
+                        if cancel_signal is not None
+                        else signal.SIGTERM
+                    )
+                    term_sent, kill_sent, survivors = terminate_tree(
+                        proc,
+                        first,
+                        grace_ms / 1000,
+                        known_descendants,
+                        graceful_root_only=True,
+                    )
+                    break
+        finally:
+            os.close(child_event_descriptor)
+        child_return = proc.wait(timeout=max(1.0, grace_ms / 1000 + 1.0))
         child_reaped_ns = time.monotonic_ns()
+        child_terminal_observed_ns = (
+            child_terminal_observed_ns or child_reaped_ns
+        )
         poll_exec_status()
         if not exec_status_complete:
             raise EvidenceError("target exec status did not reach a terminal state")
@@ -1496,8 +2029,11 @@ def run_supervised(
             kill_sent = kill_sent or sent_kill
         join_drainers()
         if any(
-            thread is not None and thread.is_alive()
-            for thread in (out_thread, err_thread)
+            thread is not None and started and thread.is_alive()
+            for thread, started in (
+                (out_thread, out_thread_started),
+                (err_thread, err_thread_started),
+            )
         ):
             sent_term, sent_kill, survivors = terminate_tree(
                 proc, signal.SIGKILL, grace_ms / 1000, known_descendants
@@ -1514,16 +2050,23 @@ def run_supervised(
             # still exceeded the declared resource budget and therefore remains typed
             # inconclusive rather than being promoted to pass/fail.
             termination_reason = "output_budget_exhausted"
+            termination_decision_ns = termination_decision_ns or time.monotonic_ns()
         if child_return < 0:
             child_signal = signal.Signals(-child_return).name
         else:
             child_exit = child_return
     except SetupCancelledError:
         setup_finished_ns = setup_finished_ns or time.monotonic_ns()
+        termination_decision_ns = (
+            termination_decision_ns or setup_finished_ns
+        )
         termination_reason = "signal"
         cleanup_failed_child(cancel_signal or signal.SIGTERM)
     except SetupTimeoutError:
         setup_finished_ns = setup_finished_ns or time.monotonic_ns()
+        termination_decision_ns = (
+            termination_decision_ns or setup_finished_ns
+        )
         termination_reason = "setup_timeout"
         cleanup_failed_child(signal.SIGTERM)
     except BaseException as error:
@@ -1537,6 +2080,12 @@ def run_supervised(
         if exec_status_read is not None:
             os.close(exec_status_read)
             exec_status_read = None
+        if gate_ready_read is not None:
+            os.close(gate_ready_read)
+            gate_ready_read = None
+        if gate_release_write is not None:
+            os.close(gate_release_write)
+            gate_release_write = None
         reap_adopted_children()
 
     if not readiness_published:
@@ -1545,11 +2094,11 @@ def run_supervised(
                 "setup_timeout": "setup_timeout",
                 "signal": "setup_cancelled",
             }.get(termination_reason, "setup_failed")
-            write_new(
+            write_atomic_new(
                 readiness_path,
                 canonical_json(
                     {
-                        "schema": "fln.supervisor-readiness/2",
+                        "schema": "fln.supervisor-readiness/3",
                         "stage_id": stage_id,
                         "wrapper_pid": wrapper_pid,
                         "wrapper_start_ticks": wrapper_start_ticks,
@@ -1557,6 +2106,7 @@ def run_supervised(
                         "supervisor_start_ticks": supervisor_start_ticks,
                         "child_pid": None,
                         "child_pgid": None,
+                        "child_sid": None,
                         "child_start_ticks": None,
                         "monotonic_ns": time.monotonic_ns(),
                         "status": readiness_status,
@@ -1572,22 +2122,64 @@ def run_supervised(
     # Block cancellation while terminal artifacts are selected and published. The
     # disposition change to SIG_IGN below is the single linearization point: signals
     # pending before it are reflected as cancellation; signals after it are post-commit.
-    previous_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched_signals)
+    signal.pthread_sigmask(signal.SIG_BLOCK, watched_signals)
+    previous_signal_mask = supervisor_runtime_signal_mask
     ended_ns = time.monotonic_ns()
     usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
     if survivors and not any("termination left survivors" in error for error in errors):
         errors.append(f"process-tree termination left survivors: {survivors}")
-    capture_publication_failed = False
-    try:
-        out_data, out_head, out_tail = stdout_capture.render()
-        err_data, err_head, err_tail = stderr_capture.render()
-        write_new(stdout_path, out_data)
-        write_new(stderr_path, err_data)
-    except BaseException as error:
-        errors.append(f"capture publication failure: {type(error).__name__}: {error}")
-        capture_publication_failed = True
-        out_data, out_head, out_tail = b"", 0, 0
-        err_data, err_head, err_tail = b"", 0, 0
+    expected_out = stdout_capture.render()
+    expected_err = stderr_capture.render()
+
+    def publish_capture(
+        label: str,
+        capture_path: Path,
+        expected: tuple[bytes, int, int],
+    ) -> tuple[bytes, int, int, bool, bool]:
+        expected_data, expected_head, expected_tail = expected
+        try:
+            if test_fault_point == f"capture_{label}":
+                raise EvidenceError(f"injected {label} capture publication failure")
+            write_atomic_new(capture_path, expected_data)
+            return expected_data, expected_head, expected_tail, False, True
+        except BaseException as error:
+            errors.append(
+                f"capture publication failure: {label}: "
+                f"{type(error).__name__}: {error}"
+            )
+        try:
+            retained, _size, _digest = stable_file_facts(
+                capture_path, max_bytes=capture_bytes
+            )
+        except FileNotFoundError:
+            try:
+                write_atomic_new(capture_path, b"")
+            except BaseException as fallback_error:
+                errors.append(
+                    f"capture fallback failure: {label}: "
+                    f"{type(fallback_error).__name__}: {fallback_error}"
+                )
+                return b"", 0, 0, True, False
+            return b"", 0, 0, True, True
+        except BaseException as inspection_error:
+            errors.append(
+                f"capture inspection failure: {label}: "
+                f"{type(inspection_error).__name__}: {inspection_error}"
+            )
+            return b"", 0, 0, True, False
+        if not hmac.compare_digest(retained, expected_data):
+            errors.append(f"capture publication retained unexpected bytes: {label}")
+            return b"", 0, 0, True, False
+        return retained, expected_head, expected_tail, True, True
+
+    out_data, out_head, out_tail, out_failed, out_available = publish_capture(
+        "stdout", stdout_path, expected_out
+    )
+    err_data, err_head, err_tail, err_failed, err_available = publish_capture(
+        "stderr", stderr_path, expected_err
+    )
+    capture_publication_failed = out_failed or err_failed
+    capture_artifacts_available = out_available and err_available
 
     pending = signal.sigpending()
     if cancel_signal is None:
@@ -1626,22 +2218,24 @@ def run_supervised(
     if setup_finished_ns is None:
         setup_finished_ns = execution_started_ns or ended_ns
     execution_duration_ns = (
-        child_reaped_ns - execution_started_ns
-        if execution_started_ns is not None and child_reaped_ns is not None
+        child_terminal_observed_ns - execution_started_ns
+        if execution_started_ns is not None
+        and child_terminal_observed_ns is not None
         else None
     )
     exec_status = (
-        "failed"
-        if target_exec_failure is not None
-        else "not_released"
+        "not_released"
         if execution_started_ns is None
+        else "failed"
+        if target_exec_failure is not None
         else "succeeded"
         if exec_status_complete
+        and (exec_success_observed_live or child_exit is not None)
         else "unknown"
     )
 
     metadata: dict[str, Any] = {
-        "schema": "fln.supervisor/2",
+        "schema": "fln.supervisor/3",
         "stage_id": stage_id,
         "argv": rendered_argv,
         "argv_redacted": had_redaction,
@@ -1660,25 +2254,40 @@ def run_supervised(
         "monotonic_end_ns": ended_ns,
         "duration_ns": ended_ns - started_ns,
         "phase_timing": {
-            "admission_protocol": "same_pid_stopped_exec_pidfd/1",
+            "admission_protocol": "same_pid_stopped_private_gate_pidfd/1",
             "setup_start_ns": started_ns,
+            "setup_deadline_ns": setup_deadline_ns,
             "readiness_ns": readiness_ns,
             "release_decision_ns": release_decision_ns,
             "setup_end_ns": setup_finished_ns,
             "setup_duration_ns": setup_finished_ns - started_ns,
             "execution_start_ns": execution_started_ns,
+            "synthetic_cancel_deadline_ns": synthetic_cancel_deadline_ns,
+            "termination_decision_ns": termination_decision_ns,
+            "child_terminal_observed_ns": child_terminal_observed_ns,
             "child_reaped_ns": child_reaped_ns,
             "execution_duration_ns": execution_duration_ns,
         },
         "target_exec": {
             "status": exec_status,
-            "failure": target_exec_failure,
+            "failure": (
+                target_exec_failure if execution_started_ns is not None else None
+            ),
+        },
+        "test_control": {
+            "before_stop_delay_ms": test_before_stop_delay_ms,
+            "before_release_delay_ms": test_before_release_delay_ms,
+            "gate_mode": test_gate_mode,
+            "terminal_delay_ms": test_terminal_delay_ms,
+            "terminal_ready_enabled": test_terminal_ready_path is not None,
+            "fault_point": test_fault_point,
         },
         "resource": {
             "capture_bytes_per_stream": capture_bytes,
             "output_budget_bytes": output_budget_bytes,
             "setup_timeout_ms": setup_timeout_ms,
-            "timeout_ms": timeout_ms,
+            "execution_timeout_ms": timeout_ms,
+            "cancel_after_ms": cancel_after_ms,
             "kill_grace_ms": grace_ms,
             "total_output_bytes": stdout_capture.total + stderr_capture.total,
             "user_cpu_seconds": max(0.0, usage_after.ru_utime - usage_before.ru_utime),
@@ -1733,14 +2342,21 @@ def run_supervised(
     for signum in watched_signals:
         candidate_data[signum] = candidate_for(cancel_signal or signum)
 
-    metadata_parent, metadata_parent_fd = open_directory_nofollow(
-        metadata_path.parent, create=True
-    )
-    del metadata_parent
+    metadata_parent_fd: int | None = None
     prepared: dict[int, int] = {}
     winner: list[int] = []
     commit_errors: list[BaseException] = []
     try:
+        if not readiness_published:
+            raise EvidenceError("readiness artifact could not be published")
+        if not capture_artifacts_available:
+            raise EvidenceError("capture artifacts could not be published")
+        if test_fault_point == "metadata_parent_open":
+            raise EvidenceError("injected metadata parent-open failure")
+        _metadata_parent, metadata_parent_fd = open_directory_nofollow(
+            metadata_path.parent, create=True
+        )
+        del _metadata_parent
         for key, data in candidate_data.items():
             prepared[key] = prepare_atomic_file(metadata_parent_fd, data)
         if test_terminal_ready_path is not None:
@@ -1785,30 +2401,138 @@ def run_supervised(
         wrapper_exit = int(selected["wrapper_exit"])
     except BaseException as error:
         fallback = {
-            "schema": "fln.supervisor/2",
+            "schema": "fln.supervisor/3",
             "classification": "internal_fault",
             "reason_code": "metadata_publication_failure",
             "metadata_path": str(metadata_path),
             "error": f"{type(error).__name__}: {error}",
         }
-        sys.stderr.buffer.write(canonical_json(fallback))
+        try:
+            sys.stderr.buffer.write(canonical_json(fallback))
+        except BaseException:
+            pass
         if restore_signal_state:
             for signum, handler in old_handlers.items():
                 signal.signal(signum, handler)
+            signal.signal(signal.SIGCHLD, old_sigchld_handler)
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
-        close_process_handles(known_descendants)
         return SETUP_FAILURE
     finally:
         for descriptor in prepared.values():
-            os.close(descriptor)
-        os.close(metadata_parent_fd)
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if metadata_parent_fd is not None:
+            try:
+                os.close(metadata_parent_fd)
+            except OSError:
+                pass
+        close_process_handles(known_descendants)
     if restore_signal_state:
         signal.pthread_sigmask(signal.SIG_BLOCK, watched_signals)
         for signum, handler in old_handlers.items():
             signal.signal(signum, handler)
+        signal.signal(signal.SIGCHLD, old_sigchld_handler)
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
-    close_process_handles(known_descendants)
     return wrapper_exit
+
+
+def run_supervised(
+    *,
+    argv: Sequence[str],
+    cwd: Path,
+    metadata_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    readiness_path: Path,
+    artifact_root: Path,
+    capture_bytes: int,
+    output_budget_bytes: int,
+    timeout_ms: int,
+    grace_ms: int,
+    stage_id: str,
+    planted: bool,
+    setup_timeout_ms: int = MAX_PROCESS_IDENTITY_WAIT_MS,
+    semantic_failure_exits: Sequence[int] = (),
+    cancel_after_ms: int | None = None,
+    restore_signal_state: bool = True,
+    test_terminal_delay_ms: int = 0,
+    test_terminal_ready_path: Path | None = None,
+    guardian_identity: tuple[int, int] | None = None,
+    initial_signal_mask: set[signal.Signals] | None = None,
+    test_before_stop_delay_ms: int = 0,
+    test_before_release_delay_ms: int = 0,
+    test_gate_mode: str = "normal",
+    test_fault_point: str = "none",
+) -> int:
+    """Run one isolated supervisor while restoring all caller process state."""
+    watched = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+    entry_handlers = {signum: signal.getsignal(signum) for signum in watched}
+    entry_sigchld_handler = signal.getsignal(signal.SIGCHLD)
+    entry_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+    entry_subreaper: bool | None = None
+    try:
+        entry_subreaper = child_subreaper_enabled()
+        try:
+            task_ids = {
+                int(entry.name)
+                for entry in Path("/proc/self/task").iterdir()
+                if entry.name.isdecimal()
+            }
+        except OSError as error:
+            raise EvidenceError("cannot prove supervisor thread state") from error
+        if threading.active_count() != 1 or task_ids != {os.getpid()}:
+            raise EvidenceError("supervisor requires an exclusive single-thread process")
+        existing_children = proc_children(os.getpid())
+        if existing_children:
+            raise EvidenceError(
+                "supervisor process already owns unrelated child lifetimes: "
+                f"{sorted(existing_children)}"
+            )
+        target_signal_mask = (
+            set(initial_signal_mask)
+            if initial_signal_mask is not None
+            else set(entry_signal_mask)
+        )
+        return _run_supervised_impl(
+            argv=argv,
+            cwd=cwd,
+            metadata_path=metadata_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            readiness_path=readiness_path,
+            artifact_root=artifact_root,
+            capture_bytes=capture_bytes,
+            output_budget_bytes=output_budget_bytes,
+            timeout_ms=timeout_ms,
+            grace_ms=grace_ms,
+            stage_id=stage_id,
+            planted=planted,
+            setup_timeout_ms=setup_timeout_ms,
+            semantic_failure_exits=semantic_failure_exits,
+            cancel_after_ms=cancel_after_ms,
+            restore_signal_state=False,
+            test_terminal_delay_ms=test_terminal_delay_ms,
+            test_terminal_ready_path=test_terminal_ready_path,
+            guardian_identity=guardian_identity,
+            initial_signal_mask=target_signal_mask,
+            test_before_stop_delay_ms=test_before_stop_delay_ms,
+            test_before_release_delay_ms=test_before_release_delay_ms,
+            test_gate_mode=test_gate_mode,
+            test_fault_point=test_fault_point,
+        )
+    finally:
+        signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+        for signum, handler in entry_handlers.items():
+            signal.signal(signum, handler)
+        signal.signal(signal.SIGCHLD, entry_sigchld_handler)
+        if (
+            entry_subreaper is not None
+            and child_subreaper_enabled() != entry_subreaper
+        ):
+            set_child_subreaper(entry_subreaper)
+        signal.pthread_sigmask(signal.SIG_SETMASK, entry_signal_mask)
 
 
 def load_ndjson_snapshot(path: Path) -> tuple[list[dict[str, Any]], str]:
@@ -2930,17 +3654,27 @@ def validate_supervisor_object(
     *,
     expected_stage_id: str,
 ) -> None:
-    if not isinstance(value, dict) or value.get("schema") != "fln.supervisor/1":
+    if not isinstance(value, dict) or value.get("schema") not in {
+        "fln.supervisor/1",
+        "fln.supervisor/2",
+        "fln.supervisor/3",
+    }:
         raise EvidenceError(f"{path}:{record_number}: missing supervisor envelope")
-    required = {
+    schema = value["schema"]
+    expected_keys = {
+        "schema",
         "stage_id",
         "argv",
+        "argv_redacted",
         "cwd",
         "classification",
         "reason_code",
         "wrapper_exit",
         "child_exit",
         "child_signal",
+        "cancel_signal",
+        "started_utc",
+        "ended_utc",
         "monotonic_start_ns",
         "monotonic_end_ns",
         "duration_ns",
@@ -2950,17 +3684,28 @@ def validate_supervisor_object(
         "planted",
         "semantic_failure_exits",
         "readiness",
+        "errors",
+        "host",
     }
-    missing = sorted(key for key in required if key not in value)
-    if missing:
-        raise EvidenceError(f"{path}:{record_number}: supervisor missing {missing!r}")
-    if not isinstance(value["argv"], list) or not all(
+    if schema in {"fln.supervisor/2", "fln.supervisor/3"}:
+        expected_keys.update({"phase_timing", "target_exec"})
+    if schema == "fln.supervisor/3":
+        expected_keys.add("test_control")
+    if set(value) != expected_keys:
+        raise EvidenceError(
+            f"{path}:{record_number}: supervisor envelope shape mismatch"
+        )
+    if not isinstance(value["argv"], list) or not value["argv"] or not all(
         isinstance(item, str) for item in value["argv"]
     ):
         raise EvidenceError(
             f"{path}:{record_number}: supervisor argv is not a string array"
         )
-    if value["stage_id"] != expected_stage_id:
+    if (
+        not isinstance(value["stage_id"], str)
+        or not value["stage_id"]
+        or value["stage_id"] != expected_stage_id
+    ):
         raise EvidenceError(
             f"{path}:{record_number}: supervisor stage identity mismatch"
         )
@@ -2968,6 +3713,57 @@ def validate_supervisor_object(
         raise EvidenceError(
             f"{path}:{record_number}: supervisor planted flag is not boolean"
         )
+    if (
+        not isinstance(value["argv_redacted"], bool)
+        or not isinstance(value["cwd"], str)
+        or not value["cwd"]
+        or not Path(value["cwd"]).is_absolute()
+        or not isinstance(value["classification"], str)
+        or not isinstance(value["reason_code"], str)
+        or not value["reason_code"]
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: malformed supervisor scalar facts"
+        )
+    if value["child_exit"] is not None and (
+        not isinstance(value["child_exit"], int)
+        or isinstance(value["child_exit"], bool)
+        or not 0 <= value["child_exit"] <= 255
+    ):
+        raise EvidenceError(f"{path}:{record_number}: malformed child exit")
+    valid_signal_names = {member.name for member in signal.Signals}
+    if value["child_signal"] is not None and value["child_signal"] not in (
+        valid_signal_names
+    ):
+        raise EvidenceError(f"{path}:{record_number}: malformed child signal")
+    if value["cancel_signal"] not in {None, "SIGHUP", "SIGINT", "SIGTERM"}:
+        raise EvidenceError(f"{path}:{record_number}: malformed cancel signal")
+    if (
+        not isinstance(value["errors"], list)
+        or not all(isinstance(item, str) and item for item in value["errors"])
+    ):
+        raise EvidenceError(f"{path}:{record_number}: malformed supervisor errors")
+    host = value["host"]
+    if (
+        not isinstance(host, dict)
+        or set(host) != {"platform", "machine", "python"}
+        or not all(isinstance(item, str) and item for item in host.values())
+    ):
+        raise EvidenceError(f"{path}:{record_number}: malformed supervisor host facts")
+    for key in ("started_utc", "ended_utc"):
+        if not isinstance(value[key], str):
+            raise EvidenceError(f"{path}:{record_number}: malformed UTC timing")
+        try:
+            parsed_utc = dt.datetime.fromisoformat(value[key])
+        except ValueError as error:
+            raise EvidenceError(
+                f"{path}:{record_number}: malformed UTC timing"
+            ) from error
+        if (
+            parsed_utc.tzinfo is None
+            or parsed_utc.utcoffset() != dt.timedelta(0)
+        ):
+            raise EvidenceError(f"{path}:{record_number}: timing is not UTC")
     semantic_exits = value["semantic_failure_exits"]
     if (
         not isinstance(semantic_exits, list)
@@ -2990,6 +3786,360 @@ def validate_supervisor_object(
             raise EvidenceError(f"{path}:{record_number}: malformed supervisor timing")
     if value["monotonic_end_ns"] - value["monotonic_start_ns"] != value["duration_ns"]:
         raise EvidenceError(f"{path}:{record_number}: supervisor duration mismatch")
+    if schema in {"fln.supervisor/2", "fln.supervisor/3"}:
+        phase = value["phase_timing"]
+        expected_phase_keys = {
+            "admission_protocol",
+            "setup_start_ns",
+            "readiness_ns",
+            "release_decision_ns",
+            "setup_end_ns",
+            "setup_duration_ns",
+            "execution_start_ns",
+            "child_reaped_ns",
+            "execution_duration_ns",
+        }
+        if schema == "fln.supervisor/3":
+            expected_phase_keys.update(
+                {
+                    "setup_deadline_ns",
+                    "synthetic_cancel_deadline_ns",
+                    "termination_decision_ns",
+                    "child_terminal_observed_ns",
+                }
+            )
+        if not isinstance(phase, dict) or set(phase) != expected_phase_keys:
+            raise EvidenceError(
+                f"{path}:{record_number}: malformed supervisor phase timing"
+            )
+        expected_admission_protocol = (
+            "same_pid_stopped_exec_pidfd/1"
+            if schema == "fln.supervisor/2"
+            else "same_pid_stopped_private_gate_pidfd/1"
+        )
+        if phase["admission_protocol"] != expected_admission_protocol:
+            raise EvidenceError(
+                f"{path}:{record_number}: unknown target admission protocol"
+            )
+        for key in (
+            "setup_start_ns",
+            "setup_end_ns",
+            "setup_duration_ns",
+            *(("setup_deadline_ns",) if schema == "fln.supervisor/3" else ()),
+        ):
+            if (
+                not isinstance(phase[key], int)
+                or isinstance(phase[key], bool)
+                or phase[key] < 0
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: malformed phase timing {key}"
+                )
+        for key in (
+            "readiness_ns",
+            "release_decision_ns",
+            "execution_start_ns",
+            "child_reaped_ns",
+            "execution_duration_ns",
+            *(
+                ("synthetic_cancel_deadline_ns", "termination_decision_ns")
+                if schema == "fln.supervisor/3"
+                else ()
+            ),
+            *(("child_terminal_observed_ns",) if schema == "fln.supervisor/3" else ()),
+        ):
+            if phase[key] is not None and (
+                not isinstance(phase[key], int)
+                or isinstance(phase[key], bool)
+                or phase[key] < 0
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: malformed phase timing {key}"
+                )
+        if (
+            phase["setup_start_ns"] != value["monotonic_start_ns"]
+            or phase["setup_end_ns"] - phase["setup_start_ns"]
+            != phase["setup_duration_ns"]
+            or phase["setup_end_ns"] > value["monotonic_end_ns"]
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: inconsistent setup phase timing"
+            )
+        readiness_ns = phase["readiness_ns"]
+        release_ns = phase["release_decision_ns"]
+        execution_ns = phase["execution_start_ns"]
+        child_terminal_observed_ns = phase.get("child_terminal_observed_ns")
+        child_reaped_ns = phase["child_reaped_ns"]
+        synthetic_cancel_deadline_ns = phase.get("synthetic_cancel_deadline_ns")
+        termination_decision_ns = phase.get("termination_decision_ns")
+        if readiness_ns is not None and not (
+            phase["setup_start_ns"] <= readiness_ns <= phase["setup_end_ns"]
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: readiness lies outside setup phase"
+            )
+        if release_ns is not None and (
+            readiness_ns is None
+            or not readiness_ns <= release_ns <= phase["setup_end_ns"]
+            or (
+                schema == "fln.supervisor/3"
+                and release_ns >= phase["setup_deadline_ns"]
+            )
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: release decision timing is inconsistent"
+            )
+        if execution_ns is None:
+            if phase["execution_duration_ns"] is not None:
+                raise EvidenceError(
+                    f"{path}:{record_number}: unstarted execution has a duration"
+                )
+        else:
+            terminal_ns = (
+                child_reaped_ns
+                if schema == "fln.supervisor/2"
+                else child_terminal_observed_ns
+            )
+            if (
+                release_ns is None
+                or execution_ns != phase["setup_end_ns"]
+                or execution_ns < release_ns
+                or terminal_ns is None
+                or terminal_ns < execution_ns
+                or child_reaped_ns is None
+                or child_reaped_ns < terminal_ns
+                or phase["execution_duration_ns"] != terminal_ns - execution_ns
+                or child_reaped_ns > value["monotonic_end_ns"]
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: inconsistent execution phase timing"
+                )
+        if schema == "fln.supervisor/3" and synthetic_cancel_deadline_ns is not None and (
+            execution_ns is None
+            or synthetic_cancel_deadline_ns < execution_ns
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: synthetic cancellation predates execution"
+            )
+        if schema == "fln.supervisor/3" and termination_decision_ns is not None and not (
+            phase["setup_start_ns"]
+            <= termination_decision_ns
+            <= value["monotonic_end_ns"]
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: termination decision timing is inconsistent"
+            )
+        for key in (
+            "readiness_ns",
+            "release_decision_ns",
+            "execution_start_ns",
+            "child_reaped_ns",
+            *(
+                (
+                    "synthetic_cancel_deadline_ns",
+                    "termination_decision_ns",
+                    "child_terminal_observed_ns",
+                )
+                if schema == "fln.supervisor/3"
+                else ()
+            ),
+        ):
+            timestamp = phase[key]
+            if timestamp is not None and (
+                timestamp < phase["setup_start_ns"]
+                or (
+                    key != "synthetic_cancel_deadline_ns"
+                    and timestamp > value["monotonic_end_ns"]
+                )
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: phase timestamp lies outside run: {key}"
+                )
+        if schema == "fln.supervisor/3" and (
+            (child_terminal_observed_ns is None)
+            != (child_reaped_ns is None)
+            or (
+                child_terminal_observed_ns is not None
+                and child_reaped_ns < child_terminal_observed_ns
+            )
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: child observation/reap timing mismatch"
+            )
+        target_exec = value["target_exec"]
+        if (
+            not isinstance(target_exec, dict)
+            or set(target_exec) != {"status", "failure"}
+            or target_exec["status"]
+            not in {"succeeded", "failed", "not_released", "unknown"}
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: malformed target exec status"
+            )
+        if target_exec["status"] == "failed":
+            failure = target_exec["failure"]
+            if (
+                not isinstance(failure, dict)
+                or set(failure)
+                != {"schema", "status", "error_type", "errno", "errno_name"}
+                or failure.get("schema") != "fln.exec-status/1"
+                or failure.get("status") != "failed"
+                or not isinstance(failure.get("error_type"), str)
+                or not failure["error_type"]
+                or (
+                    failure.get("errno") is not None
+                    and (
+                        not isinstance(failure["errno"], int)
+                        or isinstance(failure["errno"], bool)
+                        or failure["errno"] <= 0
+                        or failure.get("errno_name")
+                        != errno.errorcode.get(failure["errno"])
+                    )
+                )
+                or (
+                    failure.get("errno") is None
+                    and failure.get("errno_name") is not None
+                )
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: malformed target exec failure"
+                )
+        elif target_exec["failure"] is not None:
+            raise EvidenceError(
+                f"{path}:{record_number}: non-failed exec has failure facts"
+            )
+        if (
+            execution_ns is None
+            and target_exec["status"] != "not_released"
+        ) or (
+            execution_ns is not None
+            and target_exec["status"] == "not_released"
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: target exec/release status mismatch"
+            )
+        if target_exec["status"] == "failed" and value["classification"] in {
+            "pass",
+            "fail",
+        }:
+            raise EvidenceError(
+                f"{path}:{record_number}: target exec failure was misclassified"
+            )
+        if (
+            value["classification"] in {"pass", "fail"}
+            and target_exec["status"] != "succeeded"
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: terminal verdict lacks target exec proof"
+            )
+        if (
+            value["classification"] == "internal_fault"
+            and value["reason_code"] == "unexpected_child_exit"
+            and target_exec["status"] != "succeeded"
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: child-exit fault lacks target exec proof"
+            )
+        if target_exec["status"] == "not_released" and value["classification"] in {
+            "pass",
+            "fail",
+        }:
+            raise EvidenceError(
+                f"{path}:{record_number}: unreleased target has a semantic outcome"
+            )
+        if schema == "fln.supervisor/3":
+            test_control = value["test_control"]
+            if (
+                not isinstance(test_control, dict)
+                or set(test_control)
+                != {
+                    "before_stop_delay_ms",
+                    "before_release_delay_ms",
+                    "gate_mode",
+                    "terminal_delay_ms",
+                    "terminal_ready_enabled",
+                    "fault_point",
+                }
+                or not isinstance(test_control["before_stop_delay_ms"], int)
+                or isinstance(test_control["before_stop_delay_ms"], bool)
+                or test_control["before_stop_delay_ms"] < 0
+                or not isinstance(test_control["before_release_delay_ms"], int)
+                or isinstance(test_control["before_release_delay_ms"], bool)
+                or test_control["before_release_delay_ms"] < 0
+                or not isinstance(test_control["terminal_delay_ms"], int)
+                or isinstance(test_control["terminal_delay_ms"], bool)
+                or test_control["terminal_delay_ms"] < 0
+                or not isinstance(test_control["terminal_ready_enabled"], bool)
+                or test_control["fault_point"] not in SUPERVISOR_TEST_FAULT_POINTS
+                or test_control["gate_mode"]
+                not in {
+                    "normal",
+                    "exit_before_stop",
+                    "never_stop",
+                    "die_after_stop",
+                }
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: malformed stopped-gate test control"
+                )
+            if (
+                test_control["before_stop_delay_ms"] != 0
+                or test_control["before_release_delay_ms"] != 0
+                or test_control["gate_mode"] != "normal"
+                or test_control["terminal_delay_ms"] != 0
+                or test_control["terminal_ready_enabled"]
+                or test_control["fault_point"] != "none"
+            ) and value["planted"] is not True:
+                raise EvidenceError(
+                    f"{path}:{record_number}: injected gate fault is not planted"
+                )
+            fault_point = test_control["fault_point"]
+            if fault_point == "metadata_parent_open":
+                raise EvidenceError(
+                    f"{path}:{record_number}: metadata-open fault cannot publish metadata"
+                )
+            if fault_point in {"capture_stdout", "capture_stderr"}:
+                stream = fault_point.removeprefix("capture_")
+                if (
+                    value["classification"] != "internal_fault"
+                    or value["reason_code"] != "artifact_publication_failure"
+                    or not any(
+                        error.startswith(
+                            f"capture publication failure: {stream}:"
+                        )
+                        for error in value["errors"]
+                    )
+                ):
+                    raise EvidenceError(
+                        f"{path}:{record_number}: planted capture fault lacks effect"
+                    )
+            if fault_point == "readiness_publication" and (
+                value["classification"] != "internal_fault"
+                or value["reason_code"] != "supervisor_or_capture_failure"
+                or value["phase_timing"]["readiness_ns"] is not None
+                or value["phase_timing"]["execution_start_ns"] is not None
+                or not any(
+                    "injected readiness publication failure" in error
+                    for error in value["errors"]
+                )
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: planted readiness fault lacks effect"
+                )
+            if fault_point in {"thread_start_stdout", "thread_start_stderr"}:
+                stream = fault_point.removeprefix("thread_start_")
+                if (
+                    value["classification"] != "internal_fault"
+                    or value["reason_code"] != "supervisor_or_capture_failure"
+                    or value["phase_timing"]["execution_start_ns"] is not None
+                    or not any(
+                        f"injected {stream} drainer start failure" in error
+                        for error in value["errors"]
+                    )
+                ):
+                    raise EvidenceError(
+                        f"{path}:{record_number}: planted thread fault lacks effect"
+                    )
     expected_wrapper = {
         "pass": 0,
         "fail": 1,
@@ -3005,6 +4155,81 @@ def validate_supervisor_object(
         raise EvidenceError(
             f"{path}:{record_number}: supervisor classification/exit mismatch"
         )
+    allowed_reason_codes = {
+        "pass": {"exit_zero"},
+        "fail": {"child_exit_semantic_failure"},
+        "internal_fault": {
+            "artifact_publication_failure",
+            "supervisor_or_capture_failure",
+            "unexpected_child_exit",
+            "target_exec_failure",
+        },
+        "inconclusive": {
+            "setup_timeout",
+            "timeout",
+            "output_budget_exhausted",
+            *(f"child_signal_{name}" for name in valid_signal_names),
+        },
+        "cancelled": {"signal_SIGHUP", "signal_SIGINT", "signal_SIGTERM"},
+    }
+    if value["reason_code"] not in allowed_reason_codes[classification]:
+        raise EvidenceError(
+            f"{path}:{record_number}: classification/reason mismatch"
+        )
+    if schema == "fln.supervisor/1" and value["reason_code"] == "target_exec_failure":
+        raise EvidenceError(
+            f"{path}:{record_number}: legacy envelope claims target exec proof"
+        )
+    if value["errors"] and classification != "internal_fault":
+        raise EvidenceError(
+            f"{path}:{record_number}: non-internal outcome carries supervisor errors"
+        )
+    if value["reason_code"] == "supervisor_or_capture_failure" and not value["errors"]:
+        raise EvidenceError(
+            f"{path}:{record_number}: supervisor failure lacks recorded error"
+        )
+    if value["reason_code"] == "artifact_publication_failure" and not any(
+        error.startswith("capture publication failure:") for error in value["errors"]
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: artifact failure lacks publication error"
+        )
+    if value["errors"] and value["reason_code"] not in {
+        "artifact_publication_failure",
+        "supervisor_or_capture_failure",
+    }:
+        raise EvidenceError(
+            f"{path}:{record_number}: recorded errors do not bind terminal reason"
+        )
+    if (
+        schema in {"fln.supervisor/2", "fln.supervisor/3"}
+        and value["reason_code"] == "target_exec_failure"
+        and value["target_exec"]["status"] != "failed"
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: target exec reason lacks failure status"
+        )
+    if (value["child_exit"] is None) == (value["child_signal"] is None):
+        if not (
+            value["child_exit"] is None
+            and value["child_signal"] is None
+            and classification
+            in {"internal_fault", "inconclusive", "cancelled"}
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: child terminal facts are inconsistent"
+            )
+    if classification in {"pass", "fail"} and value["cancel_signal"] is not None:
+        raise EvidenceError(
+            f"{path}:{record_number}: conclusive target has cancellation facts"
+        )
+    if classification == "cancelled" and (
+        value["cancel_signal"] is None
+        or value["reason_code"] != f"signal_{value['cancel_signal']}"
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: cancellation reason/signal mismatch"
+        )
     if classification == "pass" and (
         value["child_exit"] != 0 or value["child_signal"] is not None
     ):
@@ -3017,17 +4242,34 @@ def validate_supervisor_object(
         raise EvidenceError(
             f"{path}:{record_number}: failed supervisor lacks semantic failure"
         )
+    if value["reason_code"] == "unexpected_child_exit" and (
+        value["child_exit"] in {None, 0}
+        or value["child_exit"] in semantic_exits
+        or value["child_signal"] is not None
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: unexpected-exit reason lacks child exit"
+        )
     if classification == "inconclusive" and value["reason_code"].startswith(
         "child_signal_"
     ):
         if (
             not isinstance(value["child_signal"], str)
             or value["child_exit"] is not None
+            or value["reason_code"] != f"child_signal_{value['child_signal']}"
         ):
             raise EvidenceError(
                 f"{path}:{record_number}: child signal is not typed inconclusive"
             )
-    if classification == "internal_fault" and value["child_exit"] not in {None, 0}:
+    if (
+        classification == "internal_fault"
+        and not (
+            schema in {"fln.supervisor/2", "fln.supervisor/3"}
+            and value["reason_code"] == "target_exec_failure"
+            and value["target_exec"]["status"] == "failed"
+        )
+        and value["child_exit"] not in {None, 0}
+    ):
         if value["child_exit"] in semantic_exits:
             raise EvidenceError(
                 f"{path}:{record_number}: semantic child failure was marked internal"
@@ -3037,17 +4279,149 @@ def validate_supervisor_object(
         raise EvidenceError(
             f"{path}:{record_number}: supervisor resource facts missing"
         )
+    expected_resource_keys = {
+        "capture_bytes_per_stream",
+        "output_budget_bytes",
+        "kill_grace_ms",
+        "total_output_bytes",
+        "user_cpu_seconds",
+        "system_cpu_seconds",
+        "max_rss_kib_observed",
+        "term_sent",
+        "kill_sent",
+        "process_tree_scope",
+        "surviving_pids",
+    }
+    if schema == "fln.supervisor/1":
+        expected_resource_keys.add("timeout_ms")
+    elif schema == "fln.supervisor/2":
+        expected_resource_keys.update({"setup_timeout_ms", "timeout_ms"})
+    else:
+        expected_resource_keys.update(
+            {"setup_timeout_ms", "execution_timeout_ms", "cancel_after_ms"}
+        )
+    if set(resource_facts) != expected_resource_keys:
+        raise EvidenceError(
+            f"{path}:{record_number}: supervisor resource shape mismatch"
+        )
     positive_integer_facts = (
         "capture_bytes_per_stream",
         "output_budget_bytes",
-        "timeout_ms",
         "kill_grace_ms",
     )
+    if schema == "fln.supervisor/2":
+        positive_integer_facts = (
+            *positive_integer_facts,
+            "setup_timeout_ms",
+            "timeout_ms",
+        )
+    elif schema == "fln.supervisor/3":
+        positive_integer_facts = (
+            *positive_integer_facts,
+            "setup_timeout_ms",
+            "execution_timeout_ms",
+        )
+    else:
+        positive_integer_facts = (*positive_integer_facts, "timeout_ms")
     for key in positive_integer_facts:
         fact = resource_facts.get(key)
         if not isinstance(fact, int) or isinstance(fact, bool) or fact <= 0:
             raise EvidenceError(
                 f"{path}:{record_number}: malformed resource fact {key}"
+            )
+    if schema == "fln.supervisor/3":
+        cancel_after = resource_facts.get("cancel_after_ms")
+        if cancel_after is not None and (
+            not isinstance(cancel_after, int)
+            or isinstance(cancel_after, bool)
+            or cancel_after < 0
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: malformed cancel-after budget"
+            )
+        execution_ns = value["phase_timing"]["execution_start_ns"]
+        cancel_deadline_ns = value["phase_timing"]["synthetic_cancel_deadline_ns"]
+        expected_cancel_deadline = (
+            execution_ns + cancel_after * 1_000_000
+            if execution_ns is not None and cancel_after is not None
+            else None
+        )
+        if cancel_deadline_ns != expected_cancel_deadline:
+            raise EvidenceError(
+                f"{path}:{record_number}: synthetic cancellation deadline mismatch"
+            )
+        if (
+            classification in {"pass", "fail"}
+            and cancel_deadline_ns is not None
+            and value["phase_timing"]["child_terminal_observed_ns"]
+            >= cancel_deadline_ns
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: conclusive target crossed cancellation deadline"
+            )
+        phase = value["phase_timing"]
+        if (
+            phase["setup_deadline_ns"]
+            != phase["setup_start_ns"]
+            + resource_facts["setup_timeout_ms"] * 1_000_000
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: setup deadline/budget mismatch"
+            )
+        execution_duration = phase["execution_duration_ns"]
+        if classification in {"pass", "fail"} and (
+            execution_duration is None
+            or execution_duration
+            > resource_facts["execution_timeout_ms"] * 1_000_000
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: conclusive execution exceeded its budget"
+            )
+        if classification in {"pass", "fail"} and phase[
+            "termination_decision_ns"
+        ] is not None:
+            raise EvidenceError(
+                f"{path}:{record_number}: conclusive execution has termination decision"
+            )
+        if value["reason_code"] == "timeout":
+            expected_timeout_ns = (
+                phase["execution_start_ns"]
+                + resource_facts["execution_timeout_ms"] * 1_000_000
+            )
+            if (
+                phase["execution_start_ns"] is None
+                or phase["termination_decision_ns"] is None
+                or phase["termination_decision_ns"] < expected_timeout_ns
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: execution timeout decision is premature"
+                )
+        if value["reason_code"] == "setup_timeout" and (
+            phase["termination_decision_ns"] is None
+            or phase["termination_decision_ns"] < phase["setup_deadline_ns"]
+            or phase["release_decision_ns"] is not None
+            or phase["execution_start_ns"] is not None
+            or value["target_exec"]["status"] != "not_released"
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: setup timeout decision is premature"
+            )
+        if value["reason_code"] == "output_budget_exhausted" and (
+            phase["execution_start_ns"] is None
+            or phase["termination_decision_ns"] is None
+            or phase["termination_decision_ns"] < phase["execution_start_ns"]
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: output termination decision is missing"
+            )
+        if (
+            phase["termination_decision_ns"] is not None
+            and phase["execution_start_ns"] is not None
+            and value["reason_code"] != "setup_timeout"
+            and phase["termination_decision_ns"] < phase["execution_start_ns"]
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: runtime termination predates execution"
             )
     if (
         resource_facts["output_budget_bytes"]
@@ -3083,10 +4457,23 @@ def validate_supervisor_object(
         raise EvidenceError(f"{path}:{record_number}: unknown process-tree scope")
     if resource_facts.get("surviving_pids") != []:
         raise EvidenceError(f"{path}:{record_number}: supervisor left live descendants")
+    readiness_name = value["readiness"]
+    if (
+        not isinstance(readiness_name, str)
+        or not readiness_name
+        or Path(readiness_name).is_absolute()
+        or Path(readiness_name).name != readiness_name
+    ):
+        raise EvidenceError(f"{path}:{record_number}: malformed readiness path")
     readiness_path = require_within(
-        path.parent / str(value["readiness"]), path.parent, label="readiness artifact"
+        path.parent / readiness_name, path.parent, label="readiness artifact"
     )
-    readiness = read_json_object(readiness_path)
+    readiness_data, _readiness_size, _readiness_digest = stable_file_facts(
+        readiness_path, max_bytes=MAX_RECORD_BYTES
+    )
+    readiness = parse_json(readiness_data, subject=str(readiness_path))
+    if not isinstance(readiness, dict):
+        raise EvidenceError(f"{path}:{record_number}: malformed readiness artifact")
     readiness_keys = {
         "schema",
         "stage_id",
@@ -3100,20 +4487,78 @@ def validate_supervisor_object(
         "monotonic_ns",
         "status",
     }
+    if readiness.get("schema") == "fln.supervisor-readiness/3":
+        readiness_keys.add("child_sid")
     if (
         set(readiness) != readiness_keys
         or not isinstance(readiness.get("monotonic_ns"), int)
         or isinstance(readiness.get("monotonic_ns"), bool)
         or readiness.get("monotonic_ns", 0) <= 0
-        or readiness.get("schema") != "fln.supervisor-readiness/1"
+        or readiness.get("schema")
+        not in {
+            "fln.supervisor-readiness/1",
+            "fln.supervisor-readiness/2",
+            "fln.supervisor-readiness/3",
+        }
         or readiness.get("stage_id") != expected_stage_id
     ):
         raise EvidenceError(f"{path}:{record_number}: malformed readiness artifact")
+    if (
+        schema == "fln.supervisor/1"
+        and readiness.get("schema") != "fln.supervisor-readiness/1"
+    ) or (
+        schema == "fln.supervisor/2"
+        and readiness.get("schema") != "fln.supervisor-readiness/2"
+    ) or (
+        schema == "fln.supervisor/3"
+        and readiness.get("schema") != "fln.supervisor-readiness/3"
+    ):
+        raise EvidenceError(f"{path}:{record_number}: supervisor/readiness version drift")
     readiness_status = readiness.get("status")
-    if readiness_status == "spawn_failed" and classification != "internal_fault":
-        raise EvidenceError(f"{path}:{record_number}: spawn failure was not internal")
-    if readiness_status not in {"ready", "spawn_failed"}:
+    allowed_readiness = (
+        {"ready", "spawn_failed"}
+        if schema == "fln.supervisor/1"
+        else {"ready", "setup_failed", "setup_timeout", "setup_cancelled"}
+    )
+    if readiness_status not in allowed_readiness:
         raise EvidenceError(f"{path}:{record_number}: unknown readiness status")
+    expected_readiness_class = {
+        "spawn_failed": ("internal_fault", None),
+        "setup_failed": ("internal_fault", None),
+        "setup_timeout": ("inconclusive", "setup_timeout"),
+        "setup_cancelled": ("cancelled", None),
+    }.get(readiness_status)
+    if expected_readiness_class is not None:
+        later_internal_override = classification == "internal_fault"
+        later_cancel_override = (
+            readiness_status == "setup_timeout" and classification == "cancelled"
+        )
+        phase_terminal = (
+            classification == expected_readiness_class[0]
+            and (
+                expected_readiness_class[1] is None
+                or value["reason_code"] == expected_readiness_class[1]
+            )
+        )
+        if (
+            not later_internal_override
+            and not later_cancel_override
+            and not phase_terminal
+        ):
+            raise EvidenceError(
+                f"{path}:{record_number}: readiness/terminal classification mismatch"
+            )
+    if schema in {"fln.supervisor/2", "fln.supervisor/3"}:
+        phase = value["phase_timing"]
+        if readiness_status == "ready":
+            if readiness["monotonic_ns"] != phase["readiness_ns"]:
+                raise EvidenceError(
+                    f"{path}:{record_number}: readiness timestamp was not bound"
+                )
+        elif phase["readiness_ns"] is not None:
+            raise EvidenceError(
+                f"{path}:{record_number}: failed setup claims ready-phase timing"
+            )
     wrapper_pid = readiness.get("wrapper_pid")
     wrapper_ticks = readiness.get("wrapper_start_ticks")
     supervisor_pid = readiness.get("supervisor_pid")
@@ -3150,12 +4595,14 @@ def validate_supervisor_object(
     if readiness_status == "ready":
         child_pid = readiness.get("child_pid")
         child_pgid = readiness.get("child_pgid")
+        child_sid = readiness.get("child_sid", child_pid)
         child_ticks = readiness.get("child_start_ticks")
         if (
             not isinstance(child_pid, int)
             or isinstance(child_pid, bool)
             or child_pid <= 1
             or child_pid != child_pgid
+            or child_pid != child_sid
             or not isinstance(child_ticks, int)
             or isinstance(child_ticks, bool)
             or child_ticks <= 0
@@ -3166,31 +4613,32 @@ def validate_supervisor_object(
             )
     elif any(
         readiness.get(key) is not None
-        for key in ("child_pid", "child_pgid", "child_start_ticks")
+        for key in ("child_pid", "child_pgid", "child_sid", "child_start_ticks")
     ):
         raise EvidenceError(
             f"{path}:{record_number}: spawn-failed readiness names a child"
         )
     stream_artifacts: set[str] = set()
+    expected_stream_keys = {
+        "artifact",
+        "sha256",
+        "retained_sha256",
+        "total_bytes",
+        "retained_bytes",
+        "head_bytes",
+        "tail_bytes",
+        "truncated",
+    }
     for stream in ("stdout", "stderr"):
         facts = value[stream]
-        if not isinstance(facts, dict):
+        if not isinstance(facts, dict) or set(facts) != expected_stream_keys:
             raise EvidenceError(f"{path}:{record_number}: missing {stream} facts")
-        for key in (
-            "artifact",
-            "sha256",
-            "retained_sha256",
-            "total_bytes",
-            "retained_bytes",
-            "head_bytes",
-            "tail_bytes",
-            "truncated",
+        if (
+            not isinstance(facts["artifact"], str)
+            or not facts["artifact"]
+            or Path(facts["artifact"]).is_absolute()
+            or Path(facts["artifact"]).name != facts["artifact"]
         ):
-            if key not in facts:
-                raise EvidenceError(
-                    f"{path}:{record_number}: incomplete {stream} facts"
-                )
-        if not isinstance(facts["artifact"], str) or not facts["artifact"]:
             raise EvidenceError(
                 f"{path}:{record_number}: malformed {stream} artifact name"
             )
@@ -3243,7 +4691,9 @@ def validate_supervisor_object(
             path.parent,
             label=f"{stream} artifact",
         )
-        _data, size, digest = stable_file_facts(artifact)
+        _data, size, digest = stable_file_facts(
+            artifact, max_bytes=resource_facts["capture_bytes_per_stream"]
+        )
         if size != facts["retained_bytes"] or not hmac.compare_digest(
             digest, str(facts["retained_sha256"])
         ):
@@ -3255,12 +4705,38 @@ def validate_supervisor_object(
     ):
         raise EvidenceError(f"{path}:{record_number}: total output accounting mismatch")
     if (
+        value["reason_code"] == "output_budget_exhausted"
+        and resource_facts["total_output_bytes"]
+        <= resource_facts["output_budget_bytes"]
+    ):
+        raise EvidenceError(
+            f"{path}:{record_number}: output-budget reason lacks exhaustion"
+        )
+    if (
         classification in {"pass", "fail"}
         and resource_facts["total_output_bytes"] > resource_facts["output_budget_bytes"]
     ):
         raise EvidenceError(
             f"{path}:{record_number}: conclusive stage exceeded output budget"
         )
+
+
+def validate_supervisor_file(path: Path, expected_stage_id: str) -> dict[str, Any]:
+    data, size, digest = stable_file_facts(path, max_bytes=MAX_RECORD_BYTES)
+    value = parse_json(data, subject=str(path))
+    validate_supervisor_object(
+        path,
+        1,
+        value,
+        expected_stage_id=expected_stage_id,
+    )
+    return {
+        "schema": "fln.supervisor-validation/1",
+        "valid": True,
+        "stage_id": expected_stage_id,
+        "bytes": size,
+        "sha256": digest,
+    }
 
 
 def sha256_file(path: Path) -> str:
@@ -3813,7 +5289,11 @@ def emergency_kill(
     readiness_path: Path, expected_wrapper_pid: int, expected_stage_id: str
 ) -> None:
     readiness = read_json_object(readiness_path)
-    if readiness.get("schema") != "fln.supervisor-readiness/1":
+    if readiness.get("schema") not in {
+        "fln.supervisor-readiness/1",
+        "fln.supervisor-readiness/2",
+        "fln.supervisor-readiness/3",
+    }:
         raise EvidenceError("emergency kill readiness schema mismatch")
     if (
         readiness.get("status") != "ready"
@@ -3824,7 +5304,12 @@ def emergency_kill(
     supervisor_pid = readiness.get("supervisor_pid")
     child_pid = readiness.get("child_pid")
     child_pgid = readiness.get("child_pgid")
-    if wrapper_pid != expected_wrapper_pid or child_pid != child_pgid:
+    child_sid = readiness.get("child_sid", child_pid)
+    if (
+        wrapper_pid != expected_wrapper_pid
+        or child_pid != child_pgid
+        or child_pid != child_sid
+    ):
         raise EvidenceError("emergency kill PID binding mismatch")
     if not all(
         isinstance(value, int) and not isinstance(value, bool) and value > 1
@@ -3846,6 +5331,7 @@ def emergency_kill(
         or child_facts[2] != readiness.get("child_start_ticks")
         or child_facts[1] != child_pgid
         or os.getpgid(child_pid) != child_pgid
+        or os.getsid(child_pid) != child_sid
     ):
         raise EvidenceError("emergency kill readiness is stale")
     handles: ProcessHandles = {}
@@ -4824,11 +6310,16 @@ def run_supervised_from_args(
         ),
         guardian_identity=guardian_identity,
         initial_signal_mask=initial_signal_mask,
+        test_before_stop_delay_ms=args.test_before_stop_delay_ms,
+        test_before_release_delay_ms=args.test_before_release_delay_ms,
+        test_gate_mode=args.test_gate_mode,
+        test_fault_point=args.test_fault_point,
     )
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     """Keep an outer subreaper alive if the inner supervisor is hard-killed."""
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     enable_child_subreaper()
     guardian_facts = proc_stat_facts(os.getpid())
     if guardian_facts is None or guardian_facts[0] == "Z":
@@ -4840,6 +6331,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     os.close(preflight_handle[1])
     watched = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+    guardian_runtime_mask = set(previous_mask).difference(watched)
     if bool(args.launch_ready) != bool(args.launch_release):
         raise EvidenceError("guardian launch gate requires both control paths")
     if args.launch_ready:
@@ -4878,6 +6370,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if worker_pid == 0:
         try:
             try:
+                arm_parent_death_signal(guardian_identity[0], signal.SIGTERM)
                 worker_exit = run_supervised_from_args(
                     args,
                     guardian_identity,
@@ -4898,6 +6391,49 @@ def cmd_run(args: argparse.Namespace) -> int:
     setup_error: BaseException | None = None
     cleanup_errors: list[str] = []
     survivors: list[int] = []
+    worker_deadline_ns = time.monotonic_ns() + (
+        args.setup_timeout_ms
+        + args.timeout_ms
+        + max(1_000, args.grace_ms) * 6
+        + max(0, args.test_before_release_delay_ms)
+        + max(0, args.test_terminal_delay_ms)
+        + 30_000
+    ) * 1_000_000
+
+    def reap_worker_until(deadline_ns: int) -> bool:
+        nonlocal waited_pid, waited_status
+        worker_events: select.poll | None = None
+        if worker_handle is not None:
+            worker_events = select.poll()
+            worker_events.register(
+                worker_handle[1], select.POLLIN | select.POLLHUP | select.POLLERR
+            )
+        while waited_status is None:
+            try:
+                candidate_pid, candidate_status = os.waitpid(
+                    worker_pid, os.WNOHANG
+                )
+            except InterruptedError:
+                continue
+            if candidate_pid == worker_pid:
+                waited_pid = candidate_pid
+                waited_status = candidate_status
+                return True
+            if candidate_pid != 0:
+                raise EvidenceError("guardian reaped an unexpected process")
+            now_ns = time.monotonic_ns()
+            if now_ns >= deadline_ns:
+                return False
+            wait_ms = max(
+                1,
+                min(50, (deadline_ns - now_ns + 999_999) // 1_000_000),
+            )
+            if worker_events is not None:
+                worker_events.poll(wait_ms)
+            else:
+                time.sleep(wait_ms / 1000)
+        return True
+
     try:
         if args.test_fail_guardian_pidfd_open:
             if args.test_guardian_child_ready:
@@ -4962,14 +6498,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         for signum in watched:
             signal.signal(signum, forward_signal)
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-        while waited_status is None:
-            try:
-                waited_pid, waited_status = os.waitpid(worker_pid, 0)
-            except InterruptedError:
-                continue
-            if waited_pid != worker_pid:
-                raise EvidenceError("guardian reaped an unexpected process")
+        signal.pthread_sigmask(signal.SIG_SETMASK, guardian_runtime_mask)
+        if not reap_worker_until(worker_deadline_ns):
+            raise EvidenceError("inner supervisor exceeded guardian wall deadline")
     except BaseException as error:
         setup_error = error
         try:
@@ -5005,22 +6536,22 @@ def cmd_run(args: argparse.Namespace) -> int:
                     cleanup_errors.append(
                         f"cannot signal failed inner supervisor by PID: {cleanup_error}"
                     )
-            while True:
-                try:
-                    waited_pid, waited_status = os.waitpid(worker_pid, 0)
-                    break
-                except InterruptedError:
-                    continue
-                except ChildProcessError as cleanup_error:
+            cleanup_deadline_ns = time.monotonic_ns() + max(
+                1_000, args.grace_ms + 1_000
+            ) * 1_000_000
+            try:
+                if not reap_worker_until(cleanup_deadline_ns):
                     cleanup_errors.append(
-                        f"cannot reap failed inner supervisor: {cleanup_error}"
+                        "failed inner supervisor did not reap within cleanup budget"
                     )
-                    break
-                except BaseException as cleanup_error:
-                    cleanup_errors.append(
-                        f"failed while reaping inner supervisor: {cleanup_error}"
-                    )
-                    break
+            except ChildProcessError as cleanup_error:
+                cleanup_errors.append(
+                    f"cannot reap failed inner supervisor: {cleanup_error}"
+                )
+            except BaseException as cleanup_error:
+                cleanup_errors.append(
+                    f"failed while reaping inner supervisor: {cleanup_error}"
+                )
             if waited_pid not in {0, worker_pid}:
                 setup_error = EvidenceError(
                     "guardian lost the failed inner supervisor"
@@ -5128,6 +6659,24 @@ def cmd_validate_run(args: argparse.Namespace) -> int:
     return PASS
 
 
+def cmd_validate_supervisor(args: argparse.Namespace) -> int:
+    report = validate_supervisor_file(Path(args.file), args.expected_stage_id)
+    if args.output:
+        if not args.artifact_root:
+            raise EvidenceError(
+                "validate-supervisor --output requires --artifact-root"
+            )
+        output = require_within(
+            Path(args.output),
+            Path(args.artifact_root),
+            label="supervisor validation",
+        )
+        write_new(output, canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
 def cmd_hash_tree(args: argparse.Namespace) -> int:
     inventory_path = Path(args.inventory) if args.inventory else None
     root = tree_hash(
@@ -5194,16 +6743,22 @@ def cmd_stopped_exec(args: argparse.Namespace) -> int:
         command = command[1:]
     if not command:
         raise EvidenceError("stopped exec requires a command")
-    try:
-        if args.exec_status_fd is not None:
+    if args.exec_status_fd is not None:
+        try:
             if args.exec_status_fd <= 2:
                 raise EvidenceError("exec status descriptor must not be a stdio stream")
             os.fstat(args.exec_status_fd)
             # subprocess pass_fds admits this descriptor into the helper. Restore
             # CLOEXEC before stopping so EOF is the target-exec success signal.
             os.set_inheritable(args.exec_status_fd, False)
+        except BaseException:
+            return SETUP_FAILURE
+    try:
         arm_parent_death_kill(args.expected_parent_pid)
         os.kill(os.getpid(), signal.SIGSTOP)
+    except BaseException:
+        return SETUP_FAILURE
+    try:
         os.execvp(command[0], command)
         raise EvidenceError("stopped exec unexpectedly returned")
     except BaseException as error:
@@ -5508,11 +7063,22 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         *,
         capture: int = 4096,
         budget: int = 262_144,
+        setup_timeout: int = MAX_PROCESS_IDENTITY_WAIT_MS,
         timeout: int = 30_000,
         cancel_after: int | None = None,
         stdout_override: Path | None = None,
         semantic_exits: Sequence[int] = (),
+        before_stop_delay: int = 0,
+        before_release_delay: int = 0,
+        gate_mode: str = "normal",
+        fault_point: str = "none",
     ) -> tuple[int, dict[str, Any], Path]:
+        injected_gate_control = (
+            before_stop_delay != 0
+            or before_release_delay != 0
+            or gate_mode != "normal"
+            or fault_point != "none"
+        )
         root = case_dir(name)
         metadata = root / "stage.meta.json"
         stdout = stdout_override or root / "stage.out"
@@ -5528,14 +7094,41 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             artifact_root=art_dir,
             capture_bytes=capture,
             output_budget_bytes=budget,
+            setup_timeout_ms=setup_timeout,
             timeout_ms=timeout,
             grace_ms=500,
             stage_id=name,
-            planted=False,
+            planted=injected_gate_control,
             semantic_failure_exits=semantic_exits,
             cancel_after_ms=cancel_after,
+            test_before_stop_delay_ms=before_stop_delay,
+            test_before_release_delay_ms=before_release_delay,
+            test_gate_mode=gate_mode,
+            test_fault_point=fault_point,
         )
         meta = read_json_object(metadata)
+        validate_supervisor_object(
+            metadata,
+            1,
+            meta,
+            expected_stage_id=name,
+        )
+        require(
+            meta["planted"] is injected_gate_control,
+            f"{name}: planted marker did not bind stopped-gate controls",
+        )
+        require(
+            meta["test_control"]
+            == {
+                "before_stop_delay_ms": before_stop_delay,
+                "before_release_delay_ms": before_release_delay,
+                "gate_mode": gate_mode,
+                "terminal_delay_ms": 0,
+                "terminal_ready_enabled": False,
+                "fault_point": fault_point,
+            },
+            f"{name}: stopped-gate controls were not retained",
+        )
         return rc, meta, root
 
     def run_shell_finalizer_probe(
@@ -5893,19 +7486,193 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     )
 
     rc, meta, root = run_case(
-        "spawn_failure",
+        "target_exec_failure",
         [str(art_dir / "definitely-missing-command")],
         capture=4096,
         budget=65_536,
+        semantic_exits=(SETUP_FAILURE,),
     )
-    require(rc == SETUP_FAILURE, "spawn failure did not return internal-fault exit")
-    require(meta["classification"] == "internal_fault", "spawn failure misclassified")
-    spawn_ready = read_json_object(root / "stage.ready.json")
+    require(rc == SETUP_FAILURE, "exec failure did not return internal-fault exit")
     require(
-        spawn_ready["status"] == "spawn_failed", "spawn failure readiness is untyped"
+        meta["classification"] == "internal_fault"
+        and meta["reason_code"] == "target_exec_failure"
+        and meta["target_exec"]["status"] == "failed",
+        "exec failure was not distinguished from semantic exit 2",
+    )
+    exec_ready = read_json_object(root / "stage.ready.json")
+    require(
+        exec_ready["status"] == "ready",
+        "exec failure did not retain admitted same-PID readiness",
     )
     cases.append(
-        {"case": "spawn_failure", "ok": True, "metadata": str(root / "stage.meta.json")}
+        {
+            "case": "target_exec_failure",
+            "ok": True,
+            "metadata": str(root / "stage.meta.json"),
+        }
+    )
+
+    rc, meta, root = run_case(
+        "semantic_exit_two",
+        [sys.executable, "-c", "raise SystemExit(2)"],
+        semantic_exits=(SETUP_FAILURE,),
+    )
+    require(
+        rc == FAIL
+        and meta["classification"] == "fail"
+        and meta["child_exit"] == SETUP_FAILURE
+        and meta["target_exec"]["status"] == "succeeded",
+        "real semantic exit 2 was confused with helper setup failure",
+    )
+    cases.append(
+        {
+            "case": "semantic_exit_two",
+            "ok": True,
+            "metadata": str(root / "stage.meta.json"),
+        }
+    )
+
+    rc, meta, root = run_case(
+        "delayed_stopped_admission",
+        ["/usr/bin/true"],
+        setup_timeout=5000,
+        timeout=100,
+        before_stop_delay=500,
+    )
+    require(
+        rc == PASS
+        and meta["phase_timing"]["setup_duration_ns"] > 500_000_000
+        and meta["phase_timing"]["execution_duration_ns"] < 100_000_000,
+        "setup delay consumed the post-release execution budget",
+    )
+    cases.append(
+        {
+            "case": "delayed_stopped_admission",
+            "ok": True,
+            "metadata": str(root / "stage.meta.json"),
+        }
+    )
+
+    rc, meta, root = run_case(
+        "never_stops",
+        ["/usr/bin/true"],
+        setup_timeout=100,
+        timeout=5000,
+        gate_mode="never_stop",
+    )
+    never_ready = read_json_object(root / "stage.ready.json")
+    require(
+        rc == INCONCLUSIVE
+        and meta["reason_code"] == "setup_timeout"
+        and meta["target_exec"]["status"] == "not_released"
+        and never_ready["status"] == "setup_timeout"
+        and meta["resource"]["surviving_pids"] == [],
+        "never-stopping child did not fail closed within setup budget",
+    )
+    cases.append(
+        {
+            "case": "never_stops",
+            "ok": True,
+            "metadata": str(root / "stage.meta.json"),
+        }
+    )
+
+    rc, meta, root = run_case(
+        "exit_before_stop",
+        ["/usr/bin/true"],
+        setup_timeout=1000,
+        gate_mode="exit_before_stop",
+    )
+    gate_ready = read_json_object(root / "stage.ready.json")
+    require(
+        rc == SETUP_FAILURE
+        and meta["classification"] == "internal_fault"
+        and meta["target_exec"]["status"] == "not_released"
+        and gate_ready["status"] == "setup_failed",
+        "pre-admission gate death was not an internal setup fault",
+    )
+    cases.append(
+        {
+            "case": "exit_before_stop",
+            "ok": True,
+            "metadata": str(root / "stage.meta.json"),
+        }
+    )
+
+    rc, meta, root = run_case(
+        "stop_then_die",
+        ["/usr/bin/true"],
+        setup_timeout=1000,
+        gate_mode="die_after_stop",
+    )
+    require(
+        rc == INCONCLUSIVE
+        and meta["reason_code"] == "child_signal_SIGKILL"
+        and meta["target_exec"]["status"] == "unknown"
+        and meta["resource"]["surviving_pids"] == [],
+        "post-release pre-exec death was promoted to a target verdict",
+    )
+    cases.append(
+        {
+            "case": "stop_then_die",
+            "ok": True,
+            "metadata": str(root / "stage.meta.json"),
+        }
+    )
+
+    mutation_source = meta
+    mutation_path = root / "stage.meta.json"
+
+    def reject_supervisor_mutation(
+        label: str, mutate: Callable[[dict[str, Any]], None]
+    ) -> None:
+        candidate = parse_json(
+            canonical_json(mutation_source),
+            subject=f"supervisor mutation {label}",
+        )
+        if not isinstance(candidate, dict):
+            raise EvidenceError("supervisor mutation source is not an object")
+        mutate(candidate)
+        try:
+            validate_supervisor_object(
+                mutation_path,
+                1,
+                candidate,
+                expected_stage_id="stop_then_die",
+            )
+        except EvidenceError:
+            return
+        raise EvidenceError(f"supervisor validator accepted mutation: {label}")
+
+    reject_supervisor_mutation(
+        "setup_duration",
+        lambda candidate: candidate["phase_timing"].__setitem__(
+            "setup_duration_ns",
+            candidate["phase_timing"]["setup_duration_ns"] + 1,
+        ),
+    )
+    reject_supervisor_mutation(
+        "session_identity",
+        lambda candidate: candidate["phase_timing"].__setitem__(
+            "admission_protocol", "unbound"
+        ),
+    )
+    reject_supervisor_mutation(
+        "unknown_exec_promoted",
+        lambda candidate: (
+            candidate.__setitem__("classification", "pass"),
+            candidate.__setitem__("reason_code", "exit_zero"),
+            candidate.__setitem__("wrapper_exit", PASS),
+            candidate.__setitem__("child_exit", PASS),
+            candidate.__setitem__("child_signal", None),
+        ),
+    )
+    cases.append(
+        {
+            "case": "supervisor_v2_mutation_rejection",
+            "ok": True,
+            "mutants": 3,
+        }
     )
 
     pid_file = art_dir / "timeout-pids.txt"
@@ -6143,6 +7910,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 "500",
                 "--stage-id",
                 f"terminal_commit_{signal_name.lower()}",
+                "--planted",
                 "--test-terminal-delay-ms",
                 "500",
                 "--test-terminal-ready",
@@ -6467,7 +8235,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     )
     guardian_fault_readiness = read_json_object(guardian_fault_ready)
     require(
-        guardian_fault_readiness.get("schema") == "fln.supervisor-readiness/1"
+        guardian_fault_readiness.get("schema") == "fln.supervisor-readiness/3"
         and guardian_fault_readiness.get("status") == "ready"
         and guardian_fault_readiness.get("stage_id")
         == "guardian_pidfd_open_failure",
@@ -7022,7 +8790,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         argv=[sys.executable, "-c", "print('must-not-pass')"],
         cwd=art_dir,
         metadata_path=metadata,
-        stdout_path=collision / "stage.out",
+        stdout_path=collision_root / "stage.out",
         stderr_path=collision_root / "stage.err",
         readiness_path=collision_root / "stage.ready.json",
         artifact_root=art_dir,
@@ -7031,9 +8799,16 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         timeout_ms=5000,
         grace_ms=500,
         stage_id="artifact_publication_failure",
-        planted=False,
+        planted=True,
+        test_fault_point="capture_stdout",
     )
     meta = read_json_object(metadata)
+    validate_supervisor_object(
+        metadata,
+        1,
+        meta,
+        expected_stage_id="artifact_publication_failure",
+    )
     require(rc == SETUP_FAILURE, "artifact publication failure returned success")
     require(
         meta["classification"] == "internal_fault",
@@ -7834,6 +9609,30 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--cancel-after-ms", type=int)
     run_parser.add_argument("--test-terminal-delay-ms", type=int, default=0)
     run_parser.add_argument("--test-terminal-ready")
+    run_parser.add_argument(
+        "--test-before-stop-delay-ms",
+        type=int,
+        default=0,
+        help=argparse.SUPPRESS,
+    )
+    run_parser.add_argument(
+        "--test-before-release-delay-ms",
+        type=int,
+        default=0,
+        help=argparse.SUPPRESS,
+    )
+    run_parser.add_argument(
+        "--test-gate-mode",
+        choices=("normal", "exit_before_stop", "never_stop", "die_after_stop"),
+        default="normal",
+        help=argparse.SUPPRESS,
+    )
+    run_parser.add_argument(
+        "--test-fault-point",
+        choices=tuple(sorted(SUPERVISOR_TEST_FAULT_POINTS)),
+        default="none",
+        help=argparse.SUPPRESS,
+    )
     run_parser.add_argument("--launch-ready")
     run_parser.add_argument("--launch-release")
     run_parser.add_argument(
@@ -7890,6 +9689,16 @@ def build_parser() -> argparse.ArgumentParser:
     run_validation.add_argument("--output")
     run_validation.add_argument("--offline", action="store_true")
     run_validation.set_defaults(func=cmd_validate_run)
+
+    supervisor_validation = subparsers.add_parser(
+        "validate-supervisor",
+        help="read-only validation of one bounded supervisor envelope",
+    )
+    supervisor_validation.add_argument("--file", required=True)
+    supervisor_validation.add_argument("--expected-stage-id", required=True)
+    supervisor_validation.add_argument("--artifact-root")
+    supervisor_validation.add_argument("--output")
+    supervisor_validation.set_defaults(func=cmd_validate_supervisor)
 
     hash_parser = subparsers.add_parser("hash-tree", help="hash canonical input files")
     hash_parser.add_argument("--root", required=True)
@@ -8100,6 +9909,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     try:
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
         args = build_parser().parse_args()
         return int(args.func(args))
     except (
