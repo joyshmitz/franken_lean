@@ -14,18 +14,25 @@
 //! mutation of any other handle.
 //!
 //! Iteration order is trie order — ascending hash chunks, least-significant
-//! chunk first — so it depends only on the key hashes present (plus bucket
-//! insertion order for hash-colliding keys), never on the sequence of
-//! non-colliding insertions that built the map.
+//! chunk first — with full-hash collision buckets ordered by [`PKey`]'s
+//! canonical total order. It therefore depends only on the keys present,
+//! never on the insertion or scheduling history that built the map.
 
 use std::sync::Arc;
 
-/// Keys carry their own 64-bit hash.
+/// Keys carry their own 64-bit hash and a canonical total order.
 ///
 /// The hash must be a pure function of the key's `Eq` identity: equal keys
-/// must return equal hashes. Distinct keys may collide; collisions degrade a
-/// leaf to a linear bucket but never affect correctness.
-pub trait PKey: Clone + Eq {
+/// must return equal hashes. `Ord` must be consistent with `Eq`; it is the CGSE
+/// tie-break for distinct keys with the same complete hash. Distinct keys may
+/// collide; collision-bucket lookup/removal is currently O(b), while insertion
+/// performs O(log b) comparisons plus O(b) clone/shift work. Resource-bounding
+/// adversarially large buckets is deliberately owned by follow-up `fln-amv.13`.
+///
+/// `Name` uses its pinned Reference `Name.cmp` order through its `Ord`
+/// implementation, never allocation address, insertion order, or randomized
+/// hashing.
+pub trait PKey: Clone + Eq + Ord {
     fn key_hash(&self) -> u64;
 }
 
@@ -254,13 +261,17 @@ fn insert_rec<K: PKey, V: Clone>(
         } => {
             if *leaf_hash == hash {
                 let mut new_entries = entries.clone();
-                let added = match new_entries.iter_mut().find(|(k, _)| *k == key) {
-                    Some(slot) => {
-                        slot.1 = value;
+                let added = match new_entries.binary_search_by(|(stored, _)| stored.cmp(&key)) {
+                    Ok(pos) => {
+                        // `PKey` requires `Ord` to be consistent with `Eq`; keep
+                        // the already-published key object and replace only its
+                        // value so overwrites cannot perturb bucket identity.
+                        debug_assert!(new_entries[pos].0 == key);
+                        new_entries[pos].1 = value;
                         false
                     }
-                    None => {
-                        new_entries.push((key, value));
+                    Err(pos) => {
+                        new_entries.insert(pos, (key, value));
                         true
                     }
                 };
@@ -485,6 +496,14 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{AxiomVal, ConstantInfo, ConstantVal};
+    use crate::environment::Environment;
+    use fln_core::expr::Expr;
+    use fln_core::level::Level;
+    use fln_core::name::{LeafView, Name};
+    use fln_core::options::KVMap;
+    use fln_hash::domain::{Domain, hash};
+    use fln_hash::root::LogicalRoot;
     use std::collections::BTreeMap;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -515,12 +534,25 @@ mod tests {
     }
 
     /// Adversarial key: every instance collides on the same hash.
-    #[derive(Clone, PartialEq, Eq, Debug)]
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
     struct CollKey(u64);
 
     impl PKey for CollKey {
         fn key_hash(&self) -> u64 {
             0xDEAD_BEEF
+        }
+    }
+
+    /// Key with a separately controlled identity order and trie hash.
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    struct ShapedKey {
+        canonical: u64,
+        hash: u64,
+    }
+
+    impl PKey for ShapedKey {
+        fn key_hash(&self) -> u64 {
+            self.hash
         }
     }
 
@@ -712,10 +744,464 @@ mod tests {
             }
         }
 
-        let mut contents: Vec<(u64, u64)> = map.iter().map(|(k, v)| (k.0, *v)).collect();
-        contents.sort_unstable();
+        let contents: Vec<(u64, u64)> = map.iter().map(|(k, v)| (k.0, *v)).collect();
         let expected: Vec<(u64, u64)> = model.iter().map(|(k, v)| (*k, *v)).collect();
         assert_eq!(contents, expected);
+    }
+
+    fn collision_map(order: &[u64]) -> PMap<CollKey, u64> {
+        order.iter().fold(PMap::new(), |map, key| {
+            map.insert(CollKey(*key), key.wrapping_mul(17))
+        })
+    }
+
+    fn collision_contents(map: &PMap<CollKey, u64>) -> Vec<(u64, u64)> {
+        map.iter().map(|(key, value)| (key.0, *value)).collect()
+    }
+
+    #[test]
+    fn collision_bucket_lifecycle_is_canonical_under_every_build_order() {
+        const CARDINALITY: u64 = 257;
+        let forward_order: Vec<u64> = (0..CARDINALITY).collect();
+        let reverse_order: Vec<u64> = forward_order.iter().rev().copied().collect();
+        let mut shuffled_order = forward_order.clone();
+        let mut rng = 0xC011_1510_0BAD_5EEDu64;
+        for index in (1..shuffled_order.len()).rev() {
+            let swap_with = (lcg(&mut rng) % (index as u64 + 1)) as usize;
+            shuffled_order.swap(index, swap_with);
+        }
+
+        let mut forward = collision_map(&forward_order);
+        let mut reverse = collision_map(&reverse_order);
+        let mut shuffled = collision_map(&shuffled_order);
+        let expected: Vec<(u64, u64)> = forward_order
+            .iter()
+            .map(|key| (*key, key.wrapping_mul(17)))
+            .collect();
+
+        assert_eq!(collision_contents(&forward), expected);
+        assert_eq!(collision_contents(&reverse), expected);
+        assert_eq!(collision_contents(&shuffled), expected);
+        assert_eq!(format!("{forward:?}"), format!("{reverse:?}"));
+        assert_eq!(format!("{forward:?}"), format!("{shuffled:?}"));
+        assert_eq!(forward, reverse);
+        assert_eq!(forward, shuffled);
+
+        // Overwrite identical keys in opposing orders. Existing key objects stay
+        // in their canonical slots; only values change.
+        for key in forward_order.iter().step_by(3) {
+            forward = forward.insert(CollKey(*key), key.wrapping_mul(31));
+        }
+        for key in reverse_order.iter().filter(|key| **key % 3 == 0) {
+            reverse = reverse.insert(CollKey(*key), key.wrapping_mul(31));
+        }
+        for key in shuffled_order.iter().filter(|key| **key % 3 == 0) {
+            shuffled = shuffled.insert(CollKey(*key), key.wrapping_mul(31));
+        }
+        assert_eq!(collision_contents(&forward), collision_contents(&reverse));
+        assert_eq!(collision_contents(&forward), collision_contents(&shuffled));
+        assert_eq!(format!("{forward:?}"), format!("{reverse:?}"));
+        assert_eq!(format!("{forward:?}"), format!("{shuffled:?}"));
+        assert_eq!(forward, reverse);
+        assert_eq!(forward, shuffled);
+
+        // Forks remain immutable while branches remove the same keys in distinct
+        // orders, then reinsert them in a third pair of orders.
+        let frozen = forward.clone();
+        let frozen_contents = collision_contents(&frozen);
+        let removed: Vec<u64> = forward_order
+            .iter()
+            .copied()
+            .filter(|key| key % 5 == 0)
+            .collect();
+        for key in &removed {
+            forward = forward.remove(&CollKey(*key));
+        }
+        for key in removed.iter().rev() {
+            reverse = reverse.remove(&CollKey(*key));
+        }
+        assert_eq!(collision_contents(&forward), collision_contents(&reverse));
+        assert_eq!(format!("{forward:?}"), format!("{reverse:?}"));
+        assert_eq!(forward, reverse);
+        assert_eq!(collision_contents(&frozen), frozen_contents);
+        assert_eq!(collision_contents(&frozen), collision_contents(&shuffled));
+        assert_eq!(format!("{frozen:?}"), format!("{shuffled:?}"));
+        assert_eq!(frozen, shuffled);
+
+        for key in removed.iter().rev() {
+            forward = forward.insert(CollKey(*key), key.wrapping_mul(47));
+        }
+        for key in &removed {
+            reverse = reverse.insert(CollKey(*key), key.wrapping_mul(47));
+        }
+        assert_eq!(collision_contents(&forward), collision_contents(&reverse));
+        assert_eq!(format!("{forward:?}"), format!("{reverse:?}"));
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.len(), CARDINALITY as usize);
+    }
+
+    #[test]
+    fn near_collision_trie_exercises_every_hash_chunk_including_partial_top_chunk() {
+        for shift in (0..=MAX_SHIFT).step_by(BITS as usize) {
+            let low = ShapedKey {
+                canonical: 0,
+                hash: 0,
+            };
+            let high = ShapedKey {
+                canonical: 1,
+                hash: 1u64 << shift,
+            };
+            let forward = PMap::new().insert(low.clone(), 0).insert(high.clone(), 1);
+            let reverse = PMap::new().insert(high, 1).insert(low, 0);
+            let expected_nodes = (shift / BITS) as usize + 3;
+            assert_eq!(forward.node_count(), expected_nodes, "shift={shift}");
+            assert_eq!(reverse.node_count(), expected_nodes, "shift={shift}");
+            assert_eq!(
+                forward.iter().collect::<Vec<_>>(),
+                reverse.iter().collect::<Vec<_>>(),
+                "shift={shift}"
+            );
+        }
+
+        // Only four real bits remain at shift 60; the five-bit mask must not
+        // manufacture a seventeenth bucket or discard the high nibble.
+        assert_eq!(chunk(u64::MAX, MAX_SHIFT), 15);
+        let top_nibble = PMap::new()
+            .insert(
+                ShapedKey {
+                    canonical: 0,
+                    hash: 0,
+                },
+                0,
+            )
+            .insert(
+                ShapedKey {
+                    canonical: 15,
+                    hash: 0xFu64 << MAX_SHIFT,
+                },
+                15,
+            );
+        assert_eq!(top_nibble.node_count(), (MAX_SHIFT / BITS) as usize + 3);
+
+        // Exercise all divergence depths together, with a full-hash collision
+        // bucket at zero, so insertion order cannot hide interactions between
+        // the trie topology and the bucket tie-break.
+        let mut mixed_keys = vec![
+            ShapedKey {
+                canonical: 0,
+                hash: 0,
+            },
+            ShapedKey {
+                canonical: 1,
+                hash: 0,
+            },
+        ];
+        mixed_keys.extend((0..=MAX_SHIFT).step_by(BITS as usize).enumerate().map(
+            |(index, shift)| ShapedKey {
+                canonical: index as u64 + 2,
+                hash: 1u64 << shift,
+            },
+        ));
+        let mixed_forward = mixed_keys.iter().fold(PMap::new(), |map, key| {
+            map.insert(key.clone(), key.canonical)
+        });
+        let mixed_reverse = mixed_keys.iter().rev().fold(PMap::new(), |map, key| {
+            map.insert(key.clone(), key.canonical)
+        });
+        assert_eq!(
+            mixed_forward.iter().collect::<Vec<_>>(),
+            mixed_reverse.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(format!("{mixed_forward:?}"), format!("{mixed_reverse:?}"));
+        assert_eq!(mixed_forward, mixed_reverse);
+    }
+
+    fn independently_built_deep_name(depth: u64) -> Name {
+        (0..depth).fold(Name::anonymous(), Name::num)
+    }
+
+    #[test]
+    fn pinned_name_order_handles_deep_full_hash_collisions_without_host_recursion() {
+        const DEPTH: u64 = 20_000;
+        let first = Name::num_overflowing(independently_built_deep_name(DEPTH), 11);
+        let second = Name::num_overflowing(independently_built_deep_name(DEPTH), 29);
+        assert_eq!(first.hash(), second.hash(), "overflowing Name nums collide");
+        assert!(
+            first < second,
+            "the pinned Name.cmp order is the bucket CGSE"
+        );
+
+        let map = PMap::new()
+            .insert(second.clone(), 29)
+            .insert(first.clone(), 11);
+        assert_eq!(numeric_leaf_order(&map), Some(vec![11, 29]));
+        assert_eq!(map.get(&first), Some(&11));
+        assert_eq!(map.get(&second), Some(&29));
+    }
+
+    fn colliding_environment_name(component: u64) -> Name {
+        Name::num_overflowing(Name::str(Name::anonymous(), "fln-amv-collision"), component)
+    }
+
+    fn collision_axiom(name: Name) -> ConstantInfo {
+        ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name,
+                level_params: vec![],
+                type_: Expr::sort(Level::zero()),
+            },
+            is_unsafe: false,
+        })
+    }
+
+    fn partitioned_insertion_order(
+        cardinality: usize,
+        partitions: usize,
+        rotation: usize,
+    ) -> Vec<u64> {
+        let mut rows: Vec<Vec<u64>> = (0..partitions)
+            .map(|partition| {
+                let mut row: Vec<u64> = (partition..cardinality)
+                    .step_by(partitions)
+                    .map(|index| index as u64)
+                    .collect();
+                if partition % 2 == 0 {
+                    row.reverse();
+                }
+                row
+            })
+            .collect();
+        rows.rotate_left(rotation % partitions);
+        rows.into_iter().flatten().collect()
+    }
+
+    fn build_collision_environment(order: &[u64]) -> Option<(PMap<Name, u64>, Environment)> {
+        let mut enumeration = PMap::new();
+        let mut environment = Environment::new();
+        for component in order {
+            let name = colliding_environment_name(*component);
+            enumeration = enumeration.insert(name.clone(), *component);
+            environment = environment.add_decl(collision_axiom(name)).ok()?;
+        }
+        Some((enumeration, environment))
+    }
+
+    fn numeric_leaf_order(map: &PMap<Name, u64>) -> Option<Vec<u64>> {
+        map.iter()
+            .map(|(name, _)| match name.leaf_view() {
+                LeafView::Num(component) => Some(component),
+                LeafView::Anonymous | LeafView::Str(_) => None,
+            })
+            .collect()
+    }
+
+    fn json_u64_array(values: &[u64]) -> String {
+        let body = values
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{body}]")
+    }
+
+    fn json_u64_matrix(rows: &[Vec<u64>]) -> String {
+        let body = rows
+            .iter()
+            .map(|row| json_u64_array(row))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{body}]")
+    }
+
+    fn json_string(value: &str) -> String {
+        let mut encoded = String::from("\"");
+        for ch in value.chars() {
+            match ch {
+                '"' => encoded.push_str("\\\""),
+                '\\' => encoded.push_str("\\\\"),
+                '\u{08}' => encoded.push_str("\\b"),
+                '\u{0c}' => encoded.push_str("\\f"),
+                '\n' => encoded.push_str("\\n"),
+                '\r' => encoded.push_str("\\r"),
+                '\t' => encoded.push_str("\\t"),
+                control if control <= '\u{1f}' => {
+                    encoded.push_str(&format!("\\u{:04x}", control as u32));
+                }
+                ordinary => encoded.push(ordinary),
+            }
+        }
+        encoded.push('"');
+        encoded
+    }
+
+    fn json_string_array(values: &[String]) -> String {
+        let body = values
+            .iter()
+            .map(|value| json_string(value))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{body}]")
+    }
+
+    #[test]
+    fn robot_json_string_escapes_every_control_character_class() {
+        let input: String = [
+            '\0', '\u{1f}', '"', '\\', '\n', '\r', '\t', '\u{08}', '\u{0c}',
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            json_string(&input),
+            "\"\\u0000\\u001f\\\"\\\\\\n\\r\\t\\b\\f\""
+        );
+    }
+
+    struct ScheduleEvidence {
+        insertion_order: Vec<u64>,
+        enumeration: Vec<u64>,
+        enumeration_nodes: usize,
+        environment_entries: usize,
+        root: LogicalRoot,
+    }
+
+    fn concurrent_schedule_evidence(cardinality: usize, threads: usize) -> Vec<ScheduleEvidence> {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|worker| {
+                    scope.spawn(move || {
+                        let insertion_order =
+                            partitioned_insertion_order(cardinality, threads, worker);
+                        let (enumeration, environment) =
+                            build_collision_environment(&insertion_order)?;
+                        Some(ScheduleEvidence {
+                            insertion_order,
+                            enumeration: numeric_leaf_order(&enumeration)?,
+                            enumeration_nodes: enumeration.node_count(),
+                            environment_entries: environment.len(),
+                            root: environment.logical_root(&KVMap::new()),
+                        })
+                    })
+                })
+                .collect();
+            let mut evidence = Vec::with_capacity(threads);
+            for handle in handles {
+                if let Ok(Some(row)) = handle.join() {
+                    evidence.push(row);
+                }
+            }
+            evidence
+        })
+    }
+
+    #[test]
+    fn environment_collision_e2e_emits_detailed_real_path_evidence() {
+        const CARDINALITY: usize = 96;
+        const THREAD_MATRIX: [usize; 3] = [1, 8, 32];
+        let started = std::time::Instant::now();
+        let expected_order: Vec<u64> = (0..CARDINALITY as u64).collect();
+        let mut expected_root = None;
+        let mut run_id = std::env::var("FLN_ENV_E2E_RUN_ID")
+            .unwrap_or_else(|_| "unit".to_string())
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            .collect::<String>();
+        if run_id.is_empty() {
+            run_id.push_str("unit");
+        }
+        let mut input_bytes = Vec::with_capacity(CARDINALITY * std::mem::size_of::<u64>());
+        for component in &expected_order {
+            input_bytes.extend_from_slice(&component.to_le_bytes());
+        }
+        let canonical_input_root = hash(Domain::Fixture, &input_bytes);
+        let cwd = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let artifact_fallback =
+            std::env::var("FLN_ENV_E2E_ARTIFACT").unwrap_or_else(|_| "stdout".to_string());
+        let stdout_artifact = std::env::var("FLN_ENV_E2E_STDOUT_ARTIFACT")
+            .unwrap_or_else(|_| artifact_fallback.clone());
+        let stderr_artifact =
+            std::env::var("FLN_ENV_E2E_STDERR_ARTIFACT").unwrap_or(artifact_fallback);
+        let argv = std::env::var("FLN_ENV_E2E_ARGV").unwrap_or_else(|_| {
+            "cargo test -p fln-env pmap::tests::environment_collision_e2e_emits_detailed_real_path_evidence -- --exact --nocapture".to_string()
+        });
+        let cache_state =
+            std::env::var("FLN_ENV_E2E_CACHE_STATE").unwrap_or_else(|_| "uncontrolled".to_string());
+        let cwd_json = json_string(&cwd);
+        let stdout_artifact_json = json_string(&stdout_artifact);
+        let stderr_artifact_json = json_string(&stderr_artifact);
+        let argv_json = json_string(&argv);
+        let cache_state_json = json_string(&cache_state);
+
+        for threads in THREAD_MATRIX {
+            let schedule_started_us = started.elapsed().as_micros();
+            let schedules = concurrent_schedule_evidence(CARDINALITY, threads);
+            let schedule_finished_us = started.elapsed().as_micros();
+            assert_eq!(schedules.len(), threads, "threads={threads}");
+            let Some(representative) = schedules.first() else {
+                continue;
+            };
+            for schedule in &schedules {
+                assert_eq!(schedule.insertion_order.len(), CARDINALITY);
+                assert_eq!(
+                    schedule.enumeration, expected_order,
+                    "collision enumeration diverged: threads={threads}"
+                );
+                match expected_root {
+                    None => expected_root = Some(schedule.root),
+                    Some(expected) => assert_eq!(schedule.root, expected, "threads={threads}"),
+                }
+            }
+            let root = expected_root.unwrap_or(representative.root);
+            let distinct_orders = schedules
+                .iter()
+                .map(|schedule| &schedule.insertion_order)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            assert_eq!(distinct_orders, threads, "threads={threads}");
+            let worker_roots: Vec<String> = schedules
+                .iter()
+                .map(|schedule| schedule.root.to_string())
+                .collect();
+            let worker_insertion_orders: Vec<Vec<u64>> = schedules
+                .iter()
+                .map(|schedule| schedule.insertion_order.clone())
+                .collect();
+            let worker_enumerations: Vec<Vec<u64>> = schedules
+                .iter()
+                .map(|schedule| schedule.enumeration.clone())
+                .collect();
+            let enumeration_nodes: Vec<u64> = schedules
+                .iter()
+                .map(|schedule| schedule.enumeration_nodes as u64)
+                .collect();
+            let environment_entries: Vec<u64> = schedules
+                .iter()
+                .map(|schedule| schedule.environment_entries as u64)
+                .collect();
+            println!(
+                "{{\"schema\":\"fln.e2e.environment-collision\",\"version\":2,\"run_id\":\"{run_id}\",\"bead\":\"fln-amv.10\",\"claim_id\":\"fln-amv.10-collision-canonicality\",\"claim_type\":\"bounded_model\",\"invariant_id\":\"FL-INV-01\",\"invariant_relation\":\"supports-local-pmap-slice\",\"gate_id\":\"PG-5\",\"gate_relation\":\"partial-component-evidence\",\"parity_ledger_row\":\"not_applicable_internal_data_structure_determinism\",\"data_grade\":\"verified\",\"epoch\":\"lean-v4.32.0\",\"mode\":\"sound\",\"profile\":\"e2e\",\"platform\":\"{}-{}\",\"seed\":\"partition-rotation-v1\",\"cache_state\":{cache_state_json},\"canonical_input_root\":\"fln-fixture:{canonical_input_root}\",\"scenario\":\"full-hash-collision-schedule-matrix\",\"schedule_id\":\"partitioned-{threads}\",\"status\":\"pass\",\"cwd\":{cwd_json},\"argv\":[{argv_json}],\"stdout_artifact\":{stdout_artifact_json},\"stderr_artifact\":{stderr_artifact_json},\"collision_cardinality\":{CARDINALITY},\"collision_hash\":\"{:016x}\",\"threads\":{threads},\"workers_built\":{},\"distinct_insertion_orders\":{distinct_orders},\"representative_insertion_order\":{},\"worker_insertion_orders\":{},\"expected_enumeration\":{},\"actual_enumeration\":{},\"worker_enumerations\":{},\"expected_root\":\"{root}\",\"actual_root\":\"{}\",\"worker_roots\":{},\"enumeration_insert_operations\":{},\"environment_insert_operations\":{},\"environment_duplicate_checks\":{},\"observed_enumeration_nodes\":{},\"observed_environment_entries\":{},\"theoretical_fresh_node_bound_per_insert\":{},\"theoretical_replaced_node_bound_per_insert\":{},\"operation_budget\":{{\"max_collision_cardinality\":{CARDINALITY},\"thread_matrix\":[1,8,32]}},\"bucket_policy\":\"PKey-Ord\",\"lookup_complexity\":\"O(bucket)\",\"insert_complexity\":\"O(log(bucket))-comparisons-plus-O(bucket)-clone-shift\",\"resource_followup\":\"fln-amv.13\",\"monotonic_start_us\":{schedule_started_us},\"monotonic_end_us\":{schedule_finished_us},\"duration_us\":{},\"timing_used_as_gate\":false,\"process_exit\":0,\"signal\":null,\"first_divergence\":null,\"cleanup_status\":\"retained_by_policy\",\"final_state\":\"canonical-enumeration-and-root-verified\"}}",
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                colliding_environment_name(0).hash(),
+                schedules.len(),
+                json_u64_array(&representative.insertion_order),
+                json_u64_matrix(&worker_insertion_orders),
+                json_u64_array(&expected_order),
+                json_u64_array(&representative.enumeration),
+                json_u64_matrix(&worker_enumerations),
+                representative.root,
+                json_string_array(&worker_roots),
+                CARDINALITY * schedules.len(),
+                CARDINALITY * schedules.len(),
+                CARDINALITY * schedules.len(),
+                json_u64_array(&enumeration_nodes),
+                json_u64_array(&environment_entries),
+                2 * MAX_DEPTH,
+                MAX_DEPTH,
+                schedule_finished_us - schedule_started_us,
+            );
+        }
     }
 
     #[test]
