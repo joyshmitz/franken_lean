@@ -153,7 +153,19 @@ fn dependencies(info: &ConstantInfo) -> HashSet<Name> {
 /// Declarations inside a dependency cycle (mutual blocks, and the
 /// self-referential generated equation lemmas) are emitted last, in module
 /// order, and reported.
-fn topological_order(infos: &[ConstantInfo]) -> (Vec<usize>, Vec<usize>) {
+///
+/// References are expanded TRANSITIVELY THROUGH the type-forming frontier:
+/// checking a declaration that applies `Membership.rec` makes the kernel read
+/// the recursor's TYPE, which names `outParam` — a checkable definition the
+/// declaration never names directly. Likewise `Lean.mkNode`'s `TSyntax`
+/// (frontier) names `SyntaxNodeKinds` (checkable abbrev). Dropping those
+/// edges replays the dependent BEFORE the abbrev exists in the environment
+/// and manufactures spurious `TypeMismatch` rejections (the bead fln-d4x
+/// probe found `env outParam = ABSENT` at `Membership.casesOn`'s check).
+fn topological_order(
+    infos: &[ConstantInfo],
+    module: &HashMap<Name, ConstantInfo>,
+) -> (Vec<usize>, Vec<usize>) {
     let index: HashMap<Name, usize> = infos
         .iter()
         .enumerate()
@@ -163,11 +175,20 @@ fn topological_order(infos: &[ConstantInfo]) -> (Vec<usize>, Vec<usize>) {
         .iter()
         .enumerate()
         .map(|(i, info)| {
-            let mut d: Vec<usize> = dependencies(info)
-                .iter()
-                .filter_map(|n| index.get(n).copied())
-                .filter(|&j| j != i)
-                .collect();
+            let mut d: Vec<usize> = Vec::new();
+            let mut seen: HashSet<Name> = HashSet::new();
+            let mut stack: Vec<Name> = dependencies(info).into_iter().collect();
+            while let Some(name) = stack.pop() {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if let Some(&j) = index.get(&name) {
+                    d.push(j);
+                } else if let Some(frontier) = module.get(&name) {
+                    stack.extend(dependencies(frontier));
+                }
+            }
+            let mut d: Vec<usize> = d.into_iter().filter(|&j| j != i).collect();
             d.sort_unstable();
             d.dedup();
             d
@@ -307,7 +328,11 @@ fn prelude_replays_through_the_kernel() {
         .filter(|info| !is_frontier(info))
         .cloned()
         .collect();
-    let (order, cyclic) = topological_order(&checkable);
+    let module_by_name: HashMap<Name, ConstantInfo> = infos
+        .iter()
+        .map(|info| (info.name().clone(), info.clone()))
+        .collect();
+    let (order, cyclic) = topological_order(&checkable, &module_by_name);
     eprintln!(
         "kernel_replay order: {} frontier admitted-unchecked, {} checkable \
          ({} topologically sorted, {} in dependency cycles replayed last)",
@@ -368,6 +393,29 @@ fn prelude_replays_through_the_kernel() {
                         eprintln!("  type  = {}", shape(&info.constant_val().type_, 6));
                         if let ConstantInfo::Defn(defn) = &info {
                             eprintln!("  value = {}", shape(&defn.value, 8));
+                        }
+                        // Companion env dump: what does the CHECKING environment
+                        // actually hold for these names at this rejection?
+                        if let Ok(names) = std::env::var("FLN_REPLAY_PROBE_ENV") {
+                            for entry in names.split(',') {
+                                let mut target = Name::anonymous();
+                                for seg in entry.trim().split('.') {
+                                    target = Name::str(target, seg);
+                                }
+                                match env.find(&target) {
+                                    Some(ConstantInfo::Defn(d)) => eprintln!(
+                                        "  env {} = definition safety={:?} hints={:?} value={}",
+                                        entry.trim(),
+                                        d.safety,
+                                        d.hints,
+                                        shape(&d.value, 4)
+                                    ),
+                                    Some(other) => {
+                                        eprintln!("  env {} = {}", entry.trim(), other.kind_name())
+                                    }
+                                    None => eprintln!("  env {} = ABSENT", entry.trim()),
+                                }
+                            }
                         }
                     }
                 }
