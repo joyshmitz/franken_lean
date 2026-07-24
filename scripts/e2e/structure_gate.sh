@@ -61,6 +61,9 @@ FINALIZATION_SIGNAL_GENERATION=0
 FINALIZATION_DECISION="$ART_DIR/bundle.decision"
 FINAL_ROOT_FILE="$ART_DIR/final-root.txt"
 EVENT_COMMAND=()
+RUN_STARTED=0
+EARLY_STEP=preflight
+TEST_EARLY_FAULT="${FLN_SG_TEST_EARLY_FAULT:-}"
 INPUT_PATHS=(
   Cargo.toml Cargo.lock SUITE.lock rust-toolchain.toml ci crates tools
   vendor/NOTICE
@@ -102,6 +105,52 @@ emit_event() {
 }
 
 set_final() { FINAL_SET=1; FINAL_VERDICT="$1"; FINAL_REASON="$2"; FINAL_EXIT="$3"; }
+
+# Typed early-envelope faults (bead fln-evidence-runner-bootstrap-btk): any
+# failure between artifact-directory creation and the run_start emission still
+# finalizes a typed durable PARTIAL bundle — never a complete one.
+early_fault() {
+  local reason="$1" message="$2"
+  echo "[structure_gate] setup failure: $message" >&2
+  set_final internal_fault "$reason" 2
+  exit 2
+}
+
+# shellcheck disable=SC2317
+finalize_early_envelope() {
+  local observed_rc="$1"
+  trap '' HUP INT TERM
+  set +e
+  if [ "$FINAL_SET" -eq 0 ]; then
+    if [ "$observed_rc" -eq 0 ]; then
+      set_final internal_fault "early_${EARLY_STEP}_uncommitted_success" 2
+    else
+      set_final internal_fault "early_${EARLY_STEP}_unexpected_exit" 2
+    fi
+  fi
+  if [ -d "$ART_DIR" ]; then
+    note "typed early-envelope fault: step=$EARLY_STEP reason=$FINAL_REASON verdict=$FINAL_VERDICT"
+    if ! python3 "$EVIDENCE" publish-partial-bundle --art-dir "$ART_DIR" \
+        --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
+        --step "$EARLY_STEP" --reason "$FINAL_REASON" \
+        --classification "$FINAL_VERDICT" \
+        --argv-json '["scripts/e2e/structure_gate.sh"]' \
+        --cwd "$ROOT"; then
+      printf '[structure_gate] INTERNAL FAULT: early evidence bundle did not publish: %s\n' \
+        "$ART_DIR" >&2
+      exit 2
+    fi
+    if ! python3 "$EVIDENCE" validate-partial-bundle --art-dir "$ART_DIR" \
+        --artifact-root "$ART_DIR" >/dev/null; then
+      printf '[structure_gate] INTERNAL FAULT: early evidence bundle did not validate: %s\n' \
+        "$ART_DIR" >&2
+      exit 2
+    fi
+    printf '[structure_gate] %s — reason=%s; partial early-envelope evidence: %s\n' \
+      "$FINAL_VERDICT" "$FINAL_REASON" "$ART_DIR" >&2
+  fi
+  exit "$FINAL_EXIT"
+}
 
 mark_process_tree_cleanup_unproven() {
   PROCESS_TREE_CLEANUP_UNPROVEN=1
@@ -383,6 +432,10 @@ abort_if_finalizer_signalled() {
 on_exit() {
   local observed_rc="$1" final_root="unavailable" first_divergence="none"
   local publish_rc=0 hash_rc=0
+  if [ "$RUN_STARTED" -eq 0 ]; then
+    trap - EXIT
+    finalize_early_envelope "$observed_rc"
+  fi
   trap 'on_finalizer_signal HUP 129' HUP
   trap 'on_finalizer_signal INT 130' INT
   trap 'on_finalizer_signal TERM 143' TERM
@@ -473,25 +526,43 @@ if ! INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$ROOT" "${HASH_ARGS[@]}
   echo "[structure_gate] setup failure: cannot hash governed inputs" >&2
   exit 2
 fi
-mkdir -p "$(dirname "$ART_DIR")"
-if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
-  echo "[structure_gate] refusing reused evidence directory: $ART_DIR" >&2
-  exit 2
-fi
-mkdir "$ART_DIR"
-python3 "$EVIDENCE" vendor-binding --root "$ROOT" --vendor-path "$VENDOR_PATH" \
-  --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" || {
-    echo "[structure_gate] setup failure: cannot verify the pinned Reference tree" >&2
-    exit 2
-  }
-
-# From the first artifact write onward every exit is typed. In particular, the
-# human log is initialized only after run_start has committed successfully.
+# From artifact-directory creation onward every exit is typed: the envelope
+# runs under the terminal/finalizer state machine and any pre-run_start fault
+# still finalizes a typed durable partial bundle
+# (bead fln-evidence-runner-bootstrap-btk).
 trap 'on_signal HUP 129' HUP
 trap 'on_signal INT 130' INT
 trap 'on_signal TERM 143' TERM
 trap 'FINALIZER_TRANSITION=1 on_exit "$?"' EXIT
+EARLY_STEP=artifact_directory_creation
+mkdir -p "$(dirname "$ART_DIR")"
+if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
+  trap - EXIT
+  echo "[structure_gate] refusing reused evidence directory: $ART_DIR" >&2
+  exit 2
+fi
+mkdir "$ART_DIR"
+if [ "$TEST_EARLY_FAULT" = early_signal_hold ]; then
+  # Deterministic early-signal window for the deliberate fault scenarios.
+  : > "$ART_DIR/early.hold"
+  for _ in $(seq 1 3000); do
+    if [ -e "$ART_DIR/early.release" ]; then break; fi
+    sleep 0.01
+  done
+fi
+EARLY_STEP=vendor_binding
+if [ "$TEST_EARLY_FAULT" = vendor_binding ]; then
+  # A directory at the output path makes the real write path fail typed.
+  mkdir "$VENDOR_BINDING"
+fi
+python3 "$EVIDENCE" vendor-binding --root "$ROOT" --vendor-path "$VENDOR_PATH" \
+  --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" \
+  || early_fault early_vendor_binding_failure "cannot verify the pinned Reference tree"
 
+EARLY_STEP=run_start_emission
+if [ "$TEST_EARLY_FAULT" = run_start_emission ]; then
+  mkdir "$LOG"
+fi
 emit_event --new-log --string event run_start \
   --json-value argv '["scripts/e2e/structure_gate.sh"]' \
   --string cwd "$ROOT" \
@@ -511,9 +582,17 @@ emit_event --new-log --string event run_start \
   --string seed deterministic-fixture-v1 --string cache_state "${FLN_E2E_CACHE_STATE:-uncontrolled}" \
   --string input_root "$INPUT_ROOT" \
   --string vendor_binding vendor-binding.json \
-  --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS,\"readiness_wait_ms\":$READY_WAIT_MS}"
+  --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"step_timeout_ms\":$TIMEOUT_MS,\"kill_grace_ms\":$GRACE_MS,\"readiness_wait_ms\":$READY_WAIT_MS}" \
+  || early_fault early_run_start_emission_failure "cannot emit run_start"
 
-: > "$HUMAN"
+EARLY_STEP=human_log
+if [ "$TEST_EARLY_FAULT" = human_log ]; then
+  mkdir "$HUMAN"
+fi
+: > "$HUMAN" || early_fault early_human_log_failure "cannot create the human log"
+# From here the run log exists with its run_start, so the full finalizer owns
+# terminal publication; the early-envelope partial machinery stands down.
+RUN_STARTED=1
 
 read_meta_field() {
   python3 - "$1" "$2" <<'PY'

@@ -614,10 +614,14 @@ def open_regular_nofollow(path: Path) -> tuple[Path, int]:
     return absolute, descriptor
 
 
+_TEST_MUTATE_DURING_READ: Path | None = None
+
+
 def stable_file_facts(
     path: Path, *, max_bytes: int | None = None
 ) -> tuple[bytes, int, str]:
     """Read one immutable snapshot and reject concurrent mutation."""
+    global _TEST_MUTATE_DURING_READ
     absolute, descriptor = open_regular_nofollow(path)
     try:
         before = os.fstat(descriptor)
@@ -635,6 +639,18 @@ def stable_file_facts(
                 raise EvidenceError(f"file exceeds {max_bytes} bytes: {absolute}")
             digest.update(block)
             chunks.append(block)
+        if (
+            _TEST_MUTATE_DURING_READ is not None
+            and absolute == _TEST_MUTATE_DURING_READ
+        ):
+            # Planted REAL mutation for the mutation-during-initial-hashing
+            # scenario (bead fln-evidence-runner-bootstrap-btk): one byte is
+            # appended through an independent descriptor while this snapshot
+            # is still open, so the ordinary stability law below must fire on
+            # genuinely changed kernel metadata — nothing here is simulated.
+            _TEST_MUTATE_DURING_READ = None
+            with open(absolute, "ab") as mutator:
+                mutator.write(b"\n")
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
@@ -7549,6 +7565,219 @@ def adopt_bundle(
     return validate_bundle(art_dir, manifest_path, digest_path, commit_path)
 
 
+PARTIAL_BUNDLE_CLASSIFICATIONS = {"internal_fault", "inconclusive", "cancelled"}
+
+
+def publish_partial_bundle(
+    art_dir: Path,
+    *,
+    run_id: str,
+    bead: str,
+    scenario: str,
+    step: str,
+    reason: str,
+    classification: str,
+    argv: Sequence[str],
+    cwd: str,
+    restore_signal_state: bool = True,
+) -> dict[str, Any]:
+    """Publish the typed durable partial bundle for an early-envelope fault.
+
+    A consumer whose evidence envelope faulted between artifact-directory
+    creation and its run_start emission has no validatable run log, so bundle
+    completeness can never be claimed for it. The partial form carries its own
+    marker name (`bundle.incomplete.json`) and schemas, is refused typed by
+    complete-bundle validation and by adoption alike, and its classification
+    can never be pass. Publication still races cancellation on the shared
+    write-once `bundle.decision` linearization point.
+    """
+    art_dir = lexical_absolute(art_dir)
+    if classification not in PARTIAL_BUNDLE_CLASSIFICATIONS:
+        raise EvidenceError("partial bundle classification is unsupported")
+    for label, value in (
+        ("run_id", run_id),
+        ("bead", bead),
+        ("scenario", scenario),
+        ("step", step),
+        ("reason", reason),
+        ("cwd", cwd),
+    ):
+        if not isinstance(value, str) or not value:
+            raise EvidenceError(f"partial bundle {label} must be present")
+    rendered_argv, _had_redaction = redacted_argv(list(argv))
+    fault = {
+        "schema": "fln.check-setup-fault/1",
+        "run_id": run_id,
+        "bead": bead,
+        "scenario": scenario,
+        "step": step,
+        "reason_code": reason,
+        "classification": classification,
+        "argv": rendered_argv,
+        "cwd": cwd,
+        "monotonic_ns": time.monotonic_ns(),
+        "wall_time_utc": utc_now(),
+    }
+    fault_path = art_dir / "setup-fault.json"
+    write_new(fault_path, canonical_json(fault))
+    manifest_path = art_dir / "manifest-incomplete.json"
+    digest_path = art_dir / "manifest-incomplete.digest"
+    marker_path = art_dir / "bundle.incomplete.json"
+    decision_path = art_dir / "bundle.decision"
+    entries = artifact_inventory(
+        art_dir,
+        excluded={manifest_path, digest_path, decision_path, marker_path},
+    )
+    present = {entry["path"] for entry in entries}
+    if "setup-fault.json" not in present:
+        raise EvidenceError("partial manifest lost its setup fault record")
+    manifest = {
+        "schema": "fln.evidence-manifest-incomplete/1",
+        "run_id": run_id,
+        "bead": bead,
+        "scenario": scenario,
+        "step": step,
+        "reason_code": reason,
+        "classification": classification,
+        "created_utc": utc_now(),
+        "setup_fault_sha256": sha256_file(fault_path),
+        "artifacts": entries,
+    }
+    manifest_data = canonical_json(manifest)
+    write_new(manifest_path, manifest_data)
+    manifest_digest = hashlib.sha256(manifest_data).hexdigest()
+    write_new(
+        digest_path,
+        f"sha256:{manifest_digest}  {manifest_path.name}\n".encode(),
+    )
+    marker = {
+        "schema": "fln.evidence-bundle-incomplete-commit/1",
+        "status": "incomplete",
+        "run_id": run_id,
+        "bead": bead,
+        "scenario": scenario,
+        "step": step,
+        "reason_code": reason,
+        "classification": classification,
+        "created_utc": utc_now(),
+        "setup_fault": {
+            "path": fault_path.name,
+            "sha256": sha256_file(fault_path),
+        },
+        "manifest": {
+            "path": manifest_path.name,
+            "sha256": sha256_file(manifest_path),
+        },
+        "manifest_digest": {
+            "path": digest_path.name,
+            "sha256": sha256_file(digest_path),
+        },
+    }
+    write_signal_committed_atomic_new(
+        marker_path,
+        canonical_json(marker),
+        decision_path=decision_path,
+        restore_signal_state=restore_signal_state,
+    )
+    return marker
+
+
+def validate_partial_bundle(art_dir: Path) -> dict[str, Any]:
+    """Side-effect-free validation of a typed early-envelope partial bundle."""
+    art_dir = lexical_absolute(art_dir)
+    fault_path = art_dir / "setup-fault.json"
+    manifest_path = art_dir / "manifest-incomplete.json"
+    digest_path = art_dir / "manifest-incomplete.digest"
+    marker_path = art_dir / "bundle.incomplete.json"
+    decision_path = art_dir / "bundle.decision"
+    fault = read_json_object(fault_path)
+    if fault.get("schema") != "fln.check-setup-fault/1":
+        raise EvidenceError("wrong setup-fault schema")
+    identity_keys = (
+        "run_id",
+        "bead",
+        "scenario",
+        "step",
+        "reason_code",
+        "classification",
+    )
+    for key in identity_keys + ("argv", "cwd", "monotonic_ns", "wall_time_utc"):
+        if key not in fault:
+            raise EvidenceError(f"setup fault is missing {key}")
+    if fault["classification"] not in PARTIAL_BUNDLE_CLASSIFICATIONS:
+        raise EvidenceError(
+            "partial bundle classification can never claim completion"
+        )
+    manifest = read_json_object(manifest_path)
+    if manifest.get("schema") != "fln.evidence-manifest-incomplete/1":
+        raise EvidenceError("wrong incomplete-manifest schema")
+    for key in identity_keys:
+        if manifest.get(key) != fault[key]:
+            raise EvidenceError(
+                f"incomplete manifest {key} disagrees with the setup fault"
+            )
+    if manifest.get("setup_fault_sha256") != sha256_file(fault_path):
+        raise EvidenceError("incomplete manifest lost its setup-fault binding")
+    manifest_data, _manifest_size, _manifest_digest = stable_file_facts(
+        manifest_path
+    )
+    digest_data, _digest_size, _digest_digest = stable_file_facts(digest_path)
+    expected_digest_line = (
+        f"sha256:{hashlib.sha256(manifest_data).hexdigest()}"
+        f"  {manifest_path.name}\n"
+    ).encode()
+    if not hmac.compare_digest(digest_data, expected_digest_line):
+        raise EvidenceError("incomplete manifest digest does not match")
+    recomputed = artifact_inventory(
+        art_dir,
+        excluded={manifest_path, digest_path, decision_path, marker_path},
+    )
+    if recomputed != manifest.get("artifacts"):
+        raise EvidenceError(
+            "partial bundle artifacts changed after publication"
+        )
+    marker = read_json_object(marker_path)
+    if (
+        marker.get("schema") != "fln.evidence-bundle-incomplete-commit/1"
+        or marker.get("status") != "incomplete"
+    ):
+        raise EvidenceError("wrong incomplete-bundle marker schema")
+    for key in identity_keys:
+        if marker.get(key) != fault[key]:
+            raise EvidenceError(
+                f"incomplete marker {key} disagrees with the setup fault"
+            )
+    if (
+        marker.get("setup_fault")
+        != {"path": fault_path.name, "sha256": sha256_file(fault_path)}
+        or marker.get("manifest")
+        != {"path": manifest_path.name, "sha256": sha256_file(manifest_path)}
+        or marker.get("manifest_digest")
+        != {"path": digest_path.name, "sha256": sha256_file(digest_path)}
+    ):
+        raise EvidenceError("incomplete marker bindings do not match")
+    marker_data, _marker_size, _marker_bytes_digest = stable_file_facts(
+        marker_path
+    )
+    decision_data, _decision_size, _decision_digest = stable_file_facts(
+        decision_path
+    )
+    if not hmac.compare_digest(marker_data, decision_data):
+        raise EvidenceError(
+            "incomplete marker does not match its commit decision"
+        )
+    return {
+        "schema": "fln.partial-bundle-validation/1",
+        "valid": True,
+        "committed": False,
+        "run_id": fault["run_id"],
+        "step": fault["step"],
+        "reason_code": fault["reason_code"],
+        "classification": fault["classification"],
+        "marker_sha256": sha256_file(marker_path),
+    }
+
+
 def add_fields(record: dict[str, Any], args: argparse.Namespace) -> None:
     occupied = set(record)
     for values, kind in (
@@ -8039,6 +8268,11 @@ def cmd_validate_supervisor(args: argparse.Namespace) -> int:
 
 def cmd_hash_tree(args: argparse.Namespace) -> int:
     inventory_path = Path(args.inventory) if args.inventory else None
+    if args.test_mutate_input:
+        global _TEST_MUTATE_DURING_READ
+        _TEST_MUTATE_DURING_READ = lexical_absolute(
+            Path(args.root) / args.test_mutate_input
+        )
     root = tree_hash(
         Path(args.root),
         args.path,
@@ -8388,6 +8622,53 @@ def cmd_validate_bundle(args: argparse.Namespace) -> int:
             )
         require_within(
             Path(args.output), Path(args.artifact_root), label="bundle validation"
+        )
+        write_new(Path(args.output), canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_publish_partial_bundle(args: argparse.Namespace) -> int:
+    argv_value = parse_json(
+        args.argv_json.encode("utf-8"), subject="partial bundle argv"
+    )
+    if not isinstance(argv_value, list) or not all(
+        isinstance(item, str) for item in argv_value
+    ):
+        raise EvidenceError("partial bundle argv must be a JSON string array")
+    publish_partial_bundle(
+        Path(args.art_dir),
+        run_id=args.run_id,
+        bead=args.bead,
+        scenario=args.scenario,
+        step=args.step,
+        reason=args.reason,
+        classification=args.classification,
+        argv=argv_value,
+        cwd=args.cwd,
+        restore_signal_state=False,
+    )
+    return PASS
+
+
+def cmd_validate_partial_bundle(args: argparse.Namespace) -> int:
+    report = validate_partial_bundle(Path(args.art_dir))
+    if args.output:
+        output = lexical_absolute(Path(args.output))
+        art_dir = lexical_absolute(Path(args.art_dir))
+        try:
+            output.relative_to(art_dir)
+        except ValueError:
+            pass
+        else:
+            raise EvidenceError(
+                "partial validation output cannot mutate the published bundle"
+            )
+        require_within(
+            Path(args.output),
+            Path(args.artifact_root),
+            label="partial bundle validation",
         )
         write_new(Path(args.output), canonical_json(report))
     else:
@@ -12035,6 +12316,360 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     )
     cases.append({"case": "bundle_decision_cancellation", "ok": True})
 
+    # --- early-envelope partial bundles (bead fln-evidence-runner-bootstrap-btk):
+    # a consumer fault between artifact-directory creation and run_start still
+    # finalizes a typed durable partial bundle that can never claim, be
+    # validated as, or be adopted into completeness.
+    partial_root = case_dir("partial_bundle_publication")
+    write_new(partial_root / "human.log", b"[probe] early fault\n")
+    write_new(partial_root / "ubs-inventory.json", b"{}\n")
+    partial_marker_object = publish_partial_bundle(
+        partial_root,
+        run_id="partial-selftest-1",
+        bead="fln-8mj",
+        scenario="quality_gate",
+        step="vendor_binding",
+        reason="early_vendor_binding_failure",
+        classification="internal_fault",
+        argv=["scripts/check.sh", "--token=supersecret"],
+        cwd=str(partial_root),
+    )
+    require(
+        partial_marker_object["status"] == "incomplete",
+        "partial marker did not carry the incomplete status",
+    )
+    partial_fault_data, _partial_fault_size, _partial_fault_digest = (
+        stable_file_facts(partial_root / "setup-fault.json")
+    )
+    require(
+        b"supersecret" not in partial_fault_data
+        and b"<redacted>" in partial_fault_data,
+        "partial setup fault leaked a secret argv value",
+    )
+    partial_report = validate_partial_bundle(partial_root)
+    require(
+        partial_report["valid"] is True
+        and partial_report["committed"] is False
+        and partial_report["classification"] == "internal_fault",
+        "partial bundle validation lost its typed shape",
+    )
+    try:
+        publish_partial_bundle(
+            partial_root,
+            run_id="partial-selftest-1",
+            bead="fln-8mj",
+            scenario="quality_gate",
+            step="vendor_binding",
+            reason="early_vendor_binding_failure",
+            classification="internal_fault",
+            argv=["scripts/check.sh"],
+            cwd=str(partial_root),
+        )
+    except FileExistsError:
+        pass
+    else:
+        raise EvidenceError("partial bundle publication was not write-once")
+    try:
+        adopt_bundle(
+            partial_root,
+            partial_root / "manifest.json",
+            partial_root / "manifest.digest",
+            partial_root / "bundle.complete.json",
+        )
+    except (EvidenceError, FileNotFoundError):
+        pass
+    else:
+        raise EvidenceError("a partial decision was adopted as complete")
+    require(
+        not (partial_root / "bundle.complete.json").exists(),
+        "refused partial adoption still created the complete marker",
+    )
+    try:
+        validate_bundle(
+            partial_root,
+            partial_root / "manifest.json",
+            partial_root / "manifest.digest",
+            partial_root / "bundle.complete.json",
+        )
+    except (EvidenceError, FileNotFoundError):
+        pass
+    else:
+        raise EvidenceError("a partial bundle validated as complete")
+    write_new(partial_root / "late-artifact.txt", b"late\n")
+    try:
+        validate_partial_bundle(partial_root)
+    except EvidenceError as error:
+        require(
+            "changed after publication" in str(error),
+            "post-publication drift produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("post-publication drift was not detected")
+    cases.append(
+        {
+            "case": "partial_bundle_publication",
+            "ok": True,
+            "artifact": str(partial_root),
+        }
+    )
+
+    partial_cancel_root = case_dir("partial_bundle_cancellation")
+    write_new(partial_cancel_root / "bundle.decision", b"")
+    try:
+        publish_partial_bundle(
+            partial_cancel_root,
+            run_id="partial-selftest-2",
+            bead="fln-8mj",
+            scenario="quality_gate",
+            step="initial_hash",
+            reason="early_initial_hash_failure",
+            classification="internal_fault",
+            argv=["scripts/check.sh"],
+            cwd=str(partial_cancel_root),
+        )
+    except EvidenceError as error:
+        require(
+            "cancellation won the bundle decision race" in str(error),
+            "partial cancellation race produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("partial publication ignored a claimed decision")
+    require(
+        not (partial_cancel_root / "bundle.incomplete.json").exists(),
+        "cancelled partial publication still linked its marker",
+    )
+    cases.append({"case": "partial_bundle_cancellation", "ok": True})
+
+    hash_mutation_root = case_dir("initial_hash_mutation")
+    write_new(hash_mutation_root / "governed-a.txt", b"alpha\n")
+    write_new(hash_mutation_root / "governed-b.txt", b"beta\n")
+    hash_control = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "hash-tree",
+            "--root",
+            str(hash_mutation_root),
+            "--path",
+            "governed-a.txt",
+            "--path",
+            "governed-b.txt",
+        ],
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    require(
+        hash_control.returncode == 0,
+        f"control hash failed: {hash_control.stderr[-200:]!r}",
+    )
+    mutation_size_before = (hash_mutation_root / "governed-a.txt").stat().st_size
+    hash_mutated = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "hash-tree",
+            "--root",
+            str(hash_mutation_root),
+            "--path",
+            "governed-a.txt",
+            "--path",
+            "governed-b.txt",
+            "--test-mutate-input",
+            "governed-a.txt",
+        ],
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    require(
+        hash_mutated.returncode != 0
+        and b"changed while being read" in hash_mutated.stderr,
+        f"planted hash mutation was not detected: {hash_mutated.stderr[-200:]!r}",
+    )
+    require(
+        (hash_mutation_root / "governed-a.txt").stat().st_size
+        == mutation_size_before + 1,
+        "planted hash mutation did not really mutate the input",
+    )
+    cases.append({"case": "initial_hash_mutation", "ok": True})
+
+    # --- deliberate early-envelope fault probes against the real consumer
+    # (bead fln-evidence-runner-bootstrap-btk): every early step of check.sh
+    # from artifact-directory creation through run_start faults against a
+    # planted-real obstruction and still finalizes a typed durable partial
+    # bundle; an early signal cancels into the same partial form; a reused
+    # artifact directory is refused without touching foreign state.
+    def run_early_fault_probe(
+        test_step: str,
+        expected_exit: int,
+        expected_classification: str,
+        expected_step: str,
+        expected_reason: str,
+        *,
+        signal_number: int | None = None,
+    ) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        check_script = repo / "scripts" / "check.sh"
+        probe_root = art_dir / f"early_fault_{test_step}"
+        require(
+            not probe_root.exists() and not probe_root.is_symlink(),
+            f"early fault probe root already exists: {test_step}",
+        )
+        probe_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("FLN_CHECK_")
+            and not key.startswith("FLN_FINALIZER_")
+        }
+        probe_environment.update(
+            {
+                "FLN_CHECK_ART_DIR": str(probe_root),
+                "FLN_CHECK_TEST_EARLY_FAULT": test_step,
+            }
+        )
+        child = subprocess.Popen(
+            ["bash", str(check_script), "--early-fault-probe"],
+            cwd=repo,
+            env=probe_environment,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            if signal_number is not None:
+                hold_path = probe_root / "early.hold"
+                hold_deadline = time.monotonic() + 30
+                while (
+                    not hold_path.exists()
+                    and child.poll() is None
+                    and time.monotonic() < hold_deadline
+                ):
+                    time.sleep(0.01)
+                require(
+                    hold_path.exists(),
+                    f"{test_step}: early hold point was never reached",
+                )
+                child.send_signal(signal_number)
+            _early_out, early_err = child.communicate(timeout=120)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate(timeout=10)
+        require(
+            child.returncode == expected_exit,
+            f"{test_step}: early probe exit {child.returncode}: "
+            f"{early_err[-300:]!r}",
+        )
+        require(
+            b"partial early-envelope evidence" in early_err,
+            f"{test_step}: partial publication was not reported",
+        )
+        early_report = validate_partial_bundle(probe_root)
+        require(
+            early_report["valid"] is True
+            and early_report["committed"] is False
+            and early_report["classification"] == expected_classification
+            and early_report["step"] == expected_step
+            and early_report["reason_code"] == expected_reason,
+            f"{test_step}: partial bundle lost its typed shape: {early_report}",
+        )
+        require(
+            not (probe_root / "bundle.complete.json").exists(),
+            f"{test_step}: an early fault produced a complete bundle marker",
+        )
+        cases.append(
+            {
+                "case": f"early_fault_{test_step}",
+                "ok": True,
+                "artifact": str(probe_root),
+            }
+        )
+
+    run_early_fault_probe(
+        "probe_control",
+        SETUP_FAILURE,
+        "internal_fault",
+        "probe_control",
+        "early_probe_control_failure",
+    )
+    run_early_fault_probe(
+        "ubs_inventory",
+        SETUP_FAILURE,
+        "internal_fault",
+        "ubs_inventory",
+        "early_ubs_inventory_failure",
+    )
+    run_early_fault_probe(
+        "vendor_binding",
+        SETUP_FAILURE,
+        "internal_fault",
+        "vendor_binding",
+        "early_vendor_binding_failure",
+    )
+    run_early_fault_probe(
+        "initial_hash",
+        INCONCLUSIVE,
+        "inconclusive",
+        "initial_hash",
+        "governed_input_mutation_during_initial_hash",
+    )
+    run_early_fault_probe(
+        "run_start_emission",
+        SETUP_FAILURE,
+        "internal_fault",
+        "run_start_emission",
+        "early_run_start_emission_failure",
+    )
+    run_early_fault_probe(
+        "human_log",
+        SETUP_FAILURE,
+        "internal_fault",
+        "human_log",
+        "early_human_log_failure",
+    )
+    run_early_fault_probe(
+        "early_signal_hold",
+        143,
+        "cancelled",
+        "artifact_directory_creation",
+        "signal_TERM",
+        signal_number=signal.SIGTERM,
+    )
+
+    reused_root = case_dir("early_fault_reused_directory")
+    write_new(reused_root / "canary.txt", b"canary\n")
+    reused_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("FLN_CHECK_")
+        and not key.startswith("FLN_FINALIZER_")
+    }
+    reused_environment["FLN_CHECK_ART_DIR"] = str(reused_root)
+    reused_probe = subprocess.run(
+        [
+            "bash",
+            str(Path(__file__).resolve().parent.parent / "scripts" / "check.sh"),
+            "--early-fault-probe",
+        ],
+        cwd=Path(__file__).resolve().parent.parent,
+        env=reused_environment,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    require(
+        reused_probe.returncode == SETUP_FAILURE
+        and b"refusing reused evidence directory" in reused_probe.stderr,
+        f"reused-directory refusal lost its type: {reused_probe.stderr[-200:]!r}",
+    )
+    require(
+        sorted(path.name for path in reused_root.iterdir()) == ["canary.txt"],
+        "reused-directory refusal touched foreign state",
+    )
+    cases.append({"case": "early_fault_reused_directory", "ok": True})
+
     race_root = case_dir("write_collision_race")
     race_path = race_root / "collision-race.txt"
     race_results: list[str] = []
@@ -12462,6 +13097,7 @@ def build_parser() -> argparse.ArgumentParser:
     hash_parser.add_argument("--vendor-path")
     hash_parser.add_argument("--output")
     hash_parser.add_argument("--artifact-root")
+    hash_parser.add_argument("--test-mutate-input")
     hash_parser.set_defaults(func=cmd_hash_tree)
 
     vendor_parser = subparsers.add_parser(
@@ -12655,6 +13291,34 @@ def build_parser() -> argparse.ArgumentParser:
     bundle_validation.add_argument("--artifact-root", required=True)
     bundle_validation.add_argument("--output")
     bundle_validation.set_defaults(func=cmd_validate_bundle)
+
+    partial_publication = subparsers.add_parser(
+        "publish-partial-bundle",
+        help="publish the typed durable partial bundle for an early fault",
+    )
+    partial_publication.add_argument("--art-dir", required=True)
+    partial_publication.add_argument("--run-id", required=True)
+    partial_publication.add_argument("--bead", required=True)
+    partial_publication.add_argument("--scenario", required=True)
+    partial_publication.add_argument("--step", required=True)
+    partial_publication.add_argument("--reason", required=True)
+    partial_publication.add_argument(
+        "--classification",
+        required=True,
+        choices=sorted(PARTIAL_BUNDLE_CLASSIFICATIONS),
+    )
+    partial_publication.add_argument("--argv-json", required=True)
+    partial_publication.add_argument("--cwd", required=True)
+    partial_publication.set_defaults(func=cmd_publish_partial_bundle)
+
+    partial_validation = subparsers.add_parser(
+        "validate-partial-bundle",
+        help="verify a published early-fault partial bundle (read-only)",
+    )
+    partial_validation.add_argument("--art-dir", required=True)
+    partial_validation.add_argument("--artifact-root", required=True)
+    partial_validation.add_argument("--output")
+    partial_validation.set_defaults(func=cmd_validate_partial_bundle)
 
     bundle_adoption = subparsers.add_parser(
         "adopt-bundle",

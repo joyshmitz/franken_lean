@@ -14,6 +14,7 @@
 set -Eeuo pipefail
 
 FINALIZER_PROBE=0
+EARLY_FAULT_PROBE=0
 case "${1:-}" in
   --help|-h)
     sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -21,6 +22,7 @@ case "${1:-}" in
     ;;
   --self-test|"") ;;
   --finalizer-probe) FINALIZER_PROBE=1 ;;
+  --early-fault-probe) FINALIZER_PROBE=1; EARLY_FAULT_PROBE=1 ;;
   *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
 esac
 
@@ -55,7 +57,10 @@ KILL_GRACE_MS="${FLN_CHECK_KILL_GRACE_MS:-2000}"
 READY_WAIT_MS="${FLN_CHECK_READY_WAIT_MS:-30000}"
 PLANT="${FLN_CHECK_PLANT:-}"
 FINALIZER_TEST_POINT="${FLN_FINALIZER_TEST_POINT:-}"
-if [ "$FINALIZER_PROBE" -eq 1 ]; then
+TEST_EARLY_FAULT="${FLN_CHECK_TEST_EARLY_FAULT:-}"
+if [ "$EARLY_FAULT_PROBE" -eq 1 ]; then
+  PROFILE=early-fault-self-test
+elif [ "$FINALIZER_PROBE" -eq 1 ]; then
   case "$FINALIZER_TEST_POINT" in
     spawn_bind|active_wait|helper_failure|decision_write|marker_link|post_decision) ;;
     *) echo "invalid finalizer probe point: $FINALIZER_TEST_POINT" >&2; exit 2 ;;
@@ -92,6 +97,8 @@ FINAL_REASON="uncommitted_exit"
 FINAL_EXIT=2
 TERMINAL_EMITTED=0
 FINALIZING=0
+RUN_STARTED=0
+EARLY_STEP=preflight
 FINALIZER_TRANSITION=0
 FINALIZER_PID=""
 FINALIZER_START_TICKS=""
@@ -145,63 +152,6 @@ HASH_CONTEXT_ARGS=(--inventory "$UBS_INVENTORY" --vendor-path "$VENDOR_PATH")
 BUNDLE_CONTEXT_ARGS=(--inventory "$UBS_INVENTORY" --vendor-path "$VENDOR_PATH")
 UBS_INVENTORY_BINDING=ubs-inventory.json
 VENDOR_BINDING_BINDING=vendor-binding.json
-mkdir -p "$(dirname "$ART_DIR")"
-if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
-  echo "[check] setup failure: refusing reused evidence directory: $ART_DIR" >&2
-  exit 2
-fi
-mkdir "$ART_DIR"
-if [ "$FINALIZER_PROBE" -eq 1 ]; then
-  if [ -e "$FINALIZER_TEST_CONTROL" ] || [ -L "$FINALIZER_TEST_CONTROL" ]; then
-    echo "[check] setup failure: refusing reused probe control directory" >&2
-    exit 2
-  fi
-  mkdir "$FINALIZER_TEST_CONTROL"
-  printf 'finalizer-probe\n' > "$ART_DIR/probe-input"
-  GOVERNED_ROOT="$ART_DIR"
-  HASH_ARGS=(--path probe-input)
-  GOVERNED_ARGS=(--governed-path probe-input)
-  HASH_CONTEXT_ARGS=()
-  BUNDLE_CONTEXT_ARGS=()
-  UBS_INVENTORY_BINDING=not_applicable_finalizer_self_test
-  VENDOR_BINDING_BINDING=not_applicable_finalizer_self_test
-else
-  python3 "$EVIDENCE" ubs-inventory --root "$REPO" --scope "$UBS_SCOPE" \
-    --output "$UBS_INVENTORY" --artifact-root "$ART_DIR" || {
-      echo "[check] setup failure: cannot inventory UBS inputs" >&2
-      exit 2
-    }
-  python3 "$EVIDENCE" vendor-binding --root "$REPO" --vendor-path "$VENDOR_PATH" \
-    --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" || {
-      echo "[check] setup failure: cannot verify the pinned Reference tree" >&2
-      exit 2
-    }
-fi
-INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$GOVERNED_ROOT" \
-  "${HASH_ARGS[@]}" "${HASH_CONTEXT_ARGS[@]}")" || {
-  echo "[check] setup failure: cannot hash governed inputs" >&2
-  exit 2
-}
-HOST_FACTS_JSON="$(python3 - <<'PY'
-import json, platform
-print(json.dumps({
-    "machine": platform.machine(),
-    "python": platform.python_version(),
-    "release": platform.release(),
-    "system": platform.system(),
-}, sort_keys=True, separators=(",", ":")))
-PY
-)"
-
-RUN_ARGV_JSON="$(python3 - "${BASH_SOURCE[0]}" "${1:-}" <<'PY'
-import json, sys
-argv = [sys.argv[1]]
-if sys.argv[2]:
-    argv.append(sys.argv[2])
-print(json.dumps(argv, separators=(",", ":")))
-PY
-)"
-
 build_event_command() {
   local sequence="$SEQ"
   SEQ=$((SEQ + 1))
@@ -236,6 +186,52 @@ mark_process_tree_cleanup_unproven() {
   PROCESS_TREE_CLEANUP_UNPROVEN=1
   trap '' HUP INT TERM
   set_final internal_fault process_tree_cleanup_unproven 2
+}
+
+# Typed early-envelope faults (bead fln-evidence-runner-bootstrap-btk): any
+# failure between artifact-directory creation and the run_start emission still
+# finalizes a typed durable PARTIAL bundle — never a complete one.
+early_fault() {
+  local reason="$1" message="$2"
+  echo "[check] setup failure: $message" >&2
+  set_final internal_fault "$reason" 2
+  exit 2
+}
+
+# shellcheck disable=SC2317
+finalize_early_envelope() {
+  local observed_rc="$1"
+  trap '' HUP INT TERM
+  set +e
+  if [ "$FINAL_SET" -eq 0 ]; then
+    if [ "$observed_rc" -eq 0 ]; then
+      set_final internal_fault "early_${EARLY_STEP}_uncommitted_success" 2
+    else
+      set_final internal_fault "early_${EARLY_STEP}_unexpected_exit" 2
+    fi
+  fi
+  if [ -d "$ART_DIR" ]; then
+    note "typed early-envelope fault: step=$EARLY_STEP reason=$FINAL_REASON verdict=$FINAL_VERDICT"
+    if ! python3 "$EVIDENCE" publish-partial-bundle --art-dir "$ART_DIR" \
+        --run-id "$RUN_ID" --bead "$BEAD" --scenario "$SCENARIO" \
+        --step "$EARLY_STEP" --reason "$FINAL_REASON" \
+        --classification "$FINAL_VERDICT" \
+        --argv-json "${RUN_ARGV_JSON:-[\"scripts/check.sh\"]}" \
+        --cwd "$REPO"; then
+      printf '[check] INTERNAL FAULT: early evidence bundle did not publish: %s\n' \
+        "$ART_DIR" >&2
+      exit 2
+    fi
+    if ! python3 "$EVIDENCE" validate-partial-bundle --art-dir "$ART_DIR" \
+        --artifact-root "$ART_DIR" >/dev/null; then
+      printf '[check] INTERNAL FAULT: early evidence bundle did not validate: %s\n' \
+        "$ART_DIR" >&2
+      exit 2
+    fi
+    printf '[check] %s — reason=%s; partial early-envelope evidence: %s\n' \
+      "$FINAL_VERDICT" "$FINAL_REASON" "$ART_DIR" >&2
+  fi
+  exit "$FINAL_EXIT"
 }
 
 # shellcheck disable=SC2317
@@ -613,6 +609,10 @@ abort_if_finalizer_signalled() {
 on_exit() {
   local observed_rc="$1" final_root="unavailable" publish_rc=0 hash_rc=0
   local -a MARKER_PAUSE_ARGS=()
+  if [ "$RUN_STARTED" -eq 0 ]; then
+    trap - EXIT
+    finalize_early_envelope "$observed_rc"
+  fi
   trap 'on_finalizer_signal HUP 129' HUP
   trap 'on_finalizer_signal INT 130' INT
   trap 'on_finalizer_signal TERM 143' TERM
@@ -730,6 +730,128 @@ trap 'on_signal INT 130' INT
 trap 'on_signal TERM 143' TERM
 trap 'FINALIZER_TRANSITION=1 on_exit "$?"' EXIT
 
+# The evidence envelope starts at fresh artifact-directory acceptance: from
+# here every step runs under the terminal/finalizer state machine and any
+# fault still finalizes a typed durable partial bundle
+# (bead fln-evidence-runner-bootstrap-btk).
+EARLY_STEP=artifact_directory_creation
+mkdir -p "$(dirname "$ART_DIR")"
+if [ -e "$ART_DIR" ] || [ -L "$ART_DIR" ]; then
+  # A reused path is refused before any envelope exists; nothing we own is
+  # available to bundle into, and the foreign directory is never touched.
+  trap - EXIT
+  echo "[check] setup failure: refusing reused evidence directory: $ART_DIR" >&2
+  exit 2
+fi
+mkdir "$ART_DIR"
+if [ "$EARLY_FAULT_PROBE" -eq 1 ] && [ "$TEST_EARLY_FAULT" = early_signal_hold ]; then
+  # Deterministic early-signal window: the probe binds on the hold file and
+  # delivers its signal while the envelope is still pre-run_start.
+  : > "$ART_DIR/early.hold"
+  for _ in $(seq 1 3000); do
+    if [ -e "$ART_DIR/early.release" ]; then break; fi
+    sleep 0.01
+  done
+fi
+if [ "$FINALIZER_PROBE" -eq 1 ]; then
+  EARLY_STEP=probe_control
+  if [ "$EARLY_FAULT_PROBE" -eq 1 ] && [ "$TEST_EARLY_FAULT" = probe_control ]; then
+    # A colliding regular file makes the real control mkdir below fail.
+    : > "$FINALIZER_TEST_CONTROL"
+  fi
+  if [ -e "$FINALIZER_TEST_CONTROL" ] && [ ! -d "$FINALIZER_TEST_CONTROL" ]; then
+    early_fault early_probe_control_failure "probe control path is not usable"
+  fi
+  if [ -d "$FINALIZER_TEST_CONTROL" ] || [ -L "$FINALIZER_TEST_CONTROL" ]; then
+    early_fault early_probe_control_failure "refusing reused probe control directory"
+  fi
+  mkdir "$FINALIZER_TEST_CONTROL" \
+    || early_fault early_probe_control_failure "cannot create probe control directory"
+  printf 'finalizer-probe\n' > "$ART_DIR/probe-input"
+  GOVERNED_ROOT="$ART_DIR"
+  HASH_ARGS=(--path probe-input)
+  GOVERNED_ARGS=(--governed-path probe-input)
+  HASH_CONTEXT_ARGS=()
+  BUNDLE_CONTEXT_ARGS=()
+  UBS_INVENTORY_BINDING=not_applicable_finalizer_self_test
+  VENDOR_BINDING_BINDING=not_applicable_finalizer_self_test
+  if [ "$EARLY_FAULT_PROBE" -eq 1 ]; then
+    # Deliberate early faults run the REAL commands against planted-real
+    # obstructions (an output path occupied by a directory), so the failure
+    # surface is the genuine write path, never a mock.
+    case "$TEST_EARLY_FAULT" in
+      ubs_inventory)
+        EARLY_STEP=ubs_inventory
+        mkdir "$UBS_INVENTORY"
+        python3 "$EVIDENCE" ubs-inventory --root "$ART_DIR" --scope all-tracked \
+          --output "$UBS_INVENTORY" --artifact-root "$ART_DIR" \
+          || early_fault early_ubs_inventory_failure "cannot inventory UBS inputs"
+        early_fault early_ubs_inventory_failure "planted inventory collision did not fail"
+        ;;
+      vendor_binding)
+        EARLY_STEP=vendor_binding
+        mkdir "$VENDOR_BINDING"
+        python3 "$EVIDENCE" vendor-binding --root "$ART_DIR" --vendor-path "$VENDOR_PATH" \
+          --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" \
+          || early_fault early_vendor_binding_failure "cannot verify the pinned Reference tree"
+        early_fault early_vendor_binding_failure "planted vendor collision did not fail"
+        ;;
+    esac
+  fi
+else
+  EARLY_STEP=ubs_inventory
+  python3 "$EVIDENCE" ubs-inventory --root "$REPO" --scope "$UBS_SCOPE" \
+    --output "$UBS_INVENTORY" --artifact-root "$ART_DIR" \
+    || early_fault early_ubs_inventory_failure "cannot inventory UBS inputs"
+  EARLY_STEP=vendor_binding
+  python3 "$EVIDENCE" vendor-binding --root "$REPO" --vendor-path "$VENDOR_PATH" \
+    --output "$VENDOR_BINDING" --artifact-root "$ART_DIR" \
+    || early_fault early_vendor_binding_failure "cannot verify the pinned Reference tree"
+fi
+EARLY_STEP=initial_hash
+EARLY_HASH_ARGS=()
+if [ "$EARLY_FAULT_PROBE" -eq 1 ] && [ "$TEST_EARLY_FAULT" = initial_hash ]; then
+  # The planted mutation appends one byte to the probe's own governed input
+  # while its snapshot is open — the ordinary stability law must fire.
+  EARLY_HASH_ARGS=(--test-mutate-input probe-input)
+fi
+INPUT_ROOT="$(python3 "$EVIDENCE" hash-tree --root "$GOVERNED_ROOT" \
+  "${HASH_ARGS[@]}" "${HASH_CONTEXT_ARGS[@]}" "${EARLY_HASH_ARGS[@]}" \
+  2>"$ART_DIR/initial-hash.err")" || {
+  cat "$ART_DIR/initial-hash.err" >&2 || true
+  if grep -q "changed while being read" "$ART_DIR/initial-hash.err" 2>/dev/null; then
+    set_final inconclusive governed_input_mutation_during_initial_hash 3
+    exit 3
+  fi
+  early_fault early_initial_hash_failure "cannot hash governed inputs"
+}
+EARLY_STEP=host_facts
+HOST_FACTS_JSON="$(python3 - <<'PY'
+import json, platform
+print(json.dumps({
+    "machine": platform.machine(),
+    "python": platform.python_version(),
+    "release": platform.release(),
+    "system": platform.system(),
+}, sort_keys=True, separators=(",", ":")))
+PY
+)" || early_fault early_host_facts_failure "cannot capture host facts"
+
+EARLY_STEP=run_argv
+RUN_ARGV_JSON="$(python3 - "${BASH_SOURCE[0]}" "${1:-}" <<'PY'
+import json, sys
+argv = [sys.argv[1]]
+if sys.argv[2]:
+    argv.append(sys.argv[2])
+print(json.dumps(argv, separators=(",", ":")))
+PY
+)" || early_fault early_run_argv_failure "cannot capture the run argv"
+
+EARLY_STEP=run_start_emission
+if [ "$EARLY_FAULT_PROBE" -eq 1 ] && [ "$TEST_EARLY_FAULT" = run_start_emission ]; then
+  # A directory at the log path makes the real append open fail typed.
+  mkdir "$NDJSON"
+fi
 emit_event \
   --new-log \
   --string event run_start \
@@ -757,8 +879,16 @@ emit_event \
   --string vendor_binding "$VENDOR_BINDING_BINDING" \
   --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"stage_timeout_ms\":$STAGE_TIMEOUT_MS,\"kill_grace_ms\":$KILL_GRACE_MS}" \
   --string rustc "$(rustc --version 2>/dev/null || printf unknown)" \
-  --string planted "$PLANT"
-: > "$HUMAN"
+  --string planted "$PLANT" \
+  || early_fault early_run_start_emission_failure "cannot emit run_start"
+EARLY_STEP=human_log
+if [ "$EARLY_FAULT_PROBE" -eq 1 ] && [ "$TEST_EARLY_FAULT" = human_log ]; then
+  mkdir "$HUMAN"
+fi
+: > "$HUMAN" || early_fault early_human_log_failure "cannot create the human log"
+# From here the run log exists with its run_start, so the full finalizer owns
+# terminal publication; the early-envelope partial machinery stands down.
+RUN_STARTED=1
 
 if [ "$FINALIZER_PROBE" -eq 1 ]; then
   ACTIVE_STAGE=finalizer-probe
