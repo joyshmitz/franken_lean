@@ -34,7 +34,7 @@ import threading
 import time
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 PASS = 0
@@ -44,6 +44,52 @@ INCONCLUSIVE = 3
 CANCELLED = 4
 
 RUN_SCHEMAS = {"fln.check/2", "fln.e2e/2"}
+
+# --- Sealed compiler environment (bead fln-evidence-runner-bootstrap-btk) ----
+# Ambient channels that can alter what the pinned compiler does (cap-lints
+# injection, wrapper substitution, alternate-toolchain selection, rustflags in
+# every spelling). Presence of ANY of these when the sealed-cargo lane is
+# requested is a typed setup fault — rejected before any repo-controlled
+# compilation, never silently scrubbed.
+HOSTILE_COMPILER_ENV_EXACT = frozenset(
+    {
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_BUILD_RUSTC",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTDOC",
+        "CARGO_BUILD_TARGET",
+        "RUSTC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTDOC",
+        "RUSTDOCFLAGS",
+        "RUSTUP_TOOLCHAIN",
+        "CARGO",
+    }
+)
+HOSTILE_COMPILER_ENV_PREFIXES = (
+    "CARGO_TARGET_",  # CARGO_TARGET_<TRIPLE>_RUSTFLAGS / _LINKER / _RUNNER …
+    "CARGO_ALIAS_",
+    "CARGO_UNSTABLE_",
+    "CARGO_REGISTRIES_",
+    "CARGO_PROFILE_",
+)
+# Scrubbed-and-overridden by the lane itself, never treated as hostile.
+SEALED_ENV_OVERRIDDEN = frozenset({"CARGO_HOME", "CARGO_TARGET_DIR"})
+# Ambient variables admitted into the sealed child environment as-is. PATH is
+# REBUILT (pinned toolchain bin first), never inherited.
+SEALED_ENV_ALLOWLIST = frozenset(
+    {"HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ", "TMPDIR"}
+)
+SEALED_PATH_TAIL = "/usr/local/bin:/usr/bin:/bin"
+SEALED_HOST_TRIPLES = {
+    "x86_64": "x86_64-unknown-linux-gnu",
+    "aarch64": "aarch64-unknown-linux-gnu",
+}
+SEALED_RUSTC_PROBE_TIMEOUT_S = 30
 CHECK_STAGE_ORDER = [
     "evidence-self-test",
     "shellcheck",
@@ -437,6 +483,19 @@ class SetupTimeoutError(EvidenceError):
 
 class SetupCancelledError(EvidenceError):
     """Cancellation won before the target was released to execute."""
+
+
+class SealedCompilerRejection(EvidenceError):
+    """The sealed-cargo lane refused to run: hostile or unverifiable ambient
+    compiler environment. Carries the typed reason token for the terminal
+    envelope and the partial sealing facts gathered before rejection."""
+
+    def __init__(
+        self, reason_token: str, detail: str, facts: dict[str, Any] | None = None
+    ) -> None:
+        super().__init__(detail)
+        self.reason_token = reason_token
+        self.facts = facts
 
 
 def utc_now() -> str:
@@ -987,6 +1046,7 @@ def spawn_stopped_exec(
     target_signal_mask: set[signal.Signals],
     test_before_stop_delay_ms: int = 0,
     test_gate_mode: str = "normal",
+    env: dict[str, str] | None = None,
 ) -> tuple[StoppedExecProcess, int, int, int]:
     """Fork an inert future target with no intervening interpreter or user exec."""
     try:
@@ -1083,10 +1143,13 @@ def spawn_stopped_exec(
                     break
                 release.extend(block)
             os.close(gate_release_read)
-            if bytes(release) != STOPPED_GATE_RELEASE_TOKEN:
+            if not hmac.compare_digest(bytes(release), STOPPED_GATE_RELEASE_TOKEN):
                 raise EvidenceError("private stopped-target release token mismatch")
             signal.pthread_sigmask(signal.SIG_SETMASK, target_signal_mask)
-            os.execvp(argv[0], list(argv))
+            if env is not None:
+                os.execvpe(argv[0], list(argv), env)
+            else:
+                os.execvp(argv[0], list(argv))
             raise EvidenceError("stopped target exec unexpectedly returned")
         except BaseException as error:
             try:
@@ -1441,7 +1504,9 @@ def admit_stopped_session_leader_until(
                 gate_ready.extend(block)
                 if len(gate_ready) > len(STOPPED_GATE_READY_TOKEN):
                     raise EvidenceError("private gate readiness token exceeded bound")
-            if gate_ready_eof and bytes(gate_ready) != STOPPED_GATE_READY_TOKEN:
+            if gate_ready_eof and not hmac.compare_digest(
+                bytes(gate_ready), STOPPED_GATE_READY_TOKEN
+            ):
                 raise EvidenceError("private gate readiness token mismatch")
             facts = proc_stat_facts(pid)
             if (
@@ -1679,9 +1744,16 @@ def _run_supervised_impl(
     test_before_release_delay_ms: int = 0,
     test_gate_mode: str = "normal",
     test_fault_point: str = "none",
+    sealed_cargo: bool = False,
+    suite_lock_path: Path | None = None,
+    sealed_build_root: Path | None = None,
 ) -> int:
     if not argv:
         raise EvidenceError("supervisor requires a non-empty argv")
+    if sealed_cargo and (suite_lock_path is None or sealed_build_root is None):
+        raise EvidenceError(
+            "sealed-cargo supervision requires --suite-lock and --sealed-build-root"
+        )
     for label, value in (
         ("capture-bytes", capture_bytes),
         ("output-budget-bytes", output_budget_bytes),
@@ -1783,6 +1855,9 @@ def _run_supervised_impl(
     exec_status_complete = False
     exec_success_observed_live = False
     target_exec_failure: dict[str, Any] | None = None
+    sealed_rejection: str | None = None
+    sealed_compiler_facts: dict[str, Any] | None = None
+    child_env: dict[str, str] | None = None
     child_exit: int | None = None
     child_signal: str | None = None
     readiness_ns: int | None = None
@@ -1972,6 +2047,21 @@ def _run_supervised_impl(
         for signum in watched_signals:
             signal.signal(signum, remember_signal)
         setup_deadline = setup_deadline_ns / 1_000_000_000
+        if sealed_cargo:
+            # The compiler-environment sealing step of the evidence envelope:
+            # a rejection here is a typed setup fault recorded in the terminal
+            # envelope — the target is never spawned.
+            assert suite_lock_path is not None and sealed_build_root is not None
+            sealed = prepare_sealed_cargo(
+                argv=argv,
+                cwd=cwd,
+                suite_lock_path=suite_lock_path,
+                sealed_build_root=sealed_build_root,
+                environ=os.environ,
+            )
+            argv = sealed["argv"]
+            child_env = sealed["env"]
+            sealed_compiler_facts = sealed["facts"]
         (
             proc,
             exec_status_read,
@@ -1984,6 +2074,7 @@ def _run_supervised_impl(
             target_signal_mask=initial_signal_mask,
             test_before_stop_delay_ms=test_before_stop_delay_ms,
             test_gate_mode=test_gate_mode,
+            env=child_env,
         )
         os.set_blocking(exec_status_read, False)
         os.set_blocking(gate_ready_read, False)
@@ -2293,6 +2384,13 @@ def _run_supervised_impl(
         )
         termination_reason = "setup_timeout"
         cleanup_failed_child(signal.SIGTERM)
+    except SealedCompilerRejection as error:
+        setup_finished_ns = setup_finished_ns or time.monotonic_ns()
+        sealed_rejection = error.reason_token
+        if error.facts is not None and sealed_compiler_facts is None:
+            sealed_compiler_facts = error.facts
+        errors.append(f"sealed compiler rejection: {error}")
+        cleanup_failed_child(signal.SIGTERM)
     except BaseException as error:
         setup_finished_ns = setup_finished_ns or time.monotonic_ns()
         errors.append(f"supervisor failure: {type(error).__name__}: {error}")
@@ -2414,6 +2512,8 @@ def _run_supervised_impl(
     def classify_terminal(observed_cancel: int | None) -> tuple[str, str, int]:
         if capture_publication_failed:
             return "internal_fault", "artifact_publication_failure", SETUP_FAILURE
+        if sealed_rejection is not None:
+            return "internal_fault", sealed_rejection, SETUP_FAILURE
         if errors:
             return "internal_fault", "supervisor_or_capture_failure", SETUP_FAILURE
         if observed_cancel is not None:
@@ -2459,13 +2559,14 @@ def _run_supervised_impl(
     )
 
     metadata: dict[str, Any] = {
-        "schema": "fln.supervisor/3",
+        "schema": "fln.supervisor/4",
         "stage_id": stage_id,
         "argv": rendered_argv,
         "argv_redacted": had_redaction,
         "cwd": str(cwd),
         "classification": classification,
         "reason_code": reason_code,
+        "sealed_compiler": sealed_compiler_facts,
         "wrapper_exit": wrapper_exit,
         "child_exit": child_exit,
         "child_signal": child_signal,
@@ -2625,7 +2726,7 @@ def _run_supervised_impl(
         wrapper_exit = int(selected["wrapper_exit"])
     except BaseException as error:
         fallback = {
-            "schema": "fln.supervisor/3",
+            "schema": "fln.supervisor/4",
             "classification": "internal_fault",
             "reason_code": "metadata_publication_failure",
             "metadata_path": str(metadata_path),
@@ -2662,6 +2763,209 @@ def _run_supervised_impl(
     return wrapper_exit
 
 
+def parse_rust_lock(lock_path: Path) -> dict[str, str]:
+    """Read the pinned Rust rows of SUITE.lock and enforce the lock's own law
+    that `rust-nightly` equals rust-toolchain.toml's `[toolchain].channel`."""
+    try:
+        lock_text = lock_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SealedCompilerRejection(
+            "sealed_compiler_lock_unreadable", f"cannot read {lock_path}: {error}"
+        ) from error
+    rows: dict[str, str] = {}
+    for line in lock_text.splitlines():
+        line = line.strip()
+        for key in ("rust-nightly", "rust-release", "rust-commit"):
+            prefix = f"{key} "
+            if line.startswith(prefix):
+                rows[key] = line[len(prefix) :].strip()
+    missing = sorted(
+        key for key in ("rust-nightly", "rust-release", "rust-commit") if key not in rows
+    )
+    if missing:
+        raise SealedCompilerRejection(
+            "sealed_compiler_lock_incomplete",
+            f"{lock_path} lacks pinned rust rows: {missing}",
+        )
+    toolchain_toml = lock_path.parent / "rust-toolchain.toml"
+    try:
+        toml_text = toolchain_toml.read_text(encoding="utf-8")
+    except OSError as error:
+        raise SealedCompilerRejection(
+            "sealed_compiler_toolchain_toml_unreadable",
+            f"cannot read {toolchain_toml}: {error}",
+        ) from error
+    channel_match = re.search(
+        r'^\s*channel\s*=\s*"([^"]+)"', toml_text, flags=re.MULTILINE
+    )
+    if channel_match is None or channel_match.group(1) != rows["rust-nightly"]:
+        raise SealedCompilerRejection(
+            "sealed_compiler_channel_disagreement",
+            f"rust-toolchain.toml channel {channel_match.group(1) if channel_match else None!r} "
+            f"!= SUITE.lock rust-nightly {rows['rust-nightly']!r}",
+        )
+    return rows
+
+
+def scan_hostile_compiler_env(environ: Mapping[str, str]) -> list[str]:
+    offenders = [name for name in environ if name in HOSTILE_COMPILER_ENV_EXACT]
+    offenders.extend(
+        name
+        for name in environ
+        if name not in SEALED_ENV_OVERRIDDEN
+        and name not in HOSTILE_COMPILER_ENV_EXACT
+        and any(name.startswith(prefix) for prefix in HOSTILE_COMPILER_ENV_PREFIXES)
+    )
+    return sorted(set(offenders))
+
+
+def scan_ancestor_cargo_config(cwd: Path) -> list[str]:
+    """Cargo discovers `.cargo/config{,.toml}` in cwd and every ancestor; any
+    such file would inject configuration beneath the sealed environment."""
+    offenders: list[str] = []
+    node = cwd
+    while True:
+        for name in ("config.toml", "config"):
+            candidate = node / ".cargo" / name
+            if candidate.is_file():
+                offenders.append(str(candidate))
+        if node.parent == node:
+            break
+        node = node.parent
+    return sorted(offenders)
+
+
+def resolve_sealed_toolchain(lock_rows: Mapping[str, str]) -> dict[str, str]:
+    """Locate the pinned rustup toolchain and prove its identity: the resolved
+    rustc must report exactly the locked release and commit hash."""
+    machine = platform.machine()
+    triple = SEALED_HOST_TRIPLES.get(machine)
+    if triple is None:
+        raise SealedCompilerRejection(
+            "sealed_compiler_unsupported_host",
+            f"no sealed host triple registered for machine {machine!r}",
+        )
+    rustup_home = Path(os.environ.get("RUSTUP_HOME", "") or Path.home() / ".rustup")
+    toolchain_root = rustup_home / "toolchains" / f"{lock_rows['rust-nightly']}-{triple}"
+    rustc_path = toolchain_root / "bin" / "rustc"
+    cargo_path = toolchain_root / "bin" / "cargo"
+    if not rustc_path.is_file() or not cargo_path.is_file():
+        raise SealedCompilerRejection(
+            "sealed_compiler_toolchain_unresolved",
+            f"pinned toolchain binaries absent under {toolchain_root}",
+        )
+    probe_env = {"PATH": SEALED_PATH_TAIL, "HOME": str(Path.home())}
+    try:
+        probe = subprocess.run(  # ubs:ignore — argv is the SUITE.lock-resolved pinned rustc with a fixed flag, never user input.
+            [str(rustc_path), "-vV"],
+            capture_output=True,
+            text=True,
+            timeout=SEALED_RUSTC_PROBE_TIMEOUT_S,
+            env=probe_env,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SealedCompilerRejection(
+            "sealed_compiler_probe_failure", f"rustc -vV probe failed: {error}"
+        ) from error
+    facts = {
+        key.strip(): value.strip()
+        for key, _, value in (
+            line.partition(":") for line in probe.stdout.splitlines() if ":" in line
+        )
+    }
+    release = facts.get("release", "")
+    commit = facts.get("commit-hash", "")
+    if (
+        probe.returncode != 0
+        or release != lock_rows["rust-release"]  # ubs:ignore — public compiler identity, not a secret.
+        or commit != lock_rows["rust-commit"]  # ubs:ignore — public content-integrity digest, not authentication material.
+    ):
+        raise SealedCompilerRejection(
+            "sealed_compiler_identity_mismatch",
+            f"resolved rustc identity release={release!r} commit={commit!r} "
+            f"does not match SUITE.lock release={lock_rows['rust-release']!r} "
+            f"commit={lock_rows['rust-commit']!r} (probe exit {probe.returncode})",
+        )
+    return {
+        "channel": lock_rows["rust-nightly"],
+        "release": release,
+        "commit": commit,
+        "toolchain_root": str(toolchain_root),
+        "rustc_path": str(rustc_path),
+        "cargo_path": str(cargo_path),
+    }
+
+
+def prepare_sealed_cargo(
+    *,
+    argv: Sequence[str],
+    cwd: Path,
+    suite_lock_path: Path,
+    sealed_build_root: Path,
+    environ: Mapping[str, str],
+) -> dict[str, Any]:
+    """The compiler-environment sealing step of the evidence envelope: reject
+    hostile channels, prove the pinned toolchain's identity, isolate Cargo
+    home/target for this attempt, rebuild PATH, and rewrite `cargo` to the
+    pinned absolute binary. Returns {argv, env, facts}."""
+    hostile = scan_hostile_compiler_env(environ)
+    if hostile:
+        raise SealedCompilerRejection(
+            "sealed_compiler_hostile_environment",
+            f"hostile compiler channels present: {','.join(hostile)}",
+            facts={"rejected_env": hostile},
+        )
+    ambient_configs = scan_ancestor_cargo_config(cwd)
+    if ambient_configs:
+        raise SealedCompilerRejection(
+            "sealed_compiler_ambient_config",
+            f"cargo config discovery would inject: {','.join(ambient_configs)}",
+            facts={"rejected_configs": ambient_configs},
+        )
+    lock_rows = parse_rust_lock(suite_lock_path)
+    toolchain = resolve_sealed_toolchain(lock_rows)
+    cargo_home = sealed_build_root / "cargo-home"
+    target_dir = sealed_build_root / "target"
+    try:
+        cargo_home.mkdir(parents=True, exist_ok=True)
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise SealedCompilerRejection(
+            "sealed_compiler_build_root_unavailable",
+            f"cannot create sealed build state under {sealed_build_root}: {error}",
+        ) from error
+    for name in ("config.toml", "config"):
+        if (cargo_home / name).exists():
+            raise SealedCompilerRejection(
+                "sealed_compiler_ambient_config",
+                f"sealed cargo home unexpectedly carries {name}",
+            )
+    sealed_env: dict[str, str] = {
+        name: environ[name]
+        for name in environ
+        if name in SEALED_ENV_ALLOWLIST or name.startswith("LC_")
+    }
+    sealed_env["PATH"] = f"{toolchain['toolchain_root']}/bin:{SEALED_PATH_TAIL}"
+    sealed_env["CARGO_HOME"] = str(cargo_home)
+    sealed_env["CARGO_TARGET_DIR"] = str(target_dir)
+    sealed_env["RUSTC"] = toolchain["rustc_path"]
+    argv = list(argv)
+    original_argv0 = argv[0] if argv else ""
+    if argv and argv[0] == "cargo":
+        argv[0] = toolchain["cargo_path"]
+    facts = {
+        **toolchain,
+        "cargo_home": str(cargo_home),
+        "target_dir": str(target_dir),
+        "admitted_env": sorted(sealed_env),
+        "rejected_env": [],
+        "original_argv0": original_argv0,
+        "effective_argv0": argv[0] if argv else "",
+    }
+    return {"argv": argv, "env": sealed_env, "facts": facts}
+
+
 def run_supervised(
     *,
     argv: Sequence[str],
@@ -2689,6 +2993,9 @@ def run_supervised(
     test_before_release_delay_ms: int = 0,
     test_gate_mode: str = "normal",
     test_fault_point: str = "none",
+    sealed_cargo: bool = False,
+    suite_lock_path: Path | None = None,
+    sealed_build_root: Path | None = None,
 ) -> int:
     """Run one isolated supervisor while restoring all caller process state."""
     watched = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
@@ -2745,6 +3052,9 @@ def run_supervised(
             test_before_release_delay_ms=test_before_release_delay_ms,
             test_gate_mode=test_gate_mode,
             test_fault_point=test_fault_point,
+            sealed_cargo=sealed_cargo,
+            suite_lock_path=suite_lock_path,
+            sealed_build_root=sealed_build_root,
         )
     finally:
         signal.pthread_sigmask(signal.SIG_BLOCK, watched)
@@ -3704,7 +4014,7 @@ def validate_kernel_admission(
             raise EvidenceError("kernel-admission verdict-stream digest is malformed")
         if shared_digest is None:
             shared_digest = digest
-        elif digest != shared_digest:
+        elif digest != shared_digest:  # ubs:ignore — public verdict-stream content digest, not authentication material.
             raise EvidenceError(
                 "kernel-admission verdict stream diverged across the thread matrix"
             )
@@ -4478,6 +4788,7 @@ def validate_supervisor_object(
         "fln.supervisor/1",
         "fln.supervisor/2",
         "fln.supervisor/3",
+        "fln.supervisor/4",
     }:
         raise EvidenceError(f"{path}:{record_number}: missing supervisor envelope")
     schema = value["schema"]
@@ -4507,14 +4818,38 @@ def validate_supervisor_object(
         "errors",
         "host",
     }
-    if schema in {"fln.supervisor/2", "fln.supervisor/3"}:
+    if schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}:
         expected_keys.update({"phase_timing", "target_exec"})
-    if schema == "fln.supervisor/3":
+    if schema in {"fln.supervisor/3", "fln.supervisor/4"}:
         expected_keys.add("test_control")
+    if schema == "fln.supervisor/4":
+        expected_keys.add("sealed_compiler")
     if set(value) != expected_keys:
         raise EvidenceError(
             f"{path}:{record_number}: supervisor envelope shape mismatch"
         )
+    if schema == "fln.supervisor/4":
+        sealed = value["sealed_compiler"]
+        if sealed is not None:
+            if not isinstance(sealed, dict):
+                raise EvidenceError(
+                    f"{path}:{record_number}: sealed-compiler facts are not an object"
+                )
+            commit = sealed.get("commit")
+            if "commit" in sealed and (
+                not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: sealed-compiler commit is malformed"
+                )
+            admitted = sealed.get("admitted_env")
+            if "admitted_env" in sealed and (
+                not isinstance(admitted, list)
+                or not all(isinstance(item, str) for item in admitted)
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: sealed-compiler admitted env is malformed"
+                )
     if not isinstance(value["argv"], list) or not value["argv"] or not all(
         isinstance(item, str) for item in value["argv"]
     ):
@@ -4606,7 +4941,7 @@ def validate_supervisor_object(
             raise EvidenceError(f"{path}:{record_number}: malformed supervisor timing")
     if value["monotonic_end_ns"] - value["monotonic_start_ns"] != value["duration_ns"]:
         raise EvidenceError(f"{path}:{record_number}: supervisor duration mismatch")
-    if schema in {"fln.supervisor/2", "fln.supervisor/3"}:
+    if schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}:
         phase = value["phase_timing"]
         expected_phase_keys = {
             "admission_protocol",
@@ -4619,7 +4954,7 @@ def validate_supervisor_object(
             "child_reaped_ns",
             "execution_duration_ns",
         }
-        if schema == "fln.supervisor/3":
+        if schema in {"fln.supervisor/3", "fln.supervisor/4"}:
             expected_phase_keys.update(
                 {
                     "setup_deadline_ns",
@@ -4645,7 +4980,7 @@ def validate_supervisor_object(
             "setup_start_ns",
             "setup_end_ns",
             "setup_duration_ns",
-            *(("setup_deadline_ns",) if schema == "fln.supervisor/3" else ()),
+            *(("setup_deadline_ns",) if schema in {"fln.supervisor/3", "fln.supervisor/4"} else ()),
         ):
             if (
                 not isinstance(phase[key], int)
@@ -4663,10 +4998,10 @@ def validate_supervisor_object(
             "execution_duration_ns",
             *(
                 ("synthetic_cancel_deadline_ns", "termination_decision_ns")
-                if schema == "fln.supervisor/3"
+                if schema in {"fln.supervisor/3", "fln.supervisor/4"}
                 else ()
             ),
-            *(("child_terminal_observed_ns",) if schema == "fln.supervisor/3" else ()),
+            *(("child_terminal_observed_ns",) if schema in {"fln.supervisor/3", "fln.supervisor/4"} else ()),
         ):
             if phase[key] is not None and (
                 not isinstance(phase[key], int)
@@ -4702,7 +5037,7 @@ def validate_supervisor_object(
             readiness_ns is None
             or not readiness_ns <= release_ns <= phase["setup_end_ns"]
             or (
-                schema == "fln.supervisor/3"
+                schema in {"fln.supervisor/3", "fln.supervisor/4"}
                 and release_ns >= phase["setup_deadline_ns"]
             )
         ):
@@ -4734,14 +5069,14 @@ def validate_supervisor_object(
                 raise EvidenceError(
                     f"{path}:{record_number}: inconsistent execution phase timing"
                 )
-        if schema == "fln.supervisor/3" and synthetic_cancel_deadline_ns is not None and (
+        if schema in {"fln.supervisor/3", "fln.supervisor/4"} and synthetic_cancel_deadline_ns is not None and (
             execution_ns is None
             or synthetic_cancel_deadline_ns < execution_ns
         ):
             raise EvidenceError(
                 f"{path}:{record_number}: synthetic cancellation predates execution"
             )
-        if schema == "fln.supervisor/3" and termination_decision_ns is not None and not (
+        if schema in {"fln.supervisor/3", "fln.supervisor/4"} and termination_decision_ns is not None and not (
             phase["setup_start_ns"]
             <= termination_decision_ns
             <= value["monotonic_end_ns"]
@@ -4760,7 +5095,7 @@ def validate_supervisor_object(
                     "termination_decision_ns",
                     "child_terminal_observed_ns",
                 )
-                if schema == "fln.supervisor/3"
+                if schema in {"fln.supervisor/3", "fln.supervisor/4"}
                 else ()
             ),
         ):
@@ -4775,7 +5110,7 @@ def validate_supervisor_object(
                 raise EvidenceError(
                     f"{path}:{record_number}: phase timestamp lies outside run: {key}"
                 )
-        if schema == "fln.supervisor/3" and (
+        if schema in {"fln.supervisor/3", "fln.supervisor/4"} and (
             (child_terminal_observed_ns is None)
             != (child_reaped_ns is None)
             or (
@@ -4867,7 +5202,7 @@ def validate_supervisor_object(
             raise EvidenceError(
                 f"{path}:{record_number}: unreleased target has a semantic outcome"
             )
-        if schema == "fln.supervisor/3":
+        if schema in {"fln.supervisor/3", "fln.supervisor/4"}:
             test_control = value["test_control"]
             if (
                 not isinstance(test_control, dict)
@@ -4983,6 +5318,19 @@ def validate_supervisor_object(
             "supervisor_or_capture_failure",
             "unexpected_child_exit",
             "target_exec_failure",
+            # Sealed compiler environment (bead fln-evidence-runner-bootstrap-
+            # btk): typed setup faults of the compiler-sealing envelope step.
+            "sealed_compiler_hostile_environment",
+            "sealed_compiler_ambient_config",
+            "sealed_compiler_lock_unreadable",
+            "sealed_compiler_lock_incomplete",
+            "sealed_compiler_toolchain_toml_unreadable",
+            "sealed_compiler_channel_disagreement",
+            "sealed_compiler_unsupported_host",
+            "sealed_compiler_toolchain_unresolved",
+            "sealed_compiler_probe_failure",
+            "sealed_compiler_identity_mismatch",
+            "sealed_compiler_build_root_unavailable",
         },
         "inconclusive": {
             "setup_timeout",
@@ -5014,15 +5362,26 @@ def validate_supervisor_object(
         raise EvidenceError(
             f"{path}:{record_number}: artifact failure lacks publication error"
         )
-    if value["errors"] and value["reason_code"] not in {
-        "artifact_publication_failure",
-        "supervisor_or_capture_failure",
-    }:
+    if (
+        value["errors"]
+        and value["reason_code"]
+        not in {
+            "artifact_publication_failure",
+            "supervisor_or_capture_failure",
+        }
+        and not (
+            value["reason_code"].startswith("sealed_compiler_")
+            and any(
+                error.startswith("sealed compiler rejection:")
+                for error in value["errors"]
+            )
+        )
+    ):
         raise EvidenceError(
             f"{path}:{record_number}: recorded errors do not bind terminal reason"
         )
     if (
-        schema in {"fln.supervisor/2", "fln.supervisor/3"}
+        schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}
         and value["reason_code"] == "target_exec_failure"
         and value["target_exec"]["status"] != "failed"
     ):
@@ -5084,7 +5443,7 @@ def validate_supervisor_object(
     if (
         classification == "internal_fault"
         and not (
-            schema in {"fln.supervisor/2", "fln.supervisor/3"}
+            schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}
             and value["reason_code"] == "target_exec_failure"
             and value["target_exec"]["status"] == "failed"
         )
@@ -5135,7 +5494,7 @@ def validate_supervisor_object(
             "setup_timeout_ms",
             "timeout_ms",
         )
-    elif schema == "fln.supervisor/3":
+    elif schema in {"fln.supervisor/3", "fln.supervisor/4"}:
         positive_integer_facts = (
             *positive_integer_facts,
             "setup_timeout_ms",
@@ -5149,7 +5508,7 @@ def validate_supervisor_object(
             raise EvidenceError(
                 f"{path}:{record_number}: malformed resource fact {key}"
             )
-    if schema == "fln.supervisor/3":
+    if schema in {"fln.supervisor/3", "fln.supervisor/4"}:
         cancel_after = resource_facts.get("cancel_after_ms")
         if cancel_after is not None and (
             not isinstance(cancel_after, int)
@@ -5281,7 +5640,7 @@ def validate_supervisor_object(
             f"{path}:{record_number}: inconclusive outcome carries cancellation"
         )
     if (
-        schema in {"fln.supervisor/2", "fln.supervisor/3"}
+        schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}
         and value["reason_code"].startswith("child_signal_")
         and (
             value["phase_timing"]["execution_start_ns"] is None
@@ -5292,7 +5651,7 @@ def validate_supervisor_object(
             f"{path}:{record_number}: child signal lacks released target execution"
         )
     if (
-        schema in {"fln.supervisor/2", "fln.supervisor/3"}
+        schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}
         and value["reason_code"] == "target_exec_failure"
         and (
             value["phase_timing"]["execution_start_ns"] is None
@@ -5364,7 +5723,7 @@ def validate_supervisor_object(
         schema == "fln.supervisor/2"
         and readiness.get("schema") != "fln.supervisor-readiness/2"
     ) or (
-        schema == "fln.supervisor/3"
+        schema in {"fln.supervisor/3", "fln.supervisor/4"}
         and readiness.get("schema") != "fln.supervisor-readiness/3"
     ):
         raise EvidenceError(f"{path}:{record_number}: supervisor/readiness version drift")
@@ -5402,7 +5761,7 @@ def validate_supervisor_object(
             raise EvidenceError(
                 f"{path}:{record_number}: readiness/terminal classification mismatch"
             )
-    if schema in {"fln.supervisor/2", "fln.supervisor/3"}:
+    if schema in {"fln.supervisor/2", "fln.supervisor/3", "fln.supervisor/4"}:
         phase = value["phase_timing"]
         if readiness_status == "ready":
             if readiness["monotonic_ns"] != phase["readiness_ns"]:
@@ -7168,6 +7527,11 @@ def run_supervised_from_args(
         test_before_release_delay_ms=args.test_before_release_delay_ms,
         test_gate_mode=args.test_gate_mode,
         test_fault_point=args.test_fault_point,
+        sealed_cargo=args.sealed_cargo,
+        suite_lock_path=Path(args.suite_lock) if args.suite_lock else None,
+        sealed_build_root=(
+            Path(args.sealed_build_root) if args.sealed_build_root else None
+        ),
     )
 
 
@@ -7934,6 +8298,16 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         raise EvidenceError(f"self-test artifact directory already exists: {art_dir}")
     _created, created_fd = open_directory_nofollow(art_dir, create=True)
     os.close(created_fd)
+    # Nested-supervision determinism (bead fln-evidence-runner-bootstrap-btk):
+    # when the self-test itself runs as a supervised stage, the runner's
+    # supervisor above us is a child subreaper, so orphans of our probe trees
+    # would be adopted there and never promptly reaped — hanging every
+    # "descendant reaped" assertion. The self-test owns every process tree it
+    # spawns; becoming the subreaper for its own domain makes orphan adoption
+    # and `reap_adopted_children` deterministic on every topology (standalone,
+    # nested stage, CI). The process exits at the end of the command, so no
+    # restore is needed.
+    enable_child_subreaper()
     cases: list[dict[str, Any]] = []
     require(
         GUARDIAN_LAUNCH_RELEASE_TIMEOUT_MS > MAX_PROCESS_IDENTITY_WAIT_MS * 3,
@@ -11039,6 +11413,226 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     require(race_data in {b"first\n", b"second\n"}, "collision race corrupted evidence")
     cases.append({"case": "write_collision_race", "ok": True})
 
+    # --- sealed compiler environment (bead fln-evidence-runner-bootstrap-btk):
+    # the hostile-environment matrix, no-mock: every case is a REAL
+    # `evidence.py run --sealed-cargo` subprocess. Hostile channels must be
+    # rejected typed before any repo-controlled compilation; a planted hostile
+    # binary must never execute (marker law); the positive lane must prove the
+    # pinned identity end to end when the toolchain is installed.
+    sealed_root = case_dir("sealed_compiler_validation")
+    sealed_repo = Path(__file__).resolve().parent.parent
+    sealed_work = sealed_root / "work"
+    sealed_work.mkdir()
+    for pin_name in ("SUITE.lock", "rust-toolchain.toml"):
+        (sealed_work / pin_name).write_bytes((sealed_repo / pin_name).read_bytes())
+    sealed_marker = sealed_root / "HOSTILE-EXECUTED"
+    sealed_fake = sealed_root / "fake-tool"
+    sealed_fake.write_text(f'#!/bin/sh\ntouch "{sealed_marker}"\nexec "$@"\n')
+    sealed_fake.chmod(0o755)
+    sealed_lock_rows = parse_rust_lock(sealed_work / "SUITE.lock")
+    try:
+        sealed_toolchain = resolve_sealed_toolchain(sealed_lock_rows)
+    except SealedCompilerRejection:
+        sealed_toolchain = None
+    sealed_case_counter = [0]
+
+    def run_sealed_case(
+        label: str,
+        *,
+        env_overrides: dict[str, str],
+        cwd: Path,
+        suite_lock: Path,
+        expected_reason: str,
+        expected_class: str,
+        expected_exit: int,
+    ) -> dict[str, Any]:
+        sealed_case_counter[0] += 1
+        stem = f"{label}-{sealed_case_counter[0]}"
+        base_env = {
+            "PATH": SEALED_PATH_TAIL,
+            "HOME": os.environ.get("HOME", str(Path.home())),
+        }
+        base_env.update(env_overrides)
+        invocation = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "run",
+                "--cwd",
+                str(cwd),
+                "--metadata",
+                str(sealed_root / f"{stem}.meta.json"),
+                "--stdout",
+                str(sealed_root / f"{stem}.out"),
+                "--stderr",
+                str(sealed_root / f"{stem}.err"),
+                "--readiness",
+                str(sealed_root / f"{stem}.ready.json"),
+                "--artifact-root",
+                str(sealed_root),
+                "--capture-bytes",
+                "65536",
+                "--output-budget-bytes",
+                "1048576",
+                "--timeout-ms",
+                "120000",
+                "--grace-ms",
+                "2000",
+                "--stage-id",
+                stem,
+                "--sealed-cargo",
+                "--suite-lock",
+                str(suite_lock),
+                "--sealed-build-root",
+                str(sealed_root / "build"),
+                "--",
+                "cargo",
+                "-V",
+            ],
+            capture_output=True,
+            env=base_env,
+            timeout=180,
+            check=False,
+        )
+        require(
+            invocation.returncode == expected_exit,
+            f"sealed case {label}: exit {invocation.returncode}, "
+            f"expected {expected_exit}: {invocation.stderr!r}",
+        )
+        envelope = json.loads((sealed_root / f"{stem}.meta.json").read_text())
+        validate_supervisor_object(
+            sealed_root / f"{stem}.meta.json", 1, envelope, expected_stage_id=stem
+        )
+        require(
+            envelope["classification"] == expected_class
+            and envelope["reason_code"] == expected_reason,
+            f"sealed case {label}: {envelope['classification']}/"
+            f"{envelope['reason_code']}, expected {expected_class}/{expected_reason}",
+        )
+        return envelope
+
+    hostile_channels = {
+        "sealed_reject_rustflags": {"RUSTFLAGS": "--cap-lints allow"},
+        "sealed_reject_encoded_rustflags": {"CARGO_ENCODED_RUSTFLAGS": "--cap-lints\x1fallow"},
+        "sealed_reject_target_rustflags": {
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "--cap-lints allow"
+        },
+        "sealed_reject_fake_rustc": {"RUSTC": str(sealed_fake)},
+        "sealed_reject_wrapper": {"RUSTC_WRAPPER": str(sealed_fake)},
+        "sealed_reject_workspace_wrapper": {"RUSTC_WORKSPACE_WRAPPER": str(sealed_fake)},
+        "sealed_reject_alt_toolchain": {"RUSTUP_TOOLCHAIN": "stable"},
+    }
+    for sealed_label, overrides in hostile_channels.items():
+        run_sealed_case(
+            sealed_label,
+            env_overrides=overrides,
+            cwd=sealed_work,
+            suite_lock=sealed_work / "SUITE.lock",
+            expected_reason="sealed_compiler_hostile_environment",
+            expected_class="internal_fault",
+            expected_exit=SETUP_FAILURE,
+        )
+    require(
+        not sealed_marker.exists(),
+        "a planted hostile compiler binary was executed by the sealed lane",
+    )
+
+    sealed_config_work = sealed_root / "config-work"
+    (sealed_config_work / ".cargo").mkdir(parents=True)
+    for pin_name in ("SUITE.lock", "rust-toolchain.toml"):
+        (sealed_config_work / pin_name).write_bytes(
+            (sealed_repo / pin_name).read_bytes()
+        )
+    (sealed_config_work / ".cargo" / "config.toml").write_text(
+        '[build]\nrustflags = ["--cap-lints", "allow"]\n'
+    )
+    run_sealed_case(
+        "sealed_reject_ambient_config",
+        env_overrides={},
+        cwd=sealed_config_work,
+        suite_lock=sealed_config_work / "SUITE.lock",
+        expected_reason="sealed_compiler_ambient_config",
+        expected_class="internal_fault",
+        expected_exit=SETUP_FAILURE,
+    )
+
+    sealed_mismatch_work = sealed_root / "mismatch-work"
+    sealed_mismatch_work.mkdir()
+    (sealed_mismatch_work / "rust-toolchain.toml").write_bytes(
+        (sealed_repo / "rust-toolchain.toml").read_bytes()
+    )
+    doctored = re.sub(
+        r"^rust-commit .*$",
+        "rust-commit " + "0" * 40,
+        (sealed_repo / "SUITE.lock").read_text(),
+        flags=re.MULTILINE,
+    )
+    (sealed_mismatch_work / "SUITE.lock").write_text(doctored)
+    run_sealed_case(
+        "sealed_identity_mismatch",
+        env_overrides={},
+        cwd=sealed_mismatch_work,
+        suite_lock=sealed_mismatch_work / "SUITE.lock",
+        expected_reason=(
+            "sealed_compiler_identity_mismatch"
+            if sealed_toolchain is not None
+            else "sealed_compiler_toolchain_unresolved"
+        ),
+        expected_class="internal_fault",
+        expected_exit=SETUP_FAILURE,
+    )
+
+    if sealed_toolchain is not None:
+        positive = run_sealed_case(
+            "sealed_positive",
+            env_overrides={},
+            cwd=sealed_work,
+            suite_lock=sealed_work / "SUITE.lock",
+            expected_reason="exit_zero",
+            expected_class="pass",
+            expected_exit=PASS,
+        )
+        sealed_facts = positive["sealed_compiler"]
+        require(
+            isinstance(sealed_facts, dict)
+            and sealed_facts["commit"] == sealed_lock_rows["rust-commit"]  # ubs:ignore — public compiler commit, not a secret.
+            and sealed_facts["release"] == sealed_lock_rows["rust-release"]
+            and sealed_facts["channel"] == sealed_lock_rows["rust-nightly"]
+            and sealed_facts["effective_argv0"] == sealed_facts["cargo_path"],
+            "sealed positive envelope does not bind the locked compiler identity",
+        )
+        # Clean recovery after every rejection: the positive lane runs green
+        # again with nothing left behind by the hostile attempts.
+        run_sealed_case(
+            "sealed_recovery",
+            env_overrides={},
+            cwd=sealed_work,
+            suite_lock=sealed_work / "SUITE.lock",
+            expected_reason="exit_zero",
+            expected_class="pass",
+            expected_exit=PASS,
+        )
+        cases.append(
+            {
+                "case": "sealed_compiler_validation",
+                "ok": True,
+                "toolchain": sealed_facts["toolchain_root"],
+                "commit": sealed_facts["commit"],
+            }
+        )
+    else:
+        # Typed limitation: the pinned toolchain is not installed on this
+        # host, so the positive/recovery lanes are unverifiable here — the
+        # rejection matrix above still ran for real. CI hosts install the pin
+        # and exercise the full lane.
+        cases.append(
+            {
+                "case": "sealed_compiler_validation",
+                "ok": True,
+                "limitation": "pinned toolchain absent; rejection matrix only",
+            }
+        )
+
     report = {
         "schema": "fln.evidence-self-test/1",
         "verdict": "pass",
@@ -11122,6 +11716,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--test-fail-guardian-pidfd-open",
         action="store_true",
         help=argparse.SUPPRESS,
+    )
+    run_parser.add_argument(
+        "--sealed-cargo",
+        action="store_true",
+        help="seal the compiler environment: reject hostile channels, verify "
+        "the SUITE.lock-pinned toolchain identity, isolate CARGO_HOME/target",
+    )
+    run_parser.add_argument("--suite-lock", help="path to SUITE.lock for sealing")
+    run_parser.add_argument(
+        "--sealed-build-root", help="per-attempt isolated build-state root"
     )
     run_parser.add_argument("--test-guardian-child-ready", help=argparse.SUPPRESS)
     run_parser.add_argument("command", nargs=argparse.REMAINDER)

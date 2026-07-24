@@ -42,6 +42,10 @@ BEAD="franken_lean-rur"
 RUN_ID="check-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ART_ROOT="${FLN_CHECK_ART_ROOT:-$REPO/target/check}"
 ART_DIR="${FLN_CHECK_ART_DIR:-$ART_ROOT/$RUN_ID}"
+# Per-attempt isolated build state for the sealed compiler lane (bead
+# fln-evidence-runner-bootstrap-btk): never the user's ambient CARGO_HOME or
+# target directory; target/ is gitignored and user caches are never touched.
+SEALED_BUILD_ROOT="${FLN_CHECK_SEALED_BUILD_ROOT:-$REPO/target/sealed}/$RUN_ID"
 NDJSON="$ART_DIR/run.ndjson"
 HUMAN="$ART_DIR/human.log"
 CAPTURE_BYTES="${FLN_CHECK_CAPTURE_BYTES:-262144}"
@@ -784,6 +788,16 @@ run_stage() {
         ;;
     esac
   fi
+  # Cargo-invoking stages run under the sealed compiler environment: hostile
+  # ambient channels are rejected typed, the SUITE.lock-pinned toolchain
+  # identity is verified, and build state is isolated per attempt.
+  local -a sealed_args=()
+  case "$name" in
+    fmt|check|clippy|test|structure-guard)
+      sealed_args=(--sealed-cargo --suite-lock "$REPO/SUITE.lock"
+        --sealed-build-root "$SEALED_BUILD_ROOT")
+      ;;
+  esac
   note "stage=$name: ${argv[*]}"
   local -a runner=(python3 "$EVIDENCE" run
     --cwd "$REPO"
@@ -798,7 +812,7 @@ run_stage() {
     --output-budget-bytes "$OUTPUT_BUDGET_BYTES"
     --timeout-ms "$STAGE_TIMEOUT_MS"
     --grace-ms "$KILL_GRACE_MS"
-    --stage-id "$name" "${semantic_args[@]}")
+    --stage-id "$name" "${semantic_args[@]}" "${sealed_args[@]}")
   [ "$planted" = true ] && runner+=(--planted)
   runner+=(-- "${argv[@]}")
   SPAWNING=1
