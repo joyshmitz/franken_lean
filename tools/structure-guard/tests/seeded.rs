@@ -19,7 +19,7 @@ use structure_guard::checks::{self, RunOutcome};
 /// root and retains it for inspection, as required by the repository's no-deletion rule.
 struct TempWs {
     tag: String,
-    files: RefCell<BTreeMap<String, String>>,
+    files: RefCell<BTreeMap<String, Vec<u8>>>,
 }
 
 impl TempWs {
@@ -31,9 +31,15 @@ impl TempWs {
     }
 
     fn write(&self, rel: &str, content: &str) {
+        self.write_bytes(rel, content.as_bytes());
+    }
+
+    /// Plant exact bytes. Needed for inputs that are deliberately not valid UTF-8: the
+    /// guard's behaviour on an undecodable governed file is itself a contract.
+    fn write_bytes(&self, rel: &str, content: &[u8]) {
         self.files
             .borrow_mut()
-            .insert(rel.to_string(), content.to_string());
+            .insert(rel.to_string(), content.to_vec());
     }
 
     fn materialize(&self) -> Result<PathBuf, String> {
@@ -68,7 +74,7 @@ impl TempWs {
                 .create_new(true)
                 .open(&path)
                 .map_err(|error| format!("create fixture file {rel} without overwrite: {error}"))?;
-            file.write_all(content.as_bytes())
+            file.write_all(content)
                 .map_err(|error| format!("write fixture file {rel}: {error}"))?;
         }
         eprintln!("retained structure-guard fixture: {}", root.display());
@@ -830,22 +836,149 @@ fn auxiliary_target_cannot_replace_the_declared_product_crate() {
 
 #[test]
 fn repository_cargo_config_cannot_bypass_the_reviewed_compilation_contract() {
+    // Cargo merges `.cargo/config(.toml)` from the invocation directory *upward*, and
+    // rustup resolves the toolchain the same way. A file that only the root check can see
+    // is therefore not the whole surface: `cd crates/fln-kernel && cargo build` picks up
+    // anything planted at or above that directory. Each of these plants a real lint cap
+    // (or an alternate toolchain) at a depth the root-only check could not see.
     for (tag, rel) in [
         ("cargo-config-toml", ".cargo/config.toml"),
         ("cargo-config-legacy", ".cargo/config"),
+        ("cargo-config-crates-dir", "crates/.cargo/config.toml"),
+        (
+            "cargo-config-nested-crate",
+            "crates/fln-kernel/.cargo/config.toml",
+        ),
+        (
+            "cargo-config-nested-legacy",
+            "crates/fln-kernel/.cargo/config",
+        ),
+        (
+            "cargo-config-nested-deep",
+            "crates/fln-kernel/src/.cargo/config.toml",
+        ),
+        ("cargo-config-tools-dir", "tools/.cargo/config.toml"),
     ] {
         let ws = TempWs::new(tag);
         base(&ws);
         ws.write(rel, "[build]\nrustflags = [\"--cap-lints\", \"allow\"]\n");
         let out = ws.run();
-        assert_eq!(codes(&out), vec!["FLN-STRUCT-016"]);
+        assert_eq!(codes(&out), vec!["FLN-STRUCT-016"], "missed plant at {rel}");
         assert_eq!(out.findings[0].path, rel);
         assert!(
             out.findings[0]
                 .detail
-                .contains("repository-local Cargo configuration")
+                .contains("repository-local Cargo/toolchain configuration")
         );
     }
+
+    // The toolchain half of the same family. `rust-toolchain.toml` at the ROOT is the
+    // reviewed pin and must stay legal; its legacy no-suffix spelling is not, because
+    // rustup prefers `.toml` when both exist, so the unreviewed file would sit there
+    // undetected. Below the root every spelling is forbidden at every depth.
+    for (tag, rel) in [
+        ("toolchain-legacy-root", "rust-toolchain"),
+        (
+            "toolchain-nested-crate",
+            "crates/fln-kernel/rust-toolchain.toml",
+        ),
+        (
+            "toolchain-nested-legacy",
+            "crates/fln-kernel/rust-toolchain",
+        ),
+        ("toolchain-tools-dir", "tools/rust-toolchain.toml"),
+    ] {
+        let ws = TempWs::new(tag);
+        base(&ws);
+        ws.write(rel, "[toolchain]\nchannel = \"stable\"\n");
+        let out = ws.run();
+        assert_eq!(codes(&out), vec!["FLN-STRUCT-016"], "missed plant at {rel}");
+        assert_eq!(out.findings[0].path, rel);
+    }
+
+    // Recovery: the reviewed root pin alone is clean, proving the new depth-walk did not
+    // start rejecting the one legal member of the family.
+    let ws = TempWs::new("cargo-config-clean-recovery");
+    base(&ws);
+    let out = ws.run();
+    assert!(out.findings.is_empty(), "unexpected: {:?}", out.findings);
+}
+
+/// A governed file the guard cannot decode leaves its structural authority *unestablished*.
+/// It must therefore be a typed per-file finding — never a clean run, and never a whole-run
+/// abort that masks every other finding (one unreadable byte would otherwise suppress the
+/// gate).
+#[test]
+fn unreadable_governed_source_is_inconclusive_not_clean_and_masks_nothing() {
+    const GARBAGE: [u8; 4] = [0xff, 0xfe, 0x00, 0x80];
+
+    // Each of these is a path the guard *does* derive authority from, and each is exactly
+    // where a violation would hide behind an undecodable byte: the covenant's counted
+    // source closure, the boundary crate's allow-site scan, an ordinary crate's root lint
+    // posture, and a package manifest.
+    for (tag, rel) in [
+        (
+            "unreadable-covenant-source",
+            "crates/fln-kernel/src/hidden.rs",
+        ),
+        (
+            "unreadable-boundary-source",
+            "crates/fln-unsafe-abi/src/hidden.rs",
+        ),
+        ("unreadable-crate-root", "crates/fln-core/src/lib.rs"),
+        ("unreadable-manifest", "crates/fln-core/Cargo.toml"),
+    ] {
+        let ws = TempWs::new(tag);
+        base(&ws);
+        ws.write_bytes(rel, &GARBAGE);
+        let out = ws.run();
+        assert!(
+            out.findings
+                .iter()
+                .any(|f| f.code == "FLN-STRUCT-027" && f.path == rel),
+            "{rel} produced no inconclusive finding: {:?}",
+            out.findings
+        );
+        assert!(
+            out.findings
+                .iter()
+                .find(|f| f.code == "FLN-STRUCT-027")
+                .is_some_and(|f| f.detail.contains("inconclusive")),
+            "finding for {rel} does not report itself as inconclusive: {:?}",
+            out.findings
+        );
+    }
+
+    // The masking property: an unreadable file must not suppress an unrelated, genuine
+    // violation found elsewhere in the same run. Before this was localised, the read error
+    // propagated to a whole-run exit 2 and the layering violation below was never reported.
+    let ws = TempWs::new("unreadable-masks-nothing");
+    base(&ws);
+    ws.write_bytes("crates/fln-kernel/src/hidden.rs", &GARBAGE);
+    ws.write(
+        "crates/fln-core/Cargo.toml",
+        &manifest("fln-core", &["fln-kernel"]),
+    );
+    ws.write(
+        "ci/WORKSPACE_GRAPH.txt",
+        &graph_with_edges(&["fln-core -> fln-kernel"]),
+    );
+    let observed = codes(&ws.run());
+    assert!(
+        observed.contains(&"FLN-STRUCT-027"),
+        "lost the unreadable-input finding: {observed:?}"
+    );
+    assert!(
+        observed.contains(&"FLN-STRUCT-007"),
+        "unreadable input masked the upward-edge finding: {observed:?}"
+    );
+
+    // Recovery: once the same path decodes, the run is clean again.
+    let ws = TempWs::new("unreadable-recovery");
+    base(&ws);
+    ws.write("crates/fln-kernel/src/hidden.rs", "// now valid UTF-8\n");
+    let out = ws.run();
+    assert!(out.findings.is_empty(), "unexpected: {:?}", out.findings);
 }
 
 // ================================================================ FLN-STRUCT-026

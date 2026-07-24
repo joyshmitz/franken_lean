@@ -40,6 +40,7 @@ fn is_option(value: &OsStr) -> bool {
 fn parse_cli(args: &[OsString]) -> Result<CliAction, CliError> {
     let robot = args.iter().any(|arg| arg == "--robot");
     let mut root = PathBuf::from(".");
+    let mut root_seen = false;
     let mut help = false;
     let mut index = 0;
 
@@ -61,6 +62,18 @@ fn parse_cli(args: &[OsString]) -> Result<CliAction, CliError> {
                     detail: "--root requires a path".to_string(),
                 });
             }
+            // A trusted gate must never accept an ambiguous target. Silently taking the
+            // last `--root` would let an injected argument redirect validation away from
+            // the workspace the caller believes is being checked, so a repeated flag is
+            // a setup failure whether or not the two paths agree.
+            if root_seen {
+                return Err(CliError {
+                    root,
+                    robot,
+                    detail: "--root given more than once; the workspace root under check must be unambiguous".to_string(),
+                });
+            }
+            root_seen = true;
             root = PathBuf::from(value);
         } else if arg == "--robot" {
             // Already captured by the whole-request pre-scan.
@@ -174,6 +187,40 @@ mod tests {
             parse_cli(&arguments(&["--root", "--robot"])).expect_err("root value is missing");
         assert!(error.robot);
         assert_eq!(error.detail, "--root requires a path");
+    }
+
+    /// Both the identical and the conflicting duplicate must fail: the defect is the
+    /// ambiguity itself, not the disagreement.
+    #[test]
+    fn duplicate_root_arguments_fail_closed_in_both_modes() {
+        for request in [
+            vec!["--root", "/a", "--root", "/a"],
+            vec!["--root", "/a", "--root", "/b"],
+        ] {
+            let error = parse_cli(&arguments(&request)).expect_err("duplicate --root must fail");
+            assert!(!error.robot);
+            assert!(
+                error.detail.contains("--root given more than once"),
+                "unexpected detail: {}",
+                error.detail
+            );
+
+            let mut robot_request = request.clone();
+            robot_request.push("--robot");
+            let error =
+                parse_cli(&arguments(&robot_request)).expect_err("duplicate --root must fail");
+            assert!(error.robot, "robot mode is a property of the whole request");
+        }
+
+        // A repeated `--robot` is idempotent and stays legal; only the target root is
+        // ambiguous when repeated.
+        assert_eq!(
+            parse_cli(&arguments(&["--robot", "--root", "/a", "--robot"])),
+            Ok(CliAction::Run {
+                root: PathBuf::from("/a"),
+                robot: true
+            })
+        );
     }
 
     #[test]

@@ -28,6 +28,11 @@
 //!   the census ⇄ `ci/ABI_EXPORT_STATUS.txt` ⇄ `export_name`-site join is broken —
 //!   an unclassified symbol, a stale or lying status row, an export outside
 //!   `fln-unsafe-abi`, or an unextractable symbol string (fail closed)
+//! * `FLN-STRUCT-027` a governed file could not be read as UTF-8, so structural
+//!   authority over it is *inconclusive* rather than clean. It is reported per file so
+//!   that one unreadable input cannot mask every other finding in the run, and it is
+//!   still a finding — never a pass — because the covenant, lint posture, or ledger
+//!   evidence that file carries was not established (FL-INV-07).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -175,6 +180,80 @@ fn audit_governed_symlinks(root: &Path, findings: &mut Vec<Finding>) -> Result<(
     scan_symlinks(root, &root.join("tools"), findings)
 }
 
+/// Configuration files that silently re-point the compiler if a supported command runs
+/// from the directory that contains them. Cargo merges `.cargo/config(.toml)` from the
+/// invocation directory *upward*, and rustup resolves the toolchain the same way, so the
+/// discovery surface is every directory a caller may `cd` into — not only the root.
+const FORBIDDEN_CONFIG_FILES: [&str; 4] = [
+    ".cargo/config.toml",
+    ".cargo/config",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+];
+
+fn audit_configuration_files_in(
+    root: &Path,
+    dir: &Path,
+    names: &[&str],
+    findings: &mut Vec<Finding>,
+) -> Result<(), String> {
+    for name in names {
+        let path = dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                findings.push(Finding {
+                    code: "FLN-STRUCT-016",
+                    path: rel,
+                    detail: "repository-local Cargo/toolchain configuration is forbidden because it can change the compiler, lint, linker, runner, or dependency-source contract outside the reviewed manifests; Cargo and rustup discover it from any directory a supported command runs in"
+                        .to_string(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+        }
+    }
+    Ok(())
+}
+
+fn audit_configuration_surface_recursive(
+    root: &Path,
+    dir: &Path,
+    findings: &mut Vec<Finding>,
+) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", dir.display())),
+    };
+    // Symlinked directories are already a finding in `audit_governed_symlinks`; do not
+    // follow one here, or the scan could escape the workspace or cycle.
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
+    audit_configuration_files_in(root, dir, &FORBIDDEN_CONFIG_FILES, findings)?;
+
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            audit_configuration_surface_recursive(root, &path, findings)?;
+        }
+    }
+    Ok(())
+}
+
 fn audit_repository_cargo_config(root: &Path, findings: &mut Vec<Finding>) -> Result<(), String> {
     // Package and workspace manifests are intentionally constrained above, but Cargo
     // also reads repository-local configuration before it compiles anything. Such a
@@ -182,24 +261,54 @@ fn audit_repository_cargo_config(root: &Path, findings: &mut Vec<Finding>) -> Re
     // source replacement without appearing in the reviewed dependency graph. There is
     // no approved repository-local Cargo configuration surface yet, so both the current
     // and legacy filenames fail closed.
-    for rel in [".cargo/config.toml", ".cargo/config"] {
-        match fs::symlink_metadata(root.join(rel)) {
-            Ok(_) => findings.push(Finding {
-                code: "FLN-STRUCT-016",
-                path: rel.to_string(),
-                detail: "repository-local Cargo configuration is forbidden because it can change the compiler, lint, linker, runner, or dependency-source contract outside the reviewed manifests"
-                    .to_string(),
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("cannot inspect {rel}: {error}")),
-        }
+    //
+    // At the root, `rust-toolchain.toml` is the reviewed pin itself (validated against
+    // SUITE.lock elsewhere) and is therefore the one legal member of this family; its
+    // legacy no-suffix spelling is not, because rustup prefers `.toml` when both exist
+    // and the unreviewed file would otherwise sit there undetected.
+    audit_configuration_files_in(
+        root,
+        root,
+        &[".cargo/config.toml", ".cargo/config", "rust-toolchain"],
+        findings,
+    )?;
+
+    // Below the root every member of the family is forbidden at every depth: a file at
+    // `crates/fln-kernel/.cargo/config.toml` never appears in the reviewed graph, yet
+    // `cd crates/fln-kernel && cargo build` merges it.
+    for subdir in ["crates", "tools"] {
+        audit_configuration_surface_recursive(root, &root.join(subdir), findings)?;
     }
     Ok(())
 }
 
+/// Read a governed file that the run can survive without. A file the guard cannot decode
+/// is an inconclusive input, not a setup failure: propagating the error would abort the
+/// whole run at exit 2 and hide every other finding, which turns one unreadable byte into
+/// a way to suppress the gate. The caller records the typed finding and skips the file, so
+/// the run can never be reported clean.
+fn read_governed(path: &Path, rel: &str, findings: &mut Vec<Finding>) -> Option<String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) => {
+            findings.push(Finding {
+                code: "FLN-STRUCT-027",
+                path: rel.to_string(),
+                detail: format!(
+                    "governed file could not be read as UTF-8 ({error}); its structural authority is inconclusive and the scan is incomplete"
+                ),
+            });
+            None
+        }
+    }
+}
+
 /// Count covenant-relevant lines: non-blank, not starting with `//` after trim.
 /// Block comments count as code — the covenant is deliberately conservative.
-fn count_loc(dir: &Path) -> Result<usize, String> {
+///
+/// A file that cannot be decoded is reported and skipped, so an unreadable source file
+/// understates the count as a finding rather than passing the covenant silently.
+fn count_loc(root: &Path, dir: &Path, findings: &mut Vec<Finding>) -> Result<usize, String> {
     let mut total = 0;
     let metadata = match fs::symlink_metadata(dir) {
         Ok(metadata) => metadata,
@@ -227,8 +336,14 @@ fn count_loc(dir: &Path) -> Result<usize, String> {
             if file_type.is_dir() {
                 stack.push(p);
             } else if file_type.is_file() && p.extension().is_some_and(|e| e == "rs") {
-                let text = fs::read_to_string(&p)
-                    .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let Some(text) = read_governed(&p, &rel, findings) else {
+                    continue;
+                };
                 total += text
                     .lines()
                     .filter(|l| {
@@ -509,8 +624,10 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
 
     for c in &mut discovered {
         let manifest_rel = format!("{}/Cargo.toml", c.rel);
-        let text = fs::read_to_string(c.dir.join("Cargo.toml"))
-            .map_err(|e| format!("cannot read {manifest_rel}: {e}"))?;
+        let Some(text) = read_governed(&c.dir.join("Cargo.toml"), &manifest_rel, &mut findings)
+        else {
+            continue;
+        };
         match manifest::parse(&text, &manifest_rel) {
             Ok(m) => c.manifest = Some(m),
             Err(e) => findings.push(Finding {
@@ -821,8 +938,9 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                 .to_string_lossy()
                 .replace('\\', "/");
             let rel = format!("{}/{}", c.rel, relative_root);
-            let text =
-                fs::read_to_string(&root_file).map_err(|e| format!("cannot read {rel}: {e}"))?;
+            let Some(text) = read_governed(&root_file, &rel, &mut findings) else {
+                continue;
+            };
             let posture = ledger::lint_posture(&text);
             match decl.kind {
                 CrateKind::UnsafeBoundary => {
@@ -861,6 +979,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
     // are closed by the `#![forbid(unsafe_code)]` root check above plus rustc itself
     // (forbid cannot be overridden by an inner allow).
     let mut sites: Vec<AllowSite> = Vec::new();
+    let mut unreadable_boundary_sources: Vec<String> = Vec::new();
     for c in &discovered {
         let is_boundary = g
             .crates
@@ -873,8 +992,19 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
             // Every Rust target in a boundary package is project-authored boundary code:
             // library/modules, bins, integration tests, examples, benches, and any
             // auto-discovered build script. None gets an unledgered lowering lane.
-            ledger::scan_allow_sites(&c.dir, &c.rel, &mut sites)?;
+            ledger::scan_allow_sites(&c.dir, &c.rel, &mut sites, &mut unreadable_boundary_sources)?;
         }
+    }
+    // An undecodable file inside a boundary crate is exactly where an unledgered
+    // allow-site would hide, so it is reported and the run is never clean.
+    for rel in unreadable_boundary_sources {
+        findings.push(Finding {
+            code: "FLN-STRUCT-027",
+            path: rel,
+            detail:
+                "boundary-crate source could not be read as UTF-8; it was not scanned for `#[allow(unsafe_code)]` sites, so the unsafe-ledger discipline is inconclusive for this file"
+                    .to_string(),
+        });
     }
     let mut used_ids: BTreeMap<&str, usize> = BTreeMap::new();
     for site in &sites {
@@ -1015,7 +1145,22 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         }
         let findings_before = findings.len();
         let mut exports = Vec::new();
-        ledger::scan_external_exports(&src, &format!("{}/src", c.rel), &mut exports)?;
+        let mut unreadable_exports = Vec::new();
+        ledger::scan_external_exports(
+            &src,
+            &format!("{}/src", c.rel),
+            &mut exports,
+            &mut unreadable_exports,
+        )?;
+        for rel in unreadable_exports {
+            findings.push(Finding {
+                code: "FLN-STRUCT-027",
+                path: rel,
+                detail:
+                    "boundary-crate source could not be read as UTF-8; it was not scanned for external export sites, so the D3 law (b) no-admission covenant is inconclusive for this file"
+                        .to_string(),
+            });
+        }
         for site in exports {
             findings.push(Finding {
                 code: "FLN-STRUCT-022",
@@ -1032,8 +1177,14 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         sources.sort();
         let mut source_pub: BTreeSet<(String, String)> = BTreeSet::new();
         for path in &sources {
-            let text = fs::read_to_string(path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            let source_rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Some(text) = read_governed(path, &source_rel, &mut findings) else {
+                continue;
+            };
             let rel = path
                 .strip_prefix(root)
                 .unwrap_or(path)
@@ -1134,14 +1285,16 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
         let mut covenant_sources = Vec::new();
         collect_rs_files(&src, &mut covenant_sources)?;
         for source in covenant_sources {
-            let text = fs::read_to_string(&source)
-                .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+            let source_rel = source
+                .strip_prefix(root)
+                .unwrap_or(&source)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Some(text) = read_governed(&source, &source_rel, &mut findings) else {
+                continue;
+            };
             for escape in ledger::source_escape_sites(&text) {
-                let rel = source
-                    .strip_prefix(root)
-                    .unwrap_or(&source)
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                let rel = source_rel.clone();
                 findings.push(Finding {
                     code: "FLN-STRUCT-015",
                     path: format!("{rel}:{}", escape.line),
@@ -1152,7 +1305,7 @@ pub fn run(root: &Path) -> Result<RunOutcome, String> {
                 });
             }
         }
-        let loc = count_loc(&src)?;
+        let loc = count_loc(root, &src, &mut findings)?;
         if loc > *limit {
             findings.push(Finding {
                 code: "FLN-STRUCT-015",

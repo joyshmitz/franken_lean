@@ -80,8 +80,10 @@ pub struct AllowSite {
     /// Only canonical, ledgered `allow` is admissible. The other levels are retained
     /// so the caller can report their attempt to lower the boundary root's `deny`.
     pub level: &'static str,
-    /// Ledger id from the `// UNSAFE-LEDGER: FLN-UL-NNNN` marker, if present on the
-    /// same line or the nearest non-empty line above.
+    /// Ledger id from the `// UNSAFE-LEDGER: FLN-UL-NNNN` marker, taken from the nearest
+    /// non-empty line *above* the attribute. A marker trailing on the attribute's own
+    /// line does not authorise it: the scan is deliberately one-directional so that the
+    /// authorising comment always precedes what it authorises.
     pub id: Option<String>,
     /// Inner attributes apply to an entire crate/module and are never a narrowly scoped
     /// unsafe allowance.
@@ -780,10 +782,16 @@ pub fn admission_token_sites(text: &str) -> Vec<ExportSite> {
     sites
 }
 
+/// Recursively collect `#[unsafe(export_name)]`-class sites under `dir`.
+///
+/// As with [`scan_allow_sites`], a file that cannot be decoded as UTF-8 is appended to
+/// `unreadable` and skipped so the caller can report it as an inconclusive input instead
+/// of aborting the whole run.
 pub fn scan_external_exports(
     dir: &Path,
     rel_prefix: &str,
     out: &mut Vec<LocatedExportSite>,
+    unreadable: &mut Vec<String>,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(dir)
         .map_err(|error| format!("cannot inspect directory {rel_prefix}: {error}"))?;
@@ -807,10 +815,12 @@ pub fn scan_external_exports(
             continue;
         }
         if file_type.is_dir() {
-            scan_external_exports(&path, &rel, out)?;
+            scan_external_exports(&path, &rel, out, unreadable)?;
         } else if file_type.is_file() && name.ends_with(".rs") {
-            let text =
-                fs::read_to_string(&path).map_err(|error| format!("cannot read {rel}: {error}"))?;
+            let Ok(text) = fs::read_to_string(&path) else {
+                unreadable.push(rel.clone());
+                continue;
+            };
             out.extend(
                 external_export_sites(&text)
                     .into_iter()
@@ -827,10 +837,16 @@ pub fn scan_external_exports(
 
 /// Recursively scan every `.rs` file under `dir` for allow-sites. `rel_prefix` is the
 /// workspace-relative path of `dir`.
+///
+/// A file that cannot be decoded as UTF-8 is appended to `unreadable` and skipped rather
+/// than aborting the scan: the caller turns each entry into a typed finding, so an
+/// undecodable file inside a boundary crate leaves the run inconclusive instead of either
+/// suppressing every other finding or silently passing the ledger discipline.
 pub fn scan_allow_sites(
     dir: &Path,
     rel_prefix: &str,
     out: &mut Vec<AllowSite>,
+    unreadable: &mut Vec<String>,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(dir)
         .map_err(|error| format!("cannot inspect directory {rel_prefix}: {error}"))?;
@@ -855,9 +871,12 @@ pub fn scan_allow_sites(
             continue;
         }
         if file_type.is_dir() {
-            scan_allow_sites(&path, &rel, out)?;
+            scan_allow_sites(&path, &rel, out, unreadable)?;
         } else if file_type.is_file() && name.ends_with(".rs") {
-            let text = fs::read_to_string(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+            let Ok(text) = fs::read_to_string(&path) else {
+                unreadable.push(rel.clone());
+                continue;
+            };
             let lines: Vec<&str> = text.lines().collect();
             for attribute in attributes(&text) {
                 for level in ["allow", "warn", "expect"] {
