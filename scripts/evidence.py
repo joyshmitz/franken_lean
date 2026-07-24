@@ -452,6 +452,7 @@ STOPPED_GATE_READY_TOKEN = b"fln-private-ready-v1\n"
 STOPPED_GATE_RELEASE_TOKEN = b"fln-private-release-v1\n"
 SUPERVISOR_TEST_FAULT_POINTS = {
     "none",
+    "admission_fd_exhaustion",
     "capture_stdout",
     "capture_stderr",
     "metadata_parent_open",
@@ -758,6 +759,7 @@ def write_signal_committed_atomic_new(
     decision_path: Path | None = None,
     restore_signal_state: bool = True,
     test_fail_after_link: bool = False,
+    test_marker_pause: tuple[Path, Path] | None = None,
 ) -> None:
     """Race cancellation and commit on one write-once cross-process decision."""
     absolute = lexical_absolute(path)
@@ -807,6 +809,32 @@ def write_signal_committed_atomic_new(
                 decision_data, _size, _digest = stable_file_facts(decision_absolute)
                 if not hmac.compare_digest(decision_data, data):
                     raise EvidenceError("cancellation won the bundle decision race")
+            if test_marker_pause is not None:
+                # Boundary-injection hook (bead fln-evidence-runner-bootstrap-btk):
+                # hold the window between the linked decision and the canonical
+                # marker open so a deterministic signal can be delivered to the
+                # supervising shell. Watched signals are already ignored here, so
+                # the pause cannot be interrupted; the decision has already won,
+                # so the signal must lose and the bundle must still commit.
+                pause_ready, pause_release = test_marker_pause
+                write_new(lexical_absolute(pause_ready), b"0 0\n")
+                pause_deadline = time.monotonic() + 180.0
+                while True:
+                    try:
+                        release_data, _release_size, _release_digest = (
+                            stable_file_facts(
+                                lexical_absolute(pause_release), max_bytes=64
+                            )
+                        )
+                    except (EvidenceError, FileNotFoundError):
+                        release_data = b""
+                    if release_data:
+                        break
+                    if time.monotonic() >= pause_deadline:
+                        raise EvidenceError(
+                            "marker-link pause release timed out"
+                        )
+                    time.sleep(0.005)
             try:
                 os.link(
                     decision_absolute.name,
@@ -2101,13 +2129,41 @@ def _run_supervised_impl(
             raise EvidenceError("injected stderr drainer start failure")
         err_thread.start()
         err_thread_started = True
-        child_handle = admit_stopped_session_leader_until(
-            proc.pid,
-            supervisor_pid,
-            setup_deadline,
-            gate_ready_descriptor=gate_ready_read,
-            cancelled=lambda: cancel_signal is not None,
-        )
+        admission_fd_hoard: list[int] = []
+        admission_fd_limit: tuple[int, int] | None = None
+        if test_fault_point == "admission_fd_exhaustion":
+            # Real resource exhaustion behind a planted trigger: clamp the soft
+            # descriptor limit onto the live table and hoard the remainder, so
+            # the admission /proc and pidfd binds hit genuine kernel EMFILE.
+            # The clamp and hoard are both released before terminal publication
+            # needs descriptors again.
+            admission_fd_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+            probe_descriptor = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+            admission_fd_hoard.append(probe_descriptor)
+            resource.setrlimit(
+                resource.RLIMIT_NOFILE,
+                (probe_descriptor + 4, admission_fd_limit[1]),
+            )
+            try:
+                while True:
+                    admission_fd_hoard.append(
+                        os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+                    )
+            except OSError:
+                pass
+        try:
+            child_handle = admit_stopped_session_leader_until(
+                proc.pid,
+                supervisor_pid,
+                setup_deadline,
+                gate_ready_descriptor=gate_ready_read,
+                cancelled=lambda: cancel_signal is not None,
+            )
+        finally:
+            if admission_fd_limit is not None:
+                resource.setrlimit(resource.RLIMIT_NOFILE, admission_fd_limit)
+            while admission_fd_hoard:
+                os.close(admission_fd_hoard.pop())
         known_descendants[proc.pid] = child_handle
         os.close(gate_ready_read)
         gate_ready_read = None
@@ -5295,6 +5351,17 @@ def validate_supervisor_object(
                     raise EvidenceError(
                         f"{path}:{record_number}: planted thread fault lacks effect"
                     )
+            if fault_point == "admission_fd_exhaustion" and (
+                value["classification"] != "internal_fault"
+                or value["reason_code"] != "supervisor_or_capture_failure"
+                or value["phase_timing"]["execution_start_ns"] is not None
+                or not any(
+                    "Too many open files" in error for error in value["errors"]
+                )
+            ):
+                raise EvidenceError(
+                    f"{path}:{record_number}: planted descriptor exhaustion lacks effect"
+                )
     expected_wrapper = {
         "pass": 0,
         "fail": 1,
@@ -7189,6 +7256,7 @@ def complete_bundle(
     vendor_path: str | None = None,
     restore_signal_state: bool = True,
     test_fail_after_link: bool = False,
+    test_marker_pause: tuple[Path, Path] | None = None,
 ) -> dict[str, Any]:
     art_dir = lexical_absolute(art_dir)
     manifest_path = require_exact_artifact_path(
@@ -7299,6 +7367,7 @@ def complete_bundle(
         decision_path=output.with_name("bundle.decision"),
         restore_signal_state=restore_signal_state,
         test_fail_after_link=test_fail_after_link,
+        test_marker_pause=test_marker_pause,
     )
     return marker
 
@@ -7355,6 +7424,13 @@ def validate_bundle(
     digest_path: Path,
     commit_path: Path,
 ) -> dict[str, Any]:
+    """Side-effect-free bundle validation: reads, verifies, and reports only.
+
+    Validation never creates, links, or syncs anything. A winning decision
+    whose publisher died before the canonical marker link is recovered only by
+    the explicitly named adoption operation (`adopt_bundle`); validation of
+    such a bundle fails typed until adoption has run.
+    """
     art_dir = lexical_absolute(art_dir)
     manifest_path = require_exact_artifact_path(
         manifest_path, art_dir, "manifest.json", label="manifest"
@@ -7377,6 +7453,81 @@ def validate_bundle(
     decision_path = art_dir / "bundle.decision"
     decision_marker = read_json_object(decision_path)
     validate_marker_bindings(decision_marker, manifest, terminal, bindings)
+    decision_data, _size, _digest = stable_file_facts(decision_path)
+    try:
+        commit_data, _size, _digest = stable_file_facts(commit_path)
+    except FileNotFoundError:
+        raise EvidenceError(
+            "bundle commit marker is absent; a winning decision is recovered "
+            "only by the named adoption operation"
+        ) from None
+    if not hmac.compare_digest(decision_data, commit_data):
+        raise EvidenceError("bundle marker does not match its commit decision")
+    marker = read_json_object(commit_path)
+    validate_marker_bindings(
+        marker,
+        manifest,
+        terminal,
+        bindings,
+    )
+    return {
+        "schema": "fln.bundle-validation/1",
+        "valid": True,
+        "committed": True,
+        "run_id": marker["run_id"],
+        "verdict": marker["verdict"],
+        "process_exit": marker["process_exit"],
+        "commit_sha256": sha256_file(commit_path),
+    }
+
+
+def adopt_bundle(
+    art_dir: Path,
+    manifest_path: Path,
+    digest_path: Path,
+    commit_path: Path,
+) -> dict[str, Any]:
+    """The explicitly named adoption operation (Design: validate/adopt split).
+
+    A publisher can die after its bundle decision wins but before the canonical
+    marker link or its durable ordering. Adoption recovers exactly that state:
+    it verifies the winning decision against the manifested run, publishes the
+    canonical marker exclusively as a hard link of the decision, fsyncs through
+    the artifact-directory ancestry, durably orders every manifested artifact,
+    and finishes with the full side-effect-free revalidation. Concurrent
+    adoption is idempotent — the link either publishes the single canonical
+    name or observes it already present — and an empty decision, claimed by
+    cancellation, is refused typed: cancellation can never be adopted as pass.
+    """
+    art_dir = lexical_absolute(art_dir)
+    manifest_path = require_exact_artifact_path(
+        manifest_path, art_dir, "manifest.json", label="manifest"
+    )
+    digest_path = require_exact_artifact_path(
+        digest_path, art_dir, "manifest.digest", label="manifest digest"
+    )
+    commit_path = require_exact_artifact_path(
+        commit_path, art_dir, "bundle.complete.json", label="bundle commit"
+    )
+    run_log = art_dir / "run.ndjson"
+    decision_path = art_dir / "bundle.decision"
+    _decision_data, decision_size, _decision_digest = stable_file_facts(
+        decision_path
+    )
+    if decision_size == 0:
+        raise EvidenceError(
+            "cancellation claimed the bundle decision; adoption refused"
+        )
+    validate_manifest(art_dir, manifest_path, digest_path, live_context=False)
+    manifest = read_json_object(manifest_path)
+    terminal = load_ndjson(run_log)[-1]
+    bindings = (
+        sha256_file(run_log),
+        sha256_file(manifest_path),
+        sha256_file(digest_path),
+    )
+    decision_marker = read_json_object(decision_path)
+    validate_marker_bindings(decision_marker, manifest, terminal, bindings)
     _parent, parent_fd = open_directory_nofollow(art_dir, create=False)
     try:
         try:
@@ -7392,53 +7543,10 @@ def validate_bundle(
         os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
-    decision_data, _size, _digest = stable_file_facts(decision_path)
-    commit_data, _size, _digest = stable_file_facts(commit_path)
-    if not hmac.compare_digest(decision_data, commit_data):
-        raise EvidenceError("bundle marker does not match its commit decision")
-    marker = read_json_object(commit_path)
-    validate_marker_bindings(
-        marker,
-        manifest,
-        terminal,
-        bindings,
-    )
-    # A publisher can die after the commit decision wins but before the canonical
-    # marker link/fsync. A validator recovers that marker, durably orders the whole
-    # bundle, and revalidates the adopted bytes before reporting commitment.
     durably_sync_manifested_bundle(
         art_dir, manifest_path, digest_path, commit_path=commit_path
     )
-    validate_manifest(art_dir, manifest_path, digest_path, live_context=False)
-    manifest = read_json_object(manifest_path)
-    decision_marker = read_json_object(decision_path)
-    marker = read_json_object(commit_path)
-    terminal = load_ndjson(run_log)[-1]
-    bindings = (
-        sha256_file(run_log),
-        sha256_file(manifest_path),
-        sha256_file(digest_path),
-    )
-    validate_marker_bindings(decision_marker, manifest, terminal, bindings)
-    validate_marker_bindings(
-        marker,
-        manifest,
-        terminal,
-        bindings,
-    )
-    decision_data, _size, _digest = stable_file_facts(decision_path)
-    commit_data, _size, _digest = stable_file_facts(commit_path)
-    if not hmac.compare_digest(decision_data, commit_data):
-        raise EvidenceError("durable bundle marker changed from its commit decision")
-    return {
-        "schema": "fln.bundle-validation/1",
-        "valid": True,
-        "committed": True,
-        "run_id": marker["run_id"],
-        "verdict": marker["verdict"],
-        "process_exit": marker["process_exit"],
-        "commit_sha256": sha256_file(commit_path),
-    }
+    return validate_bundle(art_dir, manifest_path, digest_path, commit_path)
 
 
 def add_fields(record: dict[str, Any], args: argparse.Namespace) -> None:
@@ -8235,6 +8343,10 @@ def cmd_validate_manifest(args: argparse.Namespace) -> int:
 
 
 def cmd_complete_bundle(args: argparse.Namespace) -> int:
+    if bool(args.test_marker_pause_ready) != bool(args.test_marker_pause_release):
+        raise EvidenceError(
+            "marker-link pause requires both its readiness and release paths"
+        )
     complete_bundle(
         Path(args.art_dir),
         Path(args.manifest),
@@ -8247,6 +8359,11 @@ def cmd_complete_bundle(args: argparse.Namespace) -> int:
         vendor_path=args.vendor_path,
         restore_signal_state=False,
         test_fail_after_link=args.test_fail_after_link,
+        test_marker_pause=(
+            (Path(args.test_marker_pause_ready), Path(args.test_marker_pause_release))
+            if args.test_marker_pause_ready
+            else None
+        ),
     )
     return PASS
 
@@ -8271,6 +8388,33 @@ def cmd_validate_bundle(args: argparse.Namespace) -> int:
             )
         require_within(
             Path(args.output), Path(args.artifact_root), label="bundle validation"
+        )
+        write_new(Path(args.output), canonical_json(report))
+    else:
+        sys.stdout.buffer.write(canonical_json(report))
+    return PASS
+
+
+def cmd_adopt_bundle(args: argparse.Namespace) -> int:
+    report = adopt_bundle(
+        Path(args.art_dir),
+        Path(args.manifest),
+        Path(args.digest),
+        Path(args.commit),
+    )
+    if args.output:
+        output = lexical_absolute(Path(args.output))
+        art_dir = lexical_absolute(Path(args.art_dir))
+        try:
+            output.relative_to(art_dir)
+        except ValueError:
+            pass
+        else:
+            raise EvidenceError(
+                "bundle adoption output cannot mutate the committed bundle"
+            )
+        require_within(
+            Path(args.output), Path(args.artifact_root), label="bundle adoption"
         )
         write_new(Path(args.output), canonical_json(report))
     else:
@@ -8308,6 +8452,15 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     # nested stage, CI). The process exits at the end of the command, so no
     # restore is needed.
     enable_child_subreaper()
+    # Launcher-independence for the signal-boundary campaign: a detached
+    # launcher (nohup, shell background jobs) hands this process SIG_IGN
+    # dispositions for HUP/INT, every probe shell inherits them, and POSIX
+    # forbids a non-interactive shell from trapping a signal that was ignored
+    # at entry — the finalizer probes would then never observe their signals.
+    # The self-test owns its probe domain, so it pins the watched dispositions
+    # to default before spawning anything.
+    for owned_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(owned_signal, signal.SIG_DFL)
     cases: list[dict[str, Any]] = []
     require(
         GUARDIAN_LAUNCH_RELEASE_TIMEOUT_MS > MAX_PROCESS_IDENTITY_WAIT_MS * 3,
@@ -8402,8 +8555,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     ) -> dict[str, Any]:
         repo = Path(__file__).resolve().parent.parent
         check_script = repo / "scripts" / "check.sh"
-        probe_root = art_dir / f"shell_finalizer_{point}"
+        probe_signal_name = signal.Signals(signal_number).name.lower()
+        probe_root = art_dir / f"shell_finalizer_{point}_{probe_signal_name}"
         control_root = Path(f"{probe_root}.control")
+        # The three post-terminal points run the real finalization pipeline
+        # before their checkpoint; the entry points die at the first finalizer.
+        deep_pipeline = point in {"decision_write", "marker_link", "post_decision"}
         require(
             not probe_root.exists()
             and not probe_root.is_symlink()
@@ -8457,7 +8614,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 raise EvidenceError(f"finalizer probe shell was not bindable: {point}")
 
             ready_path = control_root / "ready"
-            ready_timeout_s = 180.0 if point == "post_decision" else 60.0
+            ready_timeout_s = 180.0 if deep_pipeline else 60.0
             deadline = time.monotonic() + ready_timeout_s
             ready_values: tuple[int, int] | None = None
             while time.monotonic() < deadline:
@@ -8481,10 +8638,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             if ready_values is None:
                 raise EvidenceError(f"finalizer probe readiness timed out: {point}")
             finalizer_pid, finalizer_ticks = ready_values
-            if point == "post_decision":
+            if deep_pipeline:
                 require(
                     ready_values == (0, 0),
-                    "post-decision probe unexpectedly retained an active finalizer",
+                    f"{point} probe unexpectedly retained an active finalizer",
                 )
             else:
                 require(finalizer_pid > 1, f"invalid finalizer probe PID: {point}")
@@ -8527,7 +8684,9 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 signal_process_handle(child.pid, child_handle, signal_number),
                 f"finalizer probe shell disappeared before signal: {point}",
             )
-            if point == "post_decision":
+            if point in {"post_decision", "marker_link"}:
+                # The decision has already been linked, so the signal must lose:
+                # the shell acknowledges it and the committed bundle survives.
                 ack_path = control_root / "signal-ack"
                 expected_ack = signal.Signals(signal_number).name.removeprefix(
                     "SIG"
@@ -8546,11 +8705,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                     time.sleep(0.005)
                 else:
                     raise EvidenceError(
-                        "post-decision signal was not acknowledged correctly"
+                        f"{point} signal was not acknowledged correctly"
                     )
                 write_new(control_root / "release", b"release\n")
 
-            communicate_timeout_s = 180 if point == "post_decision" else 120
+            communicate_timeout_s = 180 if deep_pipeline else 120
             _stdout, stderr = child.communicate(timeout=communicate_timeout_s)
             require(
                 child.returncode == expected_exit,
@@ -8564,7 +8723,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                     decision == b"",
                     f"pre-decision finalizer probe crossed its decision: {point}",
                 )
-            if point in {"spawn_bind", "active_wait"}:
+            if point in {"spawn_bind", "active_wait", "decision_write"}:
                 require(
                     b"CANCELLED: signal_" in stderr,
                     f"finalizer cancellation lacked its terminal reason: {point}",
@@ -8630,7 +8789,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 os.close(child_handle[1])
             reap_adopted_children()
         return {
-            "case": f"shell_finalizer_{point}",
+            "case": f"shell_finalizer_{point}_{probe_signal_name}",
             "ok": True,
             "signal": signal.Signals(signal_number).name,
             "process_exit": expected_exit,
@@ -9217,6 +9376,387 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 "metadata": str(terminal_root / "stage.meta.json"),
             }
         )
+
+    # --- HUP/INT/TERM boundary-injection campaign, runner-side boundaries
+    # (bead fln-evidence-runner-bootstrap-btk). Spawn: the signal is queued
+    # against the guardian while its launch gate still holds every watched
+    # signal blocked, so cancellation deterministically wins before the
+    # stopped child can be admitted. Readiness: the signal lands inside the
+    # deliberately widened window between readiness publication and the
+    # private release, so cancellation wins before exec. Running: the signal
+    # lands only after the released target has published its own PID. The
+    # terminal-publication boundary is the terminal_commit_* matrix above;
+    # the finalizer-side boundaries (finalizer entry, decision write, marker
+    # link, post-fsync) are the shell finalizer probes below. In every
+    # pre-release case the target argv must never execute.
+    for boundary in ("spawn", "readiness", "running"):
+        for boundary_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            signal_name = signal.Signals(boundary_signal).name
+            case_name = f"boundary_{boundary}_{signal_name.lower()}"
+            boundary_root = case_dir(case_name)
+            boundary_marker = boundary_root / "target-executed.marker"
+            boundary_ready = boundary_root / "stage.ready.json"
+            launch_ready = boundary_root / "launch.ready.json"
+            launch_release = boundary_root / "launch.release.json"
+            boundary_pid_file = boundary_root / "target.pid"
+            if boundary == "running":
+                boundary_program = (
+                    "import os,pathlib,time;"
+                    f"pathlib.Path({str(boundary_marker)!r}).write_text('executed');"
+                    f"pathlib.Path({str(boundary_pid_file)!r})"
+                    ".write_text(str(os.getpid()));"
+                    "time.sleep(60)"
+                )
+            else:
+                boundary_program = (
+                    "import pathlib;"
+                    f"pathlib.Path({str(boundary_marker)!r}).write_text('executed')"
+                )
+            boundary_argv = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "run",
+                "--cwd",
+                str(art_dir),
+                "--metadata",
+                str(boundary_root / "stage.meta.json"),
+                "--stdout",
+                str(boundary_root / "stage.out"),
+                "--stderr",
+                str(boundary_root / "stage.err"),
+                "--readiness",
+                str(boundary_ready),
+                "--artifact-root",
+                str(art_dir),
+                "--capture-bytes",
+                "4096",
+                "--output-budget-bytes",
+                "65536",
+                "--timeout-ms",
+                "30000",
+                "--grace-ms",
+                "500",
+                "--stage-id",
+                case_name,
+            ]
+            if boundary == "spawn":
+                # The stop delay widens the spawn-to-admission window so the
+                # queued signal always wins during admission even under
+                # pathological scheduling of the guardian's forwarder.
+                boundary_argv += [
+                    "--launch-ready",
+                    str(launch_ready),
+                    "--launch-release",
+                    str(launch_release),
+                    "--planted",
+                    "--test-before-stop-delay-ms",
+                    "1500",
+                ]
+            elif boundary == "readiness":
+                boundary_argv += [
+                    "--planted",
+                    "--test-before-release-delay-ms",
+                    "2000",
+                ]
+            boundary_argv += ["--", sys.executable, "-c", boundary_program]
+            boundary_wrapper = subprocess.Popen(
+                boundary_argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            boundary_deadline = time.monotonic() + 15
+            if boundary == "spawn":
+                launch_identity: dict[str, Any] | None = None
+                while time.monotonic() < boundary_deadline:
+                    if boundary_wrapper.poll() is not None:
+                        break
+                    try:
+                        launch_identity = read_json_object(launch_ready)
+                        break
+                    except (EvidenceError, FileNotFoundError, OSError):
+                        time.sleep(0.01)
+                require(
+                    launch_identity is not None
+                    and launch_identity.get("status") == "awaiting_release"
+                    and launch_identity.get("guardian_pid")
+                    == boundary_wrapper.pid,
+                    f"{case_name}: guardian launch readiness was not bound",
+                )
+                # W is our unreaped direct child, so this delivery cannot touch
+                # a recycled PID; the guardian holds every watched signal
+                # blocked until after its launch release, so the signal is
+                # queued ahead of the spawn boundary.
+                boundary_wrapper.send_signal(boundary_signal)
+                release_payload = dict(launch_identity)
+                release_payload["status"] = "released"
+                write_atomic_new(
+                    launch_release, canonical_json(release_payload)
+                )
+            else:
+                waited_paths = [boundary_ready]
+                if boundary == "running":
+                    waited_paths.append(boundary_pid_file)
+                while (
+                    not all(path.exists() for path in waited_paths)
+                    and boundary_wrapper.poll() is None
+                    and time.monotonic() < boundary_deadline
+                ):
+                    time.sleep(0.01)
+                require(
+                    all(path.exists() for path in waited_paths),
+                    f"{case_name}: the {boundary} boundary was never reached",
+                )
+                ready_object = read_json_object(boundary_ready)
+                require(
+                    ready_object.get("status") == "ready",
+                    f"{case_name}: readiness was not the admitted-child form",
+                )
+                boundary_wrapper.send_signal(boundary_signal)
+            _boundary_out, boundary_err = boundary_wrapper.communicate(
+                timeout=30
+            )
+            require(
+                boundary_wrapper.returncode == CANCELLED,
+                f"{case_name}: wrapper exit {boundary_wrapper.returncode}: "
+                f"{boundary_err[-500:]!r}",
+            )
+            boundary_meta = read_json_object(
+                boundary_root / "stage.meta.json"
+            )
+            validate_supervisor_object(
+                boundary_root / "stage.meta.json",
+                1,
+                boundary_meta,
+                expected_stage_id=case_name,
+            )
+            require(
+                boundary_meta["classification"] == "cancelled"
+                and boundary_meta["reason_code"] == f"signal_{signal_name}"
+                and hmac.compare_digest(
+                    str(boundary_meta["cancel_signal"]), signal_name
+                ),
+                f"{case_name}: cancellation was not typed to its boundary signal",
+            )
+            if boundary == "running":
+                require(
+                    boundary_marker.exists(),
+                    f"{case_name}: released target never reached execution",
+                )
+                boundary_pid = int(
+                    boundary_pid_file.read_text(encoding="ascii")
+                )
+                require(
+                    boundary_pid > 1 and not process_alive(boundary_pid),
+                    f"{case_name}: cancellation left the target alive",
+                )
+            else:
+                require(
+                    not boundary_marker.exists(),
+                    f"{case_name}: target executed across a {boundary}-boundary "
+                    "cancellation",
+                )
+            if boundary == "spawn":
+                spawn_ready_object = read_json_object(boundary_ready)
+                require(
+                    spawn_ready_object.get("status") == "setup_cancelled",
+                    f"{case_name}: spawn-boundary readiness was not typed "
+                    "setup_cancelled",
+                )
+            cases.append(
+                {
+                    "case": case_name,
+                    "ok": True,
+                    "metadata": str(boundary_root / "stage.meta.json"),
+                }
+            )
+
+    # --- named stress gaps (bead fln-evidence-runner-bootstrap-btk): real
+    # descriptor exhaustion at admission, cancellation storms, and PID
+    # allocation churn under live supervision. Forced same-PID reuse needs
+    # namespace privileges the no-mock lane does not hold; reuse safety is
+    # carried by the identity-refusal cases (emergency_kill_rejects_unrelated,
+    # bound_group_stale_identity, direct_child_cleanup_identity) plus the
+    # allocation churn here, and by the unreaped-direct-child law.
+    rc, meta, exhaustion_root = run_case(
+        "admission_fd_exhaustion",
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        setup_timeout=10_000,
+        fault_point="admission_fd_exhaustion",
+    )
+    require(rc == SETUP_FAILURE, "descriptor exhaustion changed the exit law")
+    require(
+        meta["classification"] == "internal_fault"
+        and meta["reason_code"] == "supervisor_or_capture_failure"
+        and any("Too many open files" in error for error in meta["errors"])
+        and meta["phase_timing"]["execution_start_ns"] is None,
+        "descriptor exhaustion was not a typed contained setup fault",
+    )
+    cases.append(
+        {
+            "case": "admission_fd_exhaustion",
+            "ok": True,
+            "metadata": str(exhaustion_root / "stage.meta.json"),
+        }
+    )
+
+    def run_cancellation_storm(
+        name: str,
+        wrapper_count: int,
+        churn_processes: int = 0,
+    ) -> None:
+        storm_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        churners: list[subprocess.Popen[bytes]] = []
+        wrappers: list[tuple[str, subprocess.Popen[bytes], Path, Path]] = []
+        surviving_targets: list[tuple[str, int]] = []
+        churn_program = (
+            "import os\n"
+            "while True:\n"
+            "    pid = os.fork()\n"
+            "    if pid == 0:\n"
+            "        os._exit(0)\n"
+            "    os.waitpid(pid, 0)\n"
+        )
+        try:
+            for _ in range(churn_processes):
+                churners.append(
+                    subprocess.Popen(
+                        [sys.executable, "-c", churn_program],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                )
+            for index in range(wrapper_count):
+                member = f"{name}_{index}"
+                member_root = case_dir(member)
+                member_pid_file = member_root / "target.pid"
+                member_program = (
+                    "import os,pathlib,time;"
+                    f"pathlib.Path({str(member_pid_file)!r})"
+                    ".write_text(str(os.getpid()));"
+                    "time.sleep(60)"
+                )
+                wrappers.append(
+                    (
+                        member,
+                        subprocess.Popen(
+                            [
+                                sys.executable,
+                                str(Path(__file__).resolve()),
+                                "run",
+                                "--cwd",
+                                str(art_dir),
+                                "--metadata",
+                                str(member_root / "stage.meta.json"),
+                                "--stdout",
+                                str(member_root / "stage.out"),
+                                "--stderr",
+                                str(member_root / "stage.err"),
+                                "--readiness",
+                                str(member_root / "stage.ready.json"),
+                                "--artifact-root",
+                                str(art_dir),
+                                "--capture-bytes",
+                                "4096",
+                                "--output-budget-bytes",
+                                "65536",
+                                "--timeout-ms",
+                                "30000",
+                                "--grace-ms",
+                                "500",
+                                "--stage-id",
+                                member,
+                                "--",
+                                sys.executable,
+                                "-c",
+                                member_program,
+                            ],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                        ),
+                        member_root,
+                        member_pid_file,
+                    )
+                )
+            storm_deadline = time.monotonic() + 20
+            for member, wrapper, member_root, member_pid_file in wrappers:
+                while (
+                    not (
+                        member_pid_file.exists()
+                        and (member_root / "stage.ready.json").exists()
+                    )
+                    and wrapper.poll() is None
+                    and time.monotonic() < storm_deadline
+                ):
+                    time.sleep(0.01)
+                require(
+                    member_pid_file.exists()
+                    and (member_root / "stage.ready.json").exists(),
+                    f"{member}: storm target never became stormable",
+                )
+            # The storm proper: twenty rapid rounds of alternating watched
+            # signals against every wrapper, with no pacing between rounds.
+            for round_index in range(20):
+                for _member, wrapper, _member_root, _member_pid_file in wrappers:
+                    if wrapper.poll() is None:
+                        wrapper.send_signal(
+                            storm_signals[round_index % len(storm_signals)]
+                        )
+            for member, wrapper, member_root, member_pid_file in wrappers:
+                _storm_out, storm_err = wrapper.communicate(timeout=60)
+                require(
+                    wrapper.returncode == CANCELLED,
+                    f"{member}: storm wrapper exit {wrapper.returncode}: "
+                    f"{storm_err[-300:]!r}",
+                )
+                storm_meta = read_json_object(member_root / "stage.meta.json")
+                validate_supervisor_object(
+                    member_root / "stage.meta.json",
+                    1,
+                    storm_meta,
+                    expected_stage_id=member,
+                )
+                require(
+                    storm_meta["classification"] == "cancelled"
+                    and storm_meta["cancel_signal"]
+                    in {"SIGHUP", "SIGINT", "SIGTERM"}
+                    and storm_meta["reason_code"]
+                    == f"signal_{storm_meta['cancel_signal']}",
+                    f"{member}: storm cancellation lost its typed terminal",
+                )
+                surviving_targets.append(
+                    (
+                        member,
+                        int(member_pid_file.read_text(encoding="ascii")),
+                    )
+                )
+        finally:
+            for _member, wrapper, _member_root, _member_pid_file in wrappers:
+                if wrapper.poll() is None:
+                    wrapper.kill()
+                    wrapper.communicate(timeout=10)
+            for churner in churners:
+                churner.kill()
+                churner.communicate(timeout=10)
+            reap_adopted_children()
+        # Liveness is asserted only after every churner is dead, so a recycled
+        # target PID cannot alias a live churn child.
+        for member, storm_pid in surviving_targets:
+            require(
+                storm_pid > 1 and not process_alive(storm_pid),
+                f"{member}: storm left the target alive",
+            )
+        cases.append(
+            {
+                "case": name,
+                "ok": True,
+                "wrappers": wrapper_count,
+                "churners": churn_processes,
+            }
+        )
+
+    run_cancellation_storm("cancellation_storm", 1)
+    run_cancellation_storm("concurrent_cancellation_storm", 6)
+    run_cancellation_storm("pid_churn_storm", 4, churn_processes=4)
 
     emergency_root = case_dir("emergency_kill_detached")
     emergency_pid_file = emergency_root / "pids.txt"
@@ -10011,36 +10551,67 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         }
     )
 
-    cases.append(
-        run_shell_finalizer_probe(
-            "spawn_bind",
-            signal.SIGHUP,
-            129,
-            expect_committed_bundle=False,
+    # The complete finalizer-side boundary matrix (bead
+    # fln-evidence-runner-bootstrap-btk): every watched signal at every named
+    # post-terminal boundary. Before the bundle decision (finalizer entry via
+    # spawn_bind/active_wait, and decision_write immediately before the
+    # publisher spawns) the signal must win: typed cancellation, an empty
+    # claimed decision, and no committed bundle. From the linked decision
+    # onward (marker_link holds the decision-to-marker window open,
+    # post_decision fires after the durable commit) the signal must lose: the
+    # committed bundle survives and validates. helper_failure exercises the
+    # cleanup-uncertainty dimension of finalizer entry.
+    for probe_signal, probe_exit in (
+        (signal.SIGHUP, 129),
+        (signal.SIGINT, 130),
+        (signal.SIGTERM, 143),
+    ):
+        cases.append(
+            run_shell_finalizer_probe(
+                "spawn_bind",
+                probe_signal,
+                probe_exit,
+                expect_committed_bundle=False,
+            )
         )
-    )
-    cases.append(
-        run_shell_finalizer_probe(
-            "active_wait",
-            signal.SIGINT,
-            130,
-            expect_committed_bundle=False,
+        cases.append(
+            run_shell_finalizer_probe(
+                "active_wait",
+                probe_signal,
+                probe_exit,
+                expect_committed_bundle=False,
+            )
         )
-    )
+        cases.append(
+            run_shell_finalizer_probe(
+                "decision_write",
+                probe_signal,
+                probe_exit,
+                expect_committed_bundle=False,
+            )
+        )
+        cases.append(
+            run_shell_finalizer_probe(
+                "marker_link",
+                probe_signal,
+                PASS,
+                expect_committed_bundle=True,
+            )
+        )
+        cases.append(
+            run_shell_finalizer_probe(
+                "post_decision",
+                probe_signal,
+                PASS,
+                expect_committed_bundle=True,
+            )
+        )
     cases.append(
         run_shell_finalizer_probe(
             "helper_failure",
             signal.SIGTERM,
             SETUP_FAILURE,
             expect_committed_bundle=False,
-        )
-    )
-    cases.append(
-        run_shell_finalizer_probe(
-            "post_decision",
-            signal.SIGTERM,
-            PASS,
-            expect_committed_bundle=True,
         )
     )
 
@@ -11280,15 +11851,71 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         and not (manifest_root / "bundle.complete.json").exists(),
         "bundle link fault did not exercise the recovery window",
     )
+    # Validation is side-effect-free: on a winning decision whose marker was
+    # never linked it must fail typed and must not create the marker itself.
+    try:
+        validate_bundle(
+            manifest_root,
+            manifest_root / "manifest.json",
+            manifest_root / "manifest.digest",
+            manifest_root / "bundle.complete.json",
+        )
+    except EvidenceError as error:
+        require(
+            "named adoption operation" in str(error),
+            "pre-marker validation produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("pre-marker bundle validation reported commitment")
+    require(
+        not (manifest_root / "bundle.complete.json").exists(),
+        "side-effect-free validation created the bundle marker",
+    )
+    # Concurrent adoption is idempotent: both adopters must succeed and agree
+    # on the single canonical marker recovered from the winning decision.
+    adoption_results: list[str] = []
+
+    def race_adopter(label: str) -> None:
+        try:
+            adopt_bundle(
+                manifest_root,
+                manifest_root / "manifest.json",
+                manifest_root / "manifest.digest",
+                manifest_root / "bundle.complete.json",
+            )
+            adoption_results.append(f"{label}:adopted")
+        except EvidenceError as adopt_error:
+            adoption_results.append(f"{label}:{adopt_error}")
+
+    first_adopter = threading.Thread(target=race_adopter, args=("first",))
+    second_adopter = threading.Thread(target=race_adopter, args=("second",))
+    first_adopter.start()
+    second_adopter.start()
+    first_adopter.join()
+    second_adopter.join()
+    require(
+        sorted(adoption_results) == ["first:adopted", "second:adopted"],
+        f"concurrent adoption was not idempotent: {adoption_results}",
+    )
+    require(
+        (manifest_root / "bundle.complete.json").exists(),
+        "adoption did not recover the winning decision",
+    )
+    adopted_marker, _adopted_size, _adopted_digest = stable_file_facts(
+        manifest_root / "bundle.complete.json"
+    )
+    winning_decision, _winning_size, _winning_digest = stable_file_facts(
+        manifest_root / "bundle.decision"
+    )
+    require(
+        hmac.compare_digest(adopted_marker, winning_decision),
+        "adopted marker disagrees with the winning decision",
+    )
     validate_bundle(
         manifest_root,
         manifest_root / "manifest.json",
         manifest_root / "manifest.digest",
         manifest_root / "bundle.complete.json",
-    )
-    require(
-        (manifest_root / "bundle.complete.json").exists(),
-        "bundle validation did not recover the winning decision",
     )
     validate_bundle(
         relative_manifest_root,
@@ -11385,6 +12012,26 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     require(
         not cancellation_marker.exists(),
         "cancelled bundle decision still published a commit marker",
+    )
+    # Cancellation can never be adopted as pass: the named adoption operation
+    # must refuse the empty claimed decision and must not create the marker.
+    try:
+        adopt_bundle(
+            cancellation_root,
+            cancellation_root / "manifest.json",
+            cancellation_root / "manifest.digest",
+            cancellation_marker,
+        )
+    except EvidenceError as error:
+        require(
+            "adoption refused" in str(error),
+            "cancelled-decision adoption produced the wrong failure",
+        )
+    else:
+        raise EvidenceError("cancellation was adopted as a committed bundle")
+    require(
+        not cancellation_marker.exists(),
+        "refused adoption still published a commit marker",
     )
     cases.append({"case": "bundle_decision_cancellation", "ok": True})
 
@@ -11994,10 +12641,12 @@ def build_parser() -> argparse.ArgumentParser:
     complete_parser.add_argument("--inventory")
     complete_parser.add_argument("--vendor-path")
     complete_parser.add_argument("--test-fail-after-link", action="store_true")
+    complete_parser.add_argument("--test-marker-pause-ready")
+    complete_parser.add_argument("--test-marker-pause-release")
     complete_parser.set_defaults(func=cmd_complete_bundle)
 
     bundle_validation = subparsers.add_parser(
-        "validate-bundle", help="verify a committed evidence bundle"
+        "validate-bundle", help="verify a committed evidence bundle (read-only)"
     )
     bundle_validation.add_argument("--art-dir", required=True)
     bundle_validation.add_argument("--manifest", required=True)
@@ -12006,6 +12655,18 @@ def build_parser() -> argparse.ArgumentParser:
     bundle_validation.add_argument("--artifact-root", required=True)
     bundle_validation.add_argument("--output")
     bundle_validation.set_defaults(func=cmd_validate_bundle)
+
+    bundle_adoption = subparsers.add_parser(
+        "adopt-bundle",
+        help="recover a winning pre-marker bundle decision, then revalidate",
+    )
+    bundle_adoption.add_argument("--art-dir", required=True)
+    bundle_adoption.add_argument("--manifest", required=True)
+    bundle_adoption.add_argument("--digest", required=True)
+    bundle_adoption.add_argument("--commit", required=True)
+    bundle_adoption.add_argument("--artifact-root", required=True)
+    bundle_adoption.add_argument("--output")
+    bundle_adoption.set_defaults(func=cmd_adopt_bundle)
 
     self_test_parser = subparsers.add_parser(
         "self-test", help="exercise capture, cancellation, exhaustion, and validation"

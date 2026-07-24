@@ -57,7 +57,7 @@ PLANT="${FLN_CHECK_PLANT:-}"
 FINALIZER_TEST_POINT="${FLN_FINALIZER_TEST_POINT:-}"
 if [ "$FINALIZER_PROBE" -eq 1 ]; then
   case "$FINALIZER_TEST_POINT" in
-    spawn_bind|active_wait|helper_failure|post_decision) ;;
+    spawn_bind|active_wait|helper_failure|decision_write|marker_link|post_decision) ;;
     *) echo "invalid finalizer probe point: $FINALIZER_TEST_POINT" >&2; exit 2 ;;
   esac
   PROFILE=finalizer-self-test
@@ -612,6 +612,7 @@ abort_if_finalizer_signalled() {
 # shellcheck disable=SC2317
 on_exit() {
   local observed_rc="$1" final_root="unavailable" publish_rc=0 hash_rc=0
+  local -a MARKER_PAUSE_ARGS=()
   trap 'on_finalizer_signal HUP 129' HUP
   trap 'on_finalizer_signal INT 130' INT
   trap 'on_finalizer_signal TERM 143' TERM
@@ -676,18 +677,35 @@ on_exit() {
     abort_if_finalizer_signalled
   fi
   if [ "$publish_rc" -eq 0 ]; then
+    # A signal at this checkpoint precedes the bundle decision, so cancellation
+    # must win and the publisher below must never link a decision.
+    if ! finalizer_test_checkpoint decision_write; then publish_rc=2; fi
+    abort_if_finalizer_signalled
+  fi
+  if [ "$publish_rc" -eq 0 ]; then
+    MARKER_PAUSE_ARGS=()
+    if [ "$FINALIZER_PROBE" -eq 1 ] && [ "$FINALIZER_TEST_POINT" = marker_link ]; then
+      # Hold the decision-to-marker window open so the probe can deliver a
+      # signal that must lose against the already-linked decision.
+      MARKER_PAUSE_ARGS=(
+        --test-marker-pause-ready "$FINALIZER_TEST_READY"
+        --test-marker-pause-release "$FINALIZER_TEST_RELEASE"
+      )
+    fi
     run_finalizer_command python3 "$EVIDENCE" complete-bundle --art-dir "$ART_DIR" \
       --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
       --output "$ART_DIR/bundle.complete.json" --governed-root "$GOVERNED_ROOT" \
       "${GOVERNED_ARGS[@]}" --expected-root "$final_root" \
-      "${BUNDLE_CONTEXT_ARGS[@]}" || true
+      "${BUNDLE_CONTEXT_ARGS[@]}" "${MARKER_PAUSE_ARGS[@]}" || true
     if ! finalizer_test_checkpoint post_decision; then publish_rc=2; fi
-    if run_finalizer_command python3 "$EVIDENCE" validate-bundle --art-dir "$ART_DIR" \
+    if run_finalizer_command python3 "$EVIDENCE" adopt-bundle --art-dir "$ART_DIR" \
         --manifest "$ART_DIR/manifest.json" --digest "$ART_DIR/manifest.digest" \
         --commit "$ART_DIR/bundle.complete.json" --artifact-root "$ART_DIR" \
         >/dev/null; then
-      # A complete decision is the logical winner. Validation durably adopts its
-      # canonical marker if the publisher died before linking or syncing it.
+      # A complete decision is the logical winner. The named adoption operation
+      # recovers its canonical marker if the publisher died before linking or
+      # syncing it, then fully revalidates; validate-bundle itself stays
+      # side-effect-free.
       trap '' HUP INT TERM
     else
       abort_if_finalizer_signalled
