@@ -11,7 +11,7 @@
 //! ```
 //!
 //! The hash is stored at construction exactly as upstream stores its computed field, so
-//! `hash` is O(1) and observably identical. Macro-scope decoration (Quill) rides the
+//! `hash` is O(1) and observably identical. Macro-scope decoration (Vellum) rides the
 //! ordinary `num`/`str` constructors per upstream convention; fln-syntax owns those
 //! conventions — this type only guarantees the substrate observables.
 

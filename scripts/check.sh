@@ -117,7 +117,8 @@ INPUT_PATHS=(
   scripts/extract/gen_abi_contract.py scripts/extract/gen_olean_contract.py
   scripts/extract/gen_extern_census.sh scripts/extract/gen_extern_census.lean
   scripts/e2e/contract_drift.sh scripts/e2e/olean_resurrection.sh
-  scripts/e2e/kernel_replay.sh scripts/tribunal/leanchecker_witness.sh
+  scripts/e2e/kernel_replay.sh scripts/e2e/vellum_naming_no_mock_e2e.sh
+  scripts/tribunal/leanchecker_witness.sh
   contracts ABI_CONTRACT.md OLEAN_CONTRACT.md rustfmt.toml
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
   tribunal
@@ -1224,7 +1225,8 @@ run_stage shellcheck shellcheck scripts/check.sh scripts/verify_vendor_tree.sh \
   scripts/e2e/env_snapshots.sh scripts/e2e/bignum_vectors.sh \
   scripts/e2e/contract_drift.sh scripts/e2e/olean_resurrection.sh \
   scripts/extract/gen_extern_census.sh \
-  scripts/e2e/kernel_replay.sh scripts/tribunal/leanchecker_witness.sh \
+  scripts/e2e/kernel_replay.sh scripts/e2e/vellum_naming_no_mock_e2e.sh \
+  scripts/tribunal/leanchecker_witness.sh \
   scripts/tribunal/gen_epoch_manifest.sh scripts/tribunal/ref_vs_ref.sh
 run_stage fmt cargo fmt --check
 run_stage check cargo check --locked --all-targets

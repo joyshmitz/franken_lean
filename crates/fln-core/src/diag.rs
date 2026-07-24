@@ -62,7 +62,7 @@ pub enum ResourceReason {
 /// authoritative crates).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorValue {
-    /// Quill rejected the source text.
+    /// Vellum rejected the source text.
     SyntaxFailure { message: String },
     /// Macro expansion failed (hygiene, recursion, or user macro error).
     MacroFailure { macro_name: Name, message: String },

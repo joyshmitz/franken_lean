@@ -477,6 +477,39 @@ jobs:
           fi
           exit "$command_rc"
 
+      - name: e2e smoke — vellum naming contract
+        id: vellum_naming
+        if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
+        shell: bash
+        run: |
+          step_root="$FLN_E2E_ART_ROOT/vellum-naming"
+          mkdir "$step_root"
+          set +e
+          FLN_E2E_ART_ROOT="$step_root" \
+            FLN_E2E_CACHE_STATE="cargo-cache-hit=${{ steps.cargo_cache.outputs.cache-hit }}" \
+            ./scripts/e2e/vellum_naming_no_mock_e2e.sh
+          command_rc=$?
+          set -e
+          mapfile -d '' -t bundles < <(
+            find "$step_root" -mindepth 1 -maxdepth 1 -type d -print0
+          )
+          artifact=""
+          capture_rc=0
+          if (( ${#bundles[@]} != 1 )); then
+            echo "vellum naming lane published ${#bundles[@]} bundles; expected exactly one" >&2
+            capture_rc=2
+          else
+            artifact="${bundles[0]}"
+          fi
+          {
+            printf 'artifact_path=%s\n' "$artifact"
+            printf 'command_exit=%s\n' "$command_rc"
+          } >> "$GITHUB_OUTPUT"
+          if (( capture_rc != 0 )); then
+            exit "$capture_rc"
+          fi
+          exit "$command_rc"
+
       - name: verify and index complete evidence attempt
         if: ${{ !cancelled() && steps.evidence_attempt.outcome == 'success' }}
         shell: bash
@@ -491,6 +524,8 @@ jobs:
           CLOSURE_EXIT: ${{ steps.closure_audit.outputs.command_exit }}
           ENVIRONMENT_COLLISION_ARTIFACT: ${{ steps.environment_collision.outputs.artifact_path }}
           ENVIRONMENT_COLLISION_EXIT: ${{ steps.environment_collision.outputs.command_exit }}
+          VELLUM_NAMING_ARTIFACT: ${{ steps.vellum_naming.outputs.artifact_path }}
+          VELLUM_NAMING_EXIT: ${{ steps.vellum_naming.outputs.command_exit }}
         run: |
           python3 - <<'PY'
           import hashlib
@@ -515,7 +550,12 @@ jobs:
 
           expected_roots = {
               check_root: {"quality-gate", "gate-self-test"},
-              e2e_root: {"structure-gate", "closure-audit", "environment-collision"},
+              e2e_root: {
+                  "structure-gate",
+                  "closure-audit",
+                  "environment-collision",
+                  "vellum-naming",
+              },
           }
           for root, expected_names in expected_roots.items():
               observed = {entry.name for entry in root.iterdir()}
@@ -560,6 +600,13 @@ jobs:
                   os.environ.get("ENVIRONMENT_COLLISION_EXIT", ""),
                   e2e_root / "environment-collision",
                   "nested",
+              ),
+              (
+                  "vellum_naming",
+                  os.environ.get("VELLUM_NAMING_ARTIFACT", ""),
+                  os.environ.get("VELLUM_NAMING_EXIT", ""),
+                  e2e_root / "vellum-naming",
+                  True,
               ),
           )
 

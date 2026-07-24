@@ -7,6 +7,9 @@
 //! Bootstrap layout:
 //! * [`ledger`] — the row-per-symbol Parity Ledger schema (§18.1): parse, validate,
 //!   aggregate; headline percentages are never accepted as evidence (D6);
+//! * [`naming`] — the suite-wide subsystem-name registry (`ci/SUBSYSTEM_REGISTRY.txt`)
+//!   and the current-vocabulary scanner (bead fln-7gr6): reserved codenames cannot
+//!   silently re-enter governed prose, contracts, schemas, or mutable bead fields;
 //! * [`normalize`] — comparison classes as versioned normalizer code: a normalizer
 //!   may strip only declared-nonsemantic fields and can never discard an error body
 //!   to pass;
@@ -23,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ledger;
+pub mod naming;
 pub mod normalize;
 pub mod ownership;
 #[cfg(feature = "oracle-fallback-dev")]
