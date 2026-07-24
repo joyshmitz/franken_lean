@@ -56,6 +56,11 @@ STAGE_TIMEOUT_MS="${FLN_CHECK_STAGE_TIMEOUT_MS:-1200000}"
 KILL_GRACE_MS="${FLN_CHECK_KILL_GRACE_MS:-2000}"
 READY_WAIT_MS="${FLN_CHECK_READY_WAIT_MS:-30000}"
 PLANT="${FLN_CHECK_PLANT:-}"
+PLANT_UNEXPECTED="${FLN_CHECK_PLANT_UNEXPECTED:-}"
+# The run_start planted-stage binding carries the plant form so validation can
+# hold each form to its own contract (semantic fail vs unexpected exit).
+PLANT_BINDING="$PLANT"
+[ -n "$PLANT_UNEXPECTED" ] && PLANT_BINDING="unexpected:$PLANT_UNEXPECTED"
 FINALIZER_TEST_POINT="${FLN_FINALIZER_TEST_POINT:-}"
 TEST_EARLY_FAULT="${FLN_CHECK_TEST_EARLY_FAULT:-}"
 if [ "$EARLY_FAULT_PROBE" -eq 1 ]; then
@@ -70,7 +75,7 @@ elif [ -n "${FLN_CHECK_PROFILE:-}" ]; then
   PROFILE="$FLN_CHECK_PROFILE"
 elif [ "${1:-}" = --self-test ]; then
   PROFILE=self-test-driver
-elif [ -n "$PLANT" ]; then
+elif [ -n "$PLANT" ] || [ -n "$PLANT_UNEXPECTED" ]; then
   PROFILE=self-test-plant
 elif [ "${CI:-}" = true ]; then
   PROFILE=ci
@@ -879,7 +884,7 @@ emit_event \
   --string vendor_binding "$VENDOR_BINDING_BINDING" \
   --json-value budgets "{\"capture_bytes_per_stream\":$CAPTURE_BYTES,\"output_budget_bytes\":$OUTPUT_BUDGET_BYTES,\"stage_timeout_ms\":$STAGE_TIMEOUT_MS,\"kill_grace_ms\":$KILL_GRACE_MS}" \
   --string rustc "$(rustc --version 2>/dev/null || printf unknown)" \
-  --string planted "$PLANT" \
+  --string planted "$PLANT_BINDING" \
   || early_fault early_run_start_emission_failure "cannot emit run_start"
 EARLY_STEP=human_log
 if [ "$EARLY_FAULT_PROBE" -eq 1 ] && [ "$TEST_EARLY_FAULT" = human_log ]; then
@@ -895,6 +900,16 @@ if [ "$FINALIZER_PROBE" -eq 1 ]; then
   emit_event --string event self_test --string stage finalizer-probe \
     --boolean ok true --integer planted_exit 0 \
     --string artifact finalizer-probe
+  if [ "$EARLY_FAULT_PROBE" -eq 1 ] && [ "$TEST_EARLY_FAULT" = post_run_start_drift ]; then
+    # Deliberate concurrent source drift: the governed probe input mutates
+    # after run_start, so final workspace hashing must type inconclusive.
+    printf 'drift\n' >> "$ART_DIR/probe-input"
+  fi
+  if [ "$EARLY_FAULT_PROBE" -eq 1 ] && [ "$TEST_EARLY_FAULT" = post_run_start_abort ]; then
+    # Deliberate internal fault after run_start: an unexpected shell exit
+    # must still finalize a complete typed internal_fault bundle.
+    exit 9
+  fi
   set_final pass finalizer_probe_complete 0
   exit 0
 fi
@@ -926,6 +941,14 @@ run_stage() {
     argv=(false)
     planted=true
     semantic_args=(--semantic-failure-exit 1)
+  elif [ "$PLANT_UNEXPECTED" = "$name" ]; then
+    # Deliberate unexpected-failure scenario (bead
+    # fln-evidence-runner-bootstrap-btk): an exit code outside the stage's
+    # registered semantic set must type as internal_fault, never as a
+    # semantic stage failure.
+    argv=(sh -c 'exit 7')
+    planted=true
+    semantic_args=()
   else
     case "$name" in
       shellcheck|fmt|structure-guard|vendor-tree|ubs)

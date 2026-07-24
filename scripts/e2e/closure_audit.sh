@@ -585,6 +585,11 @@ fi
 # From here the run log exists with its run_start, so the full finalizer owns
 # terminal publication; the early-envelope partial machinery stands down.
 RUN_STARTED=1
+if [ "$TEST_EARLY_FAULT" = post_run_start_abort ]; then
+  # Deliberate internal fault after run_start: an unexpected shell exit must
+  # still finalize a complete typed internal_fault bundle.
+  exit 9
+fi
 
 read_meta_field() {
   python3 - "$1" "$2" <<'PY'
@@ -885,9 +890,28 @@ copy_workspace() {
     "$ROOT/rust-toolchain.toml" "$destination/"
 }
 
-run_pass_step build_guard "$ROOT" \
-  --semantic-failure-exit 101 \
-  env CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --locked -p structure-guard --quiet
+if [ "$TEST_EARLY_FAULT" = unexpected_first_step ]; then
+  # Deliberate unexpected-failure scenario (bead
+  # fln-evidence-runner-bootstrap-btk): exit 7 is outside every registered
+  # semantic set, so the real step supervision must type internal_fault.
+  run_pass_step build_guard "$ROOT" sh -c 'exit 7'
+elif [ "$TEST_EARLY_FAULT" = during_first_step_drift ]; then
+  # Deliberate concurrent source drift, CLONE-ONLY: the mutator appends to a
+  # governed input while the (argv-swapped, cheap) first step runs, so the
+  # per-step snapshot law must type inconclusive. The confirmation guard
+  # makes accidental use against a real working tree impossible.
+  if [ "${FLN_CA_DRIFT_ROOT_CONFIRM:-}" != "$ROOT" ]; then
+    note "drift plant refused: FLN_CA_DRIFT_ROOT_CONFIRM does not name this root"
+    set_final internal_fault drift_plant_guard_refused 2
+    exit 2
+  fi
+  ( sleep 2; printf '\n' >> "$ROOT/ci/WORKSPACE_GRAPH.txt" ) &
+  run_pass_step build_guard "$ROOT" sleep 5
+else
+  run_pass_step build_guard "$ROOT" \
+    --semantic-failure-exit 101 \
+    env CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --locked -p structure-guard --quiet
+fi
 BUILT_GUARD="$BUILD_TARGET/debug/structure-guard"
 mkdir "$ART_DIR/bin"
 # The positional parameters are intentionally expanded by the supervised child.

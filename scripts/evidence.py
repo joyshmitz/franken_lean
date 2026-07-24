@@ -4455,6 +4455,7 @@ def validate_run(
             "self-test-plant",
             "self-test-cancellation",
             "finalizer-self-test",
+            "early-fault-self-test",
             "evidence-manifest-self-test",
         }
         if schema == "fln.check/2"
@@ -4467,6 +4468,7 @@ def validate_run(
     binding_free_profiles = {
         "evidence-manifest-self-test",
         "finalizer-self-test",
+        "early-fault-self-test",
     }
     if schema == "fln.check/2" and profile not in binding_free_profiles:
         if records[0].get("ubs_inventory") != "ubs-inventory.json":
@@ -4726,7 +4728,7 @@ def validate_run(
             ]
             if len(actual_ids) != len(exercised):
                 raise EvidenceError(f"{path}: check self-test contains foreign events")
-        elif profile == "finalizer-self-test":
+        elif profile in {"finalizer-self-test", "early-fault-self-test"}:
             expected_ids = ["finalizer-probe"]
             actual_ids = [
                 str(record.get("stage"))
@@ -4760,7 +4762,25 @@ def validate_run(
             and isinstance(record.get("supervisor"), dict)
             and record["supervisor"].get("planted") is True
         ]
-        if bound_plant:
+        if isinstance(bound_plant, str) and bound_plant.startswith("unexpected:"):
+            # The deliberate unexpected-failure plant: the planted stage must
+            # type internal_fault with the unexpected-exit reason, never a
+            # semantic stage failure.
+            unexpected_stage = bound_plant.removeprefix("unexpected:")
+            if (
+                profile != "self-test-plant"
+                or expected_verdict != "internal_fault"
+                or not unexpected_stage
+                or actual_ids[-1:] != [unexpected_stage]
+                or len(planted_events) != 1
+                or planted_events[0].get("stage") != unexpected_stage
+                or planted_events[0].get("outcome") != "internal_fault"
+                or planted_events[0].get("reason_code") != "unexpected_child_exit"
+            ):
+                raise EvidenceError(
+                    f"{path}: planted unexpected-failure contract is inconsistent"
+                )
+        elif bound_plant:
             if (
                 profile != "self-test-plant"
                 or expected_verdict != "fail"
@@ -12669,6 +12689,159 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "reused-directory refusal touched foreign state",
     )
     cases.append({"case": "early_fault_reused_directory", "ok": True})
+
+    # --- deliberate consumer-outcome scenarios (bead
+    # fln-evidence-runner-bootstrap-btk): the remaining outcome families for
+    # the three consumers in complete-bundle form — unexpected failure,
+    # post-run_start internal fault, and (for check.sh) concurrent source
+    # drift. Lane source drift requires mutating governed inputs, so it is
+    # proven against a scratch clone with the guarded during_first_step_drift
+    # plant and retained as close evidence rather than run per-gate.
+    def run_consumer_fault_case(
+        case_name: str,
+        argv: list[str],
+        environment_overrides: dict[str, str],
+        art_dir_env: str,
+        art_glob: str | None,
+        expected_exit: int,
+        schema: str,
+        expected_verdict: str,
+        expected_reason: str,
+    ) -> None:
+        repo = Path(__file__).resolve().parent.parent
+        case_root = art_dir / case_name
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("FLN_CHECK_")
+            and not key.startswith("FLN_FINALIZER_")
+            and not key.startswith("FLN_SG_")
+            and not key.startswith("FLN_CA_")
+            and not key.startswith("FLN_E2E_")
+        }
+        environment.update(environment_overrides)
+        environment[art_dir_env] = str(case_root)
+        child = subprocess.run(
+            argv,
+            cwd=repo,
+            env=environment,
+            capture_output=True,
+            timeout=600,
+            check=False,
+        )
+        require(
+            child.returncode == expected_exit,
+            f"{case_name}: exit {child.returncode}: {child.stderr[-300:]!r}",
+        )
+        if art_glob is None:
+            bundle_dir = case_root
+        else:
+            matches = sorted(case_root.glob(art_glob))
+            require(
+                len(matches) == 1,
+                f"{case_name}: expected one bundle dir, found {len(matches)}",
+            )
+            bundle_dir = matches[0]
+        validate_run(
+            bundle_dir / "run.ndjson",
+            schema,
+            expected_verdict,
+            live_context=False,
+        )
+        validate_bundle(
+            bundle_dir,
+            bundle_dir / "manifest.json",
+            bundle_dir / "manifest.digest",
+            bundle_dir / "bundle.complete.json",
+        )
+        terminal = load_ndjson(bundle_dir / "run.ndjson")[-1]
+        require(
+            terminal.get("reason_code") == expected_reason,
+            f"{case_name}: terminal reason {terminal.get('reason_code')!r}, "
+            f"expected {expected_reason!r}",
+        )
+        cases.append(
+            {"case": case_name, "ok": True, "artifact": str(bundle_dir)}
+        )
+
+    consumer_check_script = str(
+        Path(__file__).resolve().parent.parent / "scripts" / "check.sh"
+    )
+    run_consumer_fault_case(
+        "consumer_check_unexpected_stage",
+        ["bash", consumer_check_script],
+        {"FLN_CHECK_PLANT_UNEXPECTED": "evidence-self-test"},
+        "FLN_CHECK_ART_DIR",
+        None,
+        SETUP_FAILURE,
+        "fln.check/2",
+        "internal_fault",
+        "evidence-self-test:unexpected_child_exit",
+    )
+    run_consumer_fault_case(
+        "consumer_check_drift",
+        ["bash", consumer_check_script, "--early-fault-probe"],
+        {"FLN_CHECK_TEST_EARLY_FAULT": "post_run_start_drift"},
+        "FLN_CHECK_ART_DIR",
+        None,
+        INCONCLUSIVE,
+        "fln.check/2",
+        "inconclusive",
+        "final_workspace_changed",
+    )
+    run_consumer_fault_case(
+        "consumer_check_abort",
+        ["bash", consumer_check_script, "--early-fault-probe"],
+        {"FLN_CHECK_TEST_EARLY_FAULT": "post_run_start_abort"},
+        "FLN_CHECK_ART_DIR",
+        None,
+        SETUP_FAILURE,
+        "fln.check/2",
+        "internal_fault",
+        "unexpected_shell_exit",
+    )
+    for lane_script_name, lane_env, lane_glob, lane_tag in (
+        (
+            "structure_gate.sh",
+            "FLN_SG_TEST_EARLY_FAULT",
+            "structure-gate-*",
+            "structure_gate",
+        ),
+        (
+            "closure_audit.sh",
+            "FLN_CA_TEST_EARLY_FAULT",
+            "closure-audit-*",
+            "closure_audit",
+        ),
+    ):
+        lane_script = str(
+            Path(__file__).resolve().parent.parent
+            / "scripts"
+            / "e2e"
+            / lane_script_name
+        )
+        run_consumer_fault_case(
+            f"consumer_{lane_tag}_unexpected_step",
+            ["bash", lane_script],
+            {lane_env: "unexpected_first_step"},
+            "FLN_E2E_ART_ROOT",
+            lane_glob,
+            SETUP_FAILURE,
+            "fln.e2e/2",
+            "internal_fault",
+            "build_guard:unexpected_child_exit",
+        )
+        run_consumer_fault_case(
+            f"consumer_{lane_tag}_abort",
+            ["bash", lane_script],
+            {lane_env: "post_run_start_abort"},
+            "FLN_E2E_ART_ROOT",
+            lane_glob,
+            SETUP_FAILURE,
+            "fln.e2e/2",
+            "internal_fault",
+            "unexpected_shell_exit",
+        )
 
     race_root = case_dir("write_collision_race")
     race_path = race_root / "collision-race.txt"
