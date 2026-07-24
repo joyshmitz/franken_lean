@@ -26,12 +26,29 @@ fn the_real_tree_has_no_stale_reserved_names() {
         !report.scanned.is_empty(),
         "the scan saw files (an empty census is not a clean tree)"
     );
+    for required in [
+        SurfaceClass::Docs,
+        SurfaceClass::Source,
+        SurfaceClass::Ci,
+        SurfaceClass::Contracts,
+        SurfaceClass::Scripts,
+        SurfaceClass::BeadsCurrent,
+    ] {
+        assert!(
+            report.scanned.iter().any(|(class, _)| *class == required),
+            "the {} class was not scanned — a silently absent surface is not a \
+             clean surface",
+            required.label()
+        );
+    }
+    // scripts/tribunal is governed script code, not the immutable epoch lab:
+    // it must be inside the census, never name-skipped.
     assert!(
         report
             .scanned
             .iter()
-            .any(|(class, _)| *class == SurfaceClass::Docs),
-        "the docs class was scanned"
+            .any(|(_, path)| path.starts_with("scripts/tribunal/")),
+        "scripts/tribunal fell out of the census"
     );
     let missing = naming::missing_anchors(&root);
     let rendered = naming::render_report_ndjson(&report, &missing);

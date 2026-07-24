@@ -244,7 +244,7 @@ KERNEL_ADMISSION_CENSUS = {
 # are inconclusive-family outcomes: never checked, never cacheable, never
 # environment-admissible — and never folded into a success total.
 KERNEL_ADMISSION_ARTIFACT_WITNESS = (
-    "e649ccb0b5ad9ffa532bc905e162e5644c48314698dcad307327b827e88ea6ee"
+    "d690ccada7f5151a88c1a06062328cf5b13f3f507074ccd489f59c576ebcc96a"
 )
 KERNEL_ADMISSION_ARTIFACT_ROWS = (
     (

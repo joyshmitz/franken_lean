@@ -167,9 +167,11 @@ pub struct DeclClosureInput {
 
 /// The canonical witness digest over a canonically ordered finding set:
 /// `DomainHasher(Fixture)` over the tag, a NUL, then per finding the
-/// length-prefixed declaration name followed by its length-prefixed missing
-/// references (count-prefixed). Deterministic for a given finding set;
-/// input-order independence is the census's job.
+/// length-prefixed declaration name, a one-byte safety class, and the
+/// length-prefixed missing references (count-prefixed). The witness binds
+/// EVERY fact a finding row asserts — declaration, safety class, and the
+/// exact missing set — so no single-field tamper survives it. Deterministic
+/// for a given finding set; input-order independence is the census's job.
 pub fn witness_digest(findings: &[MissingConstantFinding]) -> Digest {
     let mut hasher = DomainHasher::new(Domain::Fixture);
     hasher.update(WITNESS_TAG);
@@ -179,6 +181,11 @@ pub fn witness_digest(findings: &[MissingConstantFinding]) -> Digest {
         let declaration = finding.declaration.to_display_string();
         hasher.update(&(declaration.len() as u64).to_le_bytes());
         hasher.update(declaration.as_bytes());
+        hasher.update(&[match finding.safety {
+            DefinitionSafety::Safe => 0,
+            DefinitionSafety::Unsafe => 1,
+            DefinitionSafety::Partial => 2,
+        }]);
         hasher.update(&(finding.missing.len() as u64).to_le_bytes());
         for name in &finding.missing {
             let text = name.to_display_string();
@@ -564,8 +571,18 @@ mod tests {
             safety: DefinitionSafety::Unsafe,
             missing: vec![],
         }];
+        let collapsed_safety = vec![MissingConstantFinding {
+            declaration: name("M.a"),
+            safety: DefinitionSafety::Partial,
+            missing: vec![name("M.gone")],
+        }];
         let w0 = witness_digest(&base);
         assert_eq!(w0, witness_digest(&base), "witness is deterministic");
+        assert_ne!(
+            w0,
+            witness_digest(&collapsed_safety),
+            "a collapsed safety class changes the witness"
+        );
         assert_ne!(
             w0,
             witness_digest(&with_extra),

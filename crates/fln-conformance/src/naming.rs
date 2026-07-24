@@ -614,10 +614,13 @@ pub fn scan_beads_line(line_no: usize, line: &str, registry: &Registry) -> Vec<S
     stale
 }
 
-/// Directory names never scanned: build products, VCS state, the immutable
-/// Reference tree, the immutable epoch lab, and retained e2e artifacts.
+/// Directory names never scanned: build products, VCS/hidden state, vendored
+/// upstream trees, and retained e2e artifacts. The immutable epoch lab
+/// (`tribunal/` at the repo root) is excluded structurally — [`scan_tree`]
+/// never walks it — NOT by name, so governed nested dirs like
+/// `scripts/tribunal/` stay in the census.
 fn skip_dir(name: &str) -> bool {
-    name.starts_with('.') || matches!(name, "target" | "vendor" | "tribunal" | "artifacts")
+    name.starts_with('.') || matches!(name, "target" | "vendor" | "artifacts")
 }
 
 fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {

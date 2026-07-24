@@ -277,6 +277,29 @@ stdout is data-only, stderr diagnostics, exit 0 = success. Treat it as a way to 
 
 ---
 
+## Subsystem Naming Contract (bead fln-7gr6)
+
+The FrankenLean W4 parser/syntax/hygiene/macro subsystem is named **Vellum** (crates `fln-parse`, `fln-syntax` — crate names unchanged). The name "Quill" is reserved suite-wide for the Frankensearch lexical engine and is NOT a FrankenLean subsystem.
+
+- The registry of every load-bearing codename is `ci/SUBSYSTEM_REGISTRY.txt` (schema `fln-subsystem-registry/1`): owner repo, scope, crates, aliases, status, with a case-insensitive collision law. Register new codenames there before using them; regeneration goes through a `.candidate` sibling and an atomic rename — a leftover candidate fails the gate typed.
+- **Enforcement runs in plain `cargo test`** (fln-conformance suites `subsystem_name_registry`, `reserved_name_collision_model`, `vellum_surface_inventory`, `generated_name_drift_guard`): a reserved name in governed docs, source, ci artifacts, contracts, scripts, or **mutable bead fields** (title/description/acceptance_criteria/design/notes) fails the build unless the same line/field also names the owning project (e.g. "Quill" is legitimate only when Frankensearch is cited alongside it, as here). Immutable bead comments and `.br_history/` are exempt.
+- The scanner's only file exemptions are the public `CONTRACT_DEFINITION_PATHS` list in `crates/fln-conformance/src/naming.rs` — never add a hidden exception.
+
+---
+
+## Evidence & Census Pins — Operational Gotchas
+
+Hard-won facts that will bite you if unknown:
+
+1. **Creating ANY new bead stales `ci/KERNEL_CONTRACT_OWNERSHIP.jsonl`** and fails the `kernel_contract` suite workspace-wide (`bead-evidence/stale-binding`). The file binds the sorted set of bead IDs (`DomainHasher(Fixture)`, tag `fln.kernel-contract-ownership.ids/1`, NUL, u64le-length-prefixed sorted ids; header carries `record_count` + `projection_hash`). After creating beads, regenerate the projection (a one-off regenerator against the crate's own algorithm byte-reproduces prior bindings — validate yours the same way) and commit it with your beads export.
+2. **The kernel-admission census (`fln.e2e.kernel-admission`, version 2) moves only by bead**, and its pins must move together: the expected-rows array in `crates/fln-conformance/tests/kernel_replay.rs`, and `KERNEL_ADMISSION_CENSUS` / `KERNEL_ADMISSION_ARTIFACT_ROWS` / `KERNEL_ADMISSION_ARTIFACT_WITNESS` / `KERNEL_ADMISSION_VERSION` in `scripts/evidence.py`, plus the census needles in `scripts/e2e/kernel_replay.sh`. The witness digest recomputes via `fln_env::decl_closure::witness_digest` (tag `fln.artifact-incomplete-witness/1`; binds declaration, safety class, and missing refs).
+3. **ArtifactIncomplete is an FL-INV-07 inconclusive-family outcome** (`fln_env::decl_closure`): a declaration whose serialized artifact cannot supply its dependency closure is never Accepted, never Rejected, never counted checked, never cacheable, and never enters an environment. Do not fold it into any success total; the validator enforces count conservation (`checked + artifact_incomplete == decls_total`).
+4. **Writing a new `fln.e2e/2` lane**: model on `scripts/e2e/closure_audit.sh`; every `--wait-ms` for the process-identity guards is capped at **30000** (a larger value makes the guard raise instantly and the lane SIGKILLs its own runner with a bare "Killed"); every scenario MUST be registered with its exact ordered step list in `E2E_STEP_ORDERS` at the top of `scripts/evidence.py`; register the script in `scripts/check.sh` (INPUT_PATHS + shellcheck stage) and as a `.github/workflows/ci.yml` step (new e2e steps must also join the verify-step's `expected_roots` set and `specs` tuple — the roots set is closed). Expected-fail cargo steps use `--semantic-failure-exit 101` and must grep BOTH `.out` and `.err` captures for the intended reason (libtest panics print to stderr under `--nocapture`).
+5. **Never edit a governed file while an e2e lane is running** (even `cargo fmt`): lanes re-hash their INPUT_PATHS around every supervised step and flip `inconclusive: governed_inputs_changed`.
+6. **The pinned Reference toolchain** lives at `~/.elan/toolchains/leanprover--lean4---v4.32.0/` (install with `elan toolchain install leanprover/lean4:v4.32.0` if absent; the kernel-replay suites SKIP typed without it). RCH remote workers do NOT have it — run pin-dependent tests locally (a small wrapper script avoids the RCH cargo hook). Lanes longer than the 10-minute tool timeout should be launched detached (`setsid nohup … &`) and watched.
+
+---
+
 ## Note for Codex/GPT agents — unexpected working-tree changes
 
 If `git status` shows edits you did not make (in `Cargo.toml`, `crates/**/*.rs`, etc.), those are from the **other agents working on this project concurrently** — a normal, frequent occurrence. **NEVER** stash, revert, or overwrite another agent's work. Treat those changes exactly as if you made them yourself. Do not stop to ask about them.
