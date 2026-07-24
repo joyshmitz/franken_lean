@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 pub mod constants;
+pub mod decl_closure;
 pub mod effective_imports;
 pub mod environment;
 pub mod extensions;
