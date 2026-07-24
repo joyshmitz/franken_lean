@@ -330,8 +330,11 @@ for needle in (
     "checked=2198 accepted=2198",
     "inconclusive=0",
     "rejected={}",
-    'unchecked={"nonsafe_with_unserialized_refs": 6}',
-    "nested_partial_blocks=1",
+    "unchecked={}",
+    "artifact_incomplete=6",
+    "artifact_incomplete_witness="
+    "e649ccb0b5ad9ffa532bc905e162e5644c48314698dcad307327b827e88ea6ee",
+    "nested_partial_blocks=0 nested_full_blocks=1",
 ):
     if needle not in line:
         raise SystemExit(f"census regressed: missing {needle!r} in {line!r}")
@@ -431,7 +434,7 @@ PY
     python3 "$AP6_CENSUS_CHECK" "$AP6_ART_DIR/admission_replay.err"
   ap6_assert_supervisor census_floor pass 0 0
   ap6_record_step census_floor \
-    "checked=2198 accepted=2198 inconclusive=0 rejected={} unchecked={nonsafe_with_unserialized_refs:6} nested_partial_blocks=1" \
+    "checked=2198 accepted=2198 inconclusive=0 rejected={} unchecked={} artifact_incomplete=6 nested_partial_blocks=0 nested_full_blocks=1" \
     "$AP6_LAST_CLASS/wrapper=$AP6_LAST_RC/child=$AP6_LAST_CHILD/census_artifact=admission_replay.err" \
     not_applicable pass 0 0 \
     "$AP6_SUBJECT_BEFORE" "$(ap6_hash_subject)"
@@ -689,14 +692,16 @@ fi
 # 1755/1755 checkable); the admission slice then put EVERY declaration kind
 # through the kernel (ap6: inductive blocks with recursor regeneration,
 # quotients, all definition safeties) — 2198/2198 checked accepted, with
-# exactly 6 non-safe helpers typed as uncheckable-from-artifact (their
-# private auxiliary references are absent from the pin's own serialization)
-# and 1 nested block under the documented partial ruleset. The census may
-# only move by a deliberate, bead-tracked change. The authoritative census
-# evidence lives in the ap6 child bundle; this legacy step mirrors it.
+# exactly 6 non-safe helpers typed ArtifactIncomplete (bead franken_lean-
+# artifact-incomplete-private-refs-sgt: their private auxiliary references
+# are absent from the pin's own serialization; witnessed, never checked,
+# never cached, never admitted) and 1 nested block under the full ruleset.
+# The census may only move by a deliberate, bead-tracked change. The
+# authoritative census evidence lives in the ap6 child bundle; this legacy
+# step mirrors it.
 if [ "$AP6_BUNDLE_PRESENT" -eq 1 ]; then
-  emit census passed "\"checked\":2198,\"accepted\":2198,\"rejected\":0,\"inconclusive\":0,\"uncheckable_from_artifact\":6,\"beads\":\"franken_lean-irm,franken_lean-ap6\",\"census_artifact\":\"admission-ap6/admission_replay.err\""
-  note "census floor: Init.Prelude 2198/2198 checked accepted (6 typed uncheckable-from-artifact), 0 rejected, 0 inconclusive"
+  emit census passed "\"checked\":2198,\"accepted\":2198,\"rejected\":0,\"inconclusive\":0,\"artifact_incomplete\":6,\"beads\":\"franken_lean-irm,franken_lean-ap6,franken_lean-artifact-incomplete-private-refs-sgt\",\"census_artifact\":\"admission-ap6/admission_replay.err\""
+  note "census floor: Init.Prelude 2198/2198 checked accepted (6 typed inconclusive-artifact-incomplete), 0 rejected, 0 inconclusive"
 else
   emit census skipped "\"reason\":\"reference_toolchain_absent\",\"limitation\":\"L0: verdict census unverified on this host\""
   note "SKIP: census floor unverifiable without the pinned toolchain (typed limitation)"

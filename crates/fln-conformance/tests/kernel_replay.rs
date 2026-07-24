@@ -44,6 +44,9 @@ use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_env::constants::{ConstantInfo, DefinitionSafety};
+use fln_env::decl_closure::{
+    self, DeclClosureBudget, DeclClosureInput, DeclClosureStatus, MissingConstantFinding,
+};
 use fln_env::environment::Environment;
 use fln_hash::domain::{Domain, hash};
 use fln_kernel::Declaration;
@@ -354,11 +357,33 @@ struct WorkItem {
 struct PreparedReplay {
     items: Vec<WorkItem>,
     unchecked: BTreeMap<&'static str, u64>,
-    nested_partial: u64,
+    /// Blocks with nested auxiliaries — all admitted under the FULL ruleset
+    /// (the partial path was retired by franken_lean-8ce).
+    nested_full: u64,
+    /// Declarations whose artifact cannot supply the dependency closure (bead
+    /// franken_lean-artifact-incomplete-private-refs-sgt): typed
+    /// `ArtifactIncomplete` findings in canonical order. These declarations are
+    /// NOT kernel-checked, NOT counted as checked, NOT cacheable, and — the
+    /// core prohibition — never enter the environment.
+    artifact_incomplete: Vec<MissingConstantFinding>,
     final_env: Environment,
     decls_total: usize,
     units_total: usize,
     cyclic_leads: Vec<String>,
+}
+
+impl PreparedReplay {
+    /// One finding per affected declaration (never per unit): the count IS the
+    /// row count.
+    fn artifact_incomplete_count(&self) -> u64 {
+        self.artifact_incomplete.len() as u64
+    }
+
+    /// The canonical witness digest over the (already canonically ordered)
+    /// artifact-incomplete findings.
+    fn artifact_witness_hex(&self) -> String {
+        decl_closure::witness_digest(&self.artifact_incomplete).to_hex()
+    }
 }
 
 /// Build the admission units of a decoded module and walk them in canonical
@@ -452,7 +477,8 @@ fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
     let mut env = Environment::new();
     let mut items: Vec<WorkItem> = Vec::new();
     let mut unchecked: BTreeMap<&'static str, u64> = BTreeMap::new();
-    let mut nested_partial: u64 = 0;
+    let mut nested_full: u64 = 0;
+    let mut artifact_incomplete: Vec<MissingConstantFinding> = Vec::new();
     let units_total = units.len();
     for u in order.into_iter().chain(cyclic) {
         let unit = &units[u];
@@ -473,7 +499,7 @@ fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
                     }
                 }
                 if types.iter().any(|t| t.num_nested > 0) {
-                    nested_partial += 1;
+                    nested_full += 1;
                 }
                 (
                     "block",
@@ -505,28 +531,45 @@ fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
             }
             continue;
         };
-        // Uncheckable-from-the-artifact (bead franken_lean-ap6): six non-safe
-        // implementation helpers (`._unsafe_rec`/`._override`) reference
-        // PRIVATE auxiliaries (`.match_1`, `._proof_N`) that the pin's own
-        // serializer does NOT include in the module's constants array. The
-        // Reference itself cannot re-check these declarations from the olean
-        // — their checking context was transient elaboration state. Typed
-        // limitation, censused by name-count, never a silent pass.
+        // Artifact-incomplete (bead franken_lean-artifact-incomplete-private-
+        // refs-sgt, upgrading the franken_lean-ap6 counter to a typed outcome):
+        // non-safe implementation helpers (`._unsafe_rec`/`._override`)
+        // reference PRIVATE auxiliaries (`.match_1`, `._proof_N`) that the
+        // pin's own serializer does NOT include in the module's constants
+        // array — their checking context was transient elaboration state, and
+        // the Reference itself never re-checks imports
+        // (`lean_add_decl_without_checking`). The closure census produces a
+        // typed `ArtifactIncomplete` finding per declaration with its exact
+        // missing references; the declarations are NOT kernel-checked, NOT
+        // cacheable, and never enter the environment (cascade census: nothing
+        // else in the module references them, so exclusion is closed).
         if let ConstantInfo::Defn(d) = &info
             && d.safety != DefinitionSafety::Safe
-            && dependencies(&info)
-                .iter()
-                .any(|n| !index_by_name.contains_key(n))
         {
-            *unchecked
-                .entry("nonsafe_with_unserialized_refs")
-                .or_default() += n_members;
-            for &m in &unit.members {
-                env = env
-                    .add_decl(infos[m].clone())
-                    .expect("one-name law over Prelude");
+            let census_input = [DeclClosureInput {
+                name: info.name().clone(),
+                safety: d.safety,
+                dependencies: dependencies(&info).into_iter().collect(),
+            }];
+            let status = decl_closure::classify_closures(
+                &census_input,
+                |name| index_by_name.contains_key(name) || env.find(name).is_some(),
+                DeclClosureBudget::DEFAULT,
+                || false,
+            );
+            match status {
+                DeclClosureStatus::Complete => {}
+                DeclClosureStatus::ArtifactIncomplete { findings, .. } => {
+                    // Typed non-admission: no add_decl, no checked count, no
+                    // cache authority (the fln-env model tests pin
+                    // is_cacheable/may_enter_environment to false).
+                    artifact_incomplete.extend(findings);
+                    continue;
+                }
+                other => {
+                    panic!("declaration-closure census must be conclusive over Prelude: {other:?}")
+                }
             }
-            continue;
         }
         items.push(WorkItem {
             lead: info.name().clone(),
@@ -542,10 +585,14 @@ fn prepare_replay(infos: &[ConstantInfo]) -> PreparedReplay {
                 .expect("one-name law over Prelude");
         }
     }
+    // Canonical finding order regardless of Kahn/cyclic discovery order: the
+    // witness digest is a function of the finding SET.
+    artifact_incomplete.sort_by(|a, b| a.declaration.cmp(&b.declaration));
     PreparedReplay {
         items,
         unchecked,
-        nested_partial,
+        nested_full,
+        artifact_incomplete,
         final_env: env,
         decls_total: infos.len(),
         units_total,
@@ -734,7 +781,7 @@ impl EmitCtx {
     /// The governance prefix shared verbatim by both row schemas.
     fn prefix(&self, schema: &str, claim_id: &str, invariant_id: &str, scenario: &str) -> String {
         format!(
-            "\"schema\":{},\"version\":1,\"run_id\":{},\"bead\":\"franken_lean-ap6\",\
+            "\"schema\":{},\"version\":2,\"run_id\":{},\"bead\":\"franken_lean-ap6\",\
              \"claim_id\":{},\"claim_type\":\"bounded_model\",\"invariant_id\":{},\
              \"invariant_relation\":\"single-authority-admission\",\
              \"determinism_invariant\":\"FL-INV-01\",\"gate_id\":\"G1\",\
@@ -779,8 +826,9 @@ impl EmitCtx {
             "{{{},\"phase\":{},\"threads\":{},\"status\":{},\"budget_steps\":{},\
              \"budget_depth\":{},\"decls_total\":{},\"units_total\":{},\"units_checked\":{},\
              \"units_cyclic\":{},\"checked\":{},\"accepted\":{},\"rejected_total\":{},\
-             \"inconclusive\":{},\"unchecked_nonsafe_with_unserialized_refs\":{},\
-             \"nested_partial_blocks\":{},\"verdict_stream_digest\":{},\
+             \"inconclusive\":{},\"artifact_incomplete\":{},\
+             \"artifact_incomplete_witness\":{},\
+             \"nested_partial_blocks\":0,\"nested_full_blocks\":{},\"verdict_stream_digest\":{},\
              \"final_logical_root\":{},\"steps_used_total\":{},\"max_depth_seen\":{},\
              \"monotonic_start_us\":{},\"monotonic_end_us\":{},\"duration_us\":{},\
              \"timing_used_as_gate\":false,\"process_exit\":0,\"signal\":null,\
@@ -805,11 +853,9 @@ impl EmitCtx {
             run.accepted,
             rejected_total,
             run.inconclusive,
-            prep.unchecked
-                .get("nonsafe_with_unserialized_refs")
-                .copied()
-                .unwrap_or(0),
-            prep.nested_partial,
+            prep.artifact_incomplete_count(),
+            json_string(&prep.artifact_witness_hex()),
+            prep.nested_full,
             json_string(&run.stream_digest),
             json_string(final_root),
             run.steps_total,
@@ -819,6 +865,41 @@ impl EmitCtx {
             run.duration_us,
             first_divergence.map_or("null".to_string(), json_string),
             json_string(final_state),
+        );
+    }
+
+    /// One typed artifact-incomplete census row (bead
+    /// franken_lean-artifact-incomplete-private-refs-sgt): the declaration,
+    /// its safety class, its exact missing references, the finding-set
+    /// witness, and the authority facts — never checked, never cacheable,
+    /// never environment-admissible (FL-INV-07: an inconclusive-family
+    /// outcome, not a verdict).
+    fn artifact_incomplete_row(&self, finding: &MissingConstantFinding, witness_hex: &str) {
+        let missing: Vec<String> = finding
+            .missing
+            .iter()
+            .map(|name| json_string(&name.to_display_string()))
+            .collect();
+        println!(
+            "{{{},\"phase\":\"artifact-incomplete-row\",\"declaration\":{},\"safety\":{},\
+             \"missing_references\":[{}],\"witness\":{},\
+             \"outcome\":\"inconclusive-artifact-incomplete\",\"authority\":\"none\",\
+             \"kernel_checked\":false,\"cacheable\":false,\
+             \"environment_admissible\":false,\"evidence_grade\":\"verified\"}}",
+            self.prefix(
+                "fln.e2e.kernel-admission",
+                "franken_lean-sgt-artifact-completeness",
+                "FL-INV-07",
+                "init-prelude-artifact-incomplete-census",
+            ),
+            json_string(&finding.declaration.to_display_string()),
+            json_string(match finding.safety {
+                DefinitionSafety::Safe => "safe",
+                DefinitionSafety::Unsafe => "unsafe",
+                DefinitionSafety::Partial => "partial",
+            }),
+            missing.join(","),
+            json_string(witness_hex),
         );
     }
 
@@ -1292,12 +1373,20 @@ fn prelude_replays_through_the_kernel() {
 
     let checked = accepted + inconclusive + rejected.values().sum::<u64>();
     let unchecked = &prep.unchecked;
+    let artifact_incomplete = prep.artifact_incomplete_count();
+    let artifact_witness = prep.artifact_witness_hex();
     eprintln!(
         "kernel_replay census: checked={checked} accepted={accepted} \
          inconclusive={inconclusive} rejected={rejected:?} unchecked={unchecked:?} \
-         nested_partial_blocks={}",
-        prep.nested_partial
+         artifact_incomplete={artifact_incomplete} \
+         artifact_incomplete_witness={artifact_witness} \
+         nested_partial_blocks=0 nested_full_blocks={}",
+        prep.nested_full
     );
+    // One typed row per artifact-incomplete declaration, bound by the witness.
+    for finding in &prep.artifact_incomplete {
+        emit.artifact_incomplete_row(finding, &artifact_witness);
+    }
     if !rejected_names.is_empty() {
         eprintln!("first rejections: {rejected_names:?}");
         let mut by_count: Vec<_> = reasons.iter().collect();
@@ -1309,22 +1398,98 @@ fn prelude_replays_through_the_kernel() {
 
     eprintln!("kernel_replay triage (reduction-gap families): {gap_families:?}");
 
-    // Census law: every declaration lands in exactly one bucket — and the
-    // admission slice leaves NOTHING unchecked in this module (opaques would
-    // be the only unchecked kind, and Init.Prelude has none).
+    // Census law: every declaration lands in exactly one typed bucket —
+    // validated (checked through the sole kernel authority), unsafe-not-
+    // kernel-checked (kinds with no admission rule yet; Init.Prelude has
+    // none), or artifact-incomplete — and the three families are never
+    // folded into one another (bead franken_lean-artifact-incomplete-
+    // private-refs-sgt: no typed limitation may disappear into a success
+    // total).
     let unchecked_total: u64 = unchecked.values().sum();
-    assert_eq!(checked + unchecked_total, 2204);
-    // The ONLY unchecked family is the six non-safe implementation helpers
-    // whose private auxiliary references the pin serializer discarded — the
-    // Reference itself cannot re-check them from this artifact.
+    assert_eq!(checked + unchecked_total + artifact_incomplete, 2204);
     assert_eq!(
-        unchecked
-            .get("nonsafe_with_unserialized_refs")
-            .copied()
-            .unwrap_or(0),
-        unchecked_total,
+        unchecked_total, 0,
         "a declaration kind bypassed the kernel: {unchecked:?}"
     );
+    // The exact six artifact-incomplete rows at the pin: each non-safe
+    // implementation helper with its exact missing private auxiliaries. A
+    // name-only exception cannot satisfy this pin — the census computes the
+    // rows from decoded dependencies, and this assertion binds declaration,
+    // safety class, and missing-reference set alike.
+    let expected_rows: [(&str, &str, &[&str]); 6] = [
+        (
+            "Lean.Name.hash._override",
+            "unsafe",
+            &["_private.Init.Prelude.0.Lean.Name.hash._proof_1"],
+        ),
+        (
+            "Lean.Name.num._override",
+            "unsafe",
+            &["_private.Init.Prelude.0.Lean.Name.hash._proof_2"],
+        ),
+        (
+            "Lean.Syntax.getHeadInfo?._unsafe_rec",
+            "partial",
+            &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1"],
+        ),
+        (
+            "Lean.Syntax.getTailPos?._unsafe_rec",
+            "partial",
+            &["_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1"],
+        ),
+        (
+            "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+            "partial",
+            &["_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1"],
+        ),
+        (
+            "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+            "partial",
+            &["_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop.match_1"],
+        ),
+    ];
+    let actual_rows: Vec<(String, &'static str, Vec<String>)> = prep
+        .artifact_incomplete
+        .iter()
+        .map(|finding| {
+            (
+                finding.declaration.to_display_string(),
+                match finding.safety {
+                    DefinitionSafety::Safe => "safe",
+                    DefinitionSafety::Unsafe => "unsafe",
+                    DefinitionSafety::Partial => "partial",
+                },
+                finding
+                    .missing
+                    .iter()
+                    .map(|name| name.to_display_string())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let expected_rows: Vec<(String, &str, Vec<String>)> = expected_rows
+        .iter()
+        .map(|(declaration, safety, missing)| {
+            (
+                declaration.to_string(),
+                *safety,
+                missing.iter().map(|m| m.to_string()).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual_rows, expected_rows,
+        "the artifact-incomplete census drifted from the pin"
+    );
+    // None of the six entered the environment (the ap6-era insertion was the
+    // bug this bead governs) — and every complete declaration did.
+    for finding in &prep.artifact_incomplete {
+        assert!(
+            prep.final_env.find(&finding.declaration).is_none(),
+            "artifact-incomplete declaration `{}` entered the environment",
+            finding.declaration.to_display_string()
+        );
+    }
 
     // Never Inconclusive: the default budget suffices for every Prelude
     // declaration K1 can check (FL-INV-07 — exhaustion would be honest, but

@@ -215,7 +215,7 @@ ENVIRONMENT_COLLISION_FIELDS = {
 
 KERNEL_ADMISSION_SCHEMA = "fln.e2e.kernel-admission"
 KERNEL_ADMISSION_FAULT_SCHEMA = "fln.e2e.kernel-admission-fault"
-KERNEL_ADMISSION_VERSION = 1
+KERNEL_ADMISSION_VERSION = 2
 KERNEL_ADMISSION_THREADS = (1, 8, 32)
 KERNEL_ADMISSION_TESTS = (
     "prelude_replays_through_the_kernel",
@@ -231,9 +231,53 @@ KERNEL_ADMISSION_CENSUS = {
     "accepted": 2198,
     "rejected_total": 0,
     "inconclusive": 0,
-    "unchecked_nonsafe_with_unserialized_refs": 6,
-    "nested_partial_blocks": 1,
+    "artifact_incomplete": 6,
+    "nested_partial_blocks": 0,
+    "nested_full_blocks": 1,
 }
+# The typed artifact-incomplete census at the pin (bead
+# franken_lean-artifact-incomplete-private-refs-sgt): six non-safe
+# implementation helpers whose private auxiliaries the pin's serializer
+# discarded. Each row is (declaration, safety, missing references) in
+# canonical order; the witness digest binds the exact finding set
+# (fln-env decl_closure, tag fln.artifact-incomplete-witness/1). These rows
+# are inconclusive-family outcomes: never checked, never cacheable, never
+# environment-admissible — and never folded into a success total.
+KERNEL_ADMISSION_ARTIFACT_WITNESS = (
+    "e649ccb0b5ad9ffa532bc905e162e5644c48314698dcad307327b827e88ea6ee"
+)
+KERNEL_ADMISSION_ARTIFACT_ROWS = (
+    (
+        "Lean.Name.hash._override",
+        "unsafe",
+        ("_private.Init.Prelude.0.Lean.Name.hash._proof_1",),
+    ),
+    (
+        "Lean.Name.num._override",
+        "unsafe",
+        ("_private.Init.Prelude.0.Lean.Name.hash._proof_2",),
+    ),
+    (
+        "Lean.Syntax.getHeadInfo?._unsafe_rec",
+        "partial",
+        ("_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.match_1",),
+    ),
+    (
+        "Lean.Syntax.getTailPos?._unsafe_rec",
+        "partial",
+        ("_private.Init.Prelude.0.Lean.Syntax.getTailPos?.match_1",),
+    ),
+    (
+        "_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop._unsafe_rec",
+        "partial",
+        ("_private.Init.Prelude.0.Lean.Syntax.getHeadInfo?.loop.match_1",),
+    ),
+    (
+        "_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop._unsafe_rec",
+        "partial",
+        ("_private.Init.Prelude.0.Lean.Syntax.getTailPos?.loop.match_1",),
+    ),
+)
 # The named single-defect admission mutants (bead franken_lean-ap6): every
 # one must be killed by a typed rejection in the fault matrix.
 KERNEL_ADMISSION_MUTANTS = (
@@ -300,12 +344,45 @@ KERNEL_ADMISSION_FIELDS = _KERNEL_ADMISSION_COMMON_FIELDS | {
     "accepted",
     "rejected_total",
     "inconclusive",
-    "unchecked_nonsafe_with_unserialized_refs",
+    "artifact_incomplete",
+    "artifact_incomplete_witness",
     "nested_partial_blocks",
+    "nested_full_blocks",
     "verdict_stream_digest",
     "final_logical_root",
     "steps_used_total",
     "max_depth_seen",
+}
+# The per-declaration artifact-incomplete rows carry the shared governance
+# prefix (no supervisor/timing tail — they are census rows, not phases) plus
+# the finding facts and the authority denials.
+KERNEL_ADMISSION_ARTIFACT_ROW_FIELDS = (
+    _KERNEL_ADMISSION_COMMON_FIELDS
+    - {
+        "status",
+        "budget_steps",
+        "budget_depth",
+        "monotonic_start_us",
+        "monotonic_end_us",
+        "duration_us",
+        "timing_used_as_gate",
+        "process_exit",
+        "signal",
+        "first_divergence",
+        "cleanup_status",
+        "final_state",
+    }
+) | {
+    "declaration",
+    "safety",
+    "missing_references",
+    "witness",
+    "outcome",
+    "authority",
+    "kernel_checked",
+    "cacheable",
+    "environment_admissible",
+    "evidence_grade",
 }
 KERNEL_ADMISSION_FAULT_FIELDS = _KERNEL_ADMISSION_COMMON_FIELDS | {
     "mutant_id",
@@ -3425,6 +3502,7 @@ def validate_kernel_admission(
 
     matrix_records: list[dict[str, Any]] = []
     fault_records: list[dict[str, Any]] = []
+    artifact_records: list[dict[str, Any]] = []
     for number, raw_line in enumerate(stdout_data.splitlines(), 1):
         is_fault = fault_marker in raw_line
         if not is_fault and matrix_marker not in raw_line:
@@ -3441,7 +3519,12 @@ def validate_kernel_admission(
             raise EvidenceError(
                 f"{stdout_path}:{number}: kernel-admission evidence is not an object"
             )
-        (fault_records if is_fault else matrix_records).append(value)
+        if is_fault:
+            fault_records.append(value)
+        elif value.get("scenario") == "init-prelude-artifact-incomplete-census":
+            artifact_records.append(value)
+        else:
+            matrix_records.append(value)
 
     expected_shared_identity = {
         "bead": "franken_lean-ap6",
@@ -3599,6 +3682,23 @@ def validate_kernel_admission(
                     f"kernel-admission census {key} "
                     f"{record.get(key)!r}, expected {expected_value}"
                 )
+        # Count conservation: validated + artifact-incomplete covers the module
+        # exactly — a typed limitation folded into a success total (or dropped)
+        # breaks this arithmetic (bead franken_lean-artifact-incomplete-
+        # private-refs-sgt).
+        if (
+            positive_integer(record, "checked")
+            + positive_integer(record, "artifact_incomplete")
+            != positive_integer(record, "decls_total")
+        ):
+            raise EvidenceError(
+                "kernel-admission census does not conserve declaration counts"
+            )
+        if record.get("artifact_incomplete_witness") != KERNEL_ADMISSION_ARTIFACT_WITNESS:
+            raise EvidenceError(
+                "kernel-admission artifact-incomplete witness "
+                f"{record.get('artifact_incomplete_witness')!r} is not the pin"
+            )
         digest = record.get("verdict_stream_digest")
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise EvidenceError("kernel-admission verdict-stream digest is malformed")
@@ -3624,6 +3724,86 @@ def validate_kernel_admission(
         elif steps_total != shared_steps or depth_seen != shared_depth:
             raise EvidenceError(
                 "kernel-admission resource facts diverged across the thread matrix"
+            )
+
+    # The typed artifact-incomplete rows: exactly the pinned six, in canonical
+    # order, each denying every authority, all bound by the pinned witness.
+    if len(artifact_records) != len(KERNEL_ADMISSION_ARTIFACT_ROWS):
+        raise EvidenceError(
+            f"kernel-admission emitted {len(artifact_records)} artifact-incomplete "
+            f"rows, expected {len(KERNEL_ADMISSION_ARTIFACT_ROWS)}"
+        )
+    for record, (declaration, safety, missing) in zip(
+        artifact_records, KERNEL_ADMISSION_ARTIFACT_ROWS, strict=True
+    ):
+        if set(record) != KERNEL_ADMISSION_ARTIFACT_ROW_FIELDS:
+            missing_fields = sorted(KERNEL_ADMISSION_ARTIFACT_ROW_FIELDS - set(record))
+            extra = sorted(set(record) - KERNEL_ADMISSION_ARTIFACT_ROW_FIELDS)
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete field mismatch: "
+                f"missing={missing_fields!r} extra={extra!r}"
+            )
+        if record.get("schema") != KERNEL_ADMISSION_SCHEMA:
+            raise EvidenceError("kernel-admission artifact-incomplete schema mismatch")
+        if record.get("claim_id") != "franken_lean-sgt-artifact-completeness":
+            raise EvidenceError("kernel-admission artifact-incomplete claim id mismatch")
+        if record.get("invariant_id") != "FL-INV-07":
+            raise EvidenceError(
+                "kernel-admission artifact-incomplete invariant id mismatch"
+            )
+        if record.get("phase") != "artifact-incomplete-row":
+            raise EvidenceError("kernel-admission artifact-incomplete phase mismatch")
+        for key, expected in expected_shared_identity.items():
+            if key in record and record.get(key) != expected:
+                raise EvidenceError(
+                    f"kernel-admission artifact-incomplete {key} mismatch"
+                )
+        version = record.get("version")
+        if version != KERNEL_ADMISSION_VERSION or isinstance(version, bool):
+            raise EvidenceError("kernel-admission artifact-incomplete version mismatch")
+        if record.get("run_id") != expected_run_id:
+            raise EvidenceError("kernel-admission artifact-incomplete run id mismatch")
+        if record.get("declaration") != declaration:
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete row names "
+                f"{record.get('declaration')!r}, expected {declaration!r}"
+            )
+        if record.get("safety") != safety:
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete safety collapsed for "
+                f"{declaration}: {record.get('safety')!r} != {safety!r}"
+            )
+        if record.get("missing_references") != list(missing):
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete missing references drifted "
+                f"for {declaration}: {record.get('missing_references')!r}"
+            )
+        if record.get("witness") != KERNEL_ADMISSION_ARTIFACT_WITNESS:
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete witness drifted for "
+                f"{declaration}"
+            )
+        if record.get("outcome") != "inconclusive-artifact-incomplete":
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete outcome laundered for "
+                f"{declaration}: {record.get('outcome')!r}"
+            )
+        if record.get("authority") != "none":
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete authority claimed for "
+                f"{declaration}"
+            )
+        for denial in ("kernel_checked", "cacheable", "environment_admissible"):
+            if record.get(denial) is not False:
+                raise EvidenceError(
+                    f"kernel-admission artifact-incomplete {denial} must be false "
+                    f"for {declaration} (an Inconclusive is never cached, checked, "
+                    f"or admitted)"
+                )
+        if record.get("evidence_grade") != "verified":
+            raise EvidenceError(
+                f"kernel-admission artifact-incomplete evidence grade mismatch for "
+                f"{declaration}"
             )
 
     expected_fault_count = len(KERNEL_ADMISSION_MUTANTS) + len(
@@ -3751,6 +3931,8 @@ def validate_kernel_admission(
         "observed_exit": observed_exit,
         "matrix_records": len(matrix_records),
         "fault_records": len(fault_records),
+        "artifact_incomplete_records": len(artifact_records),
+        "artifact_incomplete_witness": KERNEL_ADMISSION_ARTIFACT_WITNESS,
         "thread_matrix": list(KERNEL_ADMISSION_THREADS),
         "census": dict(KERNEL_ADMISSION_CENSUS),
         "mutants_killed": sorted(seen_mutants),
@@ -10047,6 +10229,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
                 "final_logical_root": admission_env_root,
                 "steps_used_total": 2_694_649,
                 "max_depth_seen": 132,
+                "artifact_incomplete_witness": KERNEL_ADMISSION_ARTIFACT_WITNESS,
                 "final_state": (
                     "byte-identical-across-1-8-32"
                     if phase == "matrix-identity"
@@ -10055,6 +10238,48 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             }
         )
         record.update(KERNEL_ADMISSION_CENSUS)
+        return record
+
+    def admission_artifact_record(
+        row: tuple[str, str, tuple[str, ...]],
+        stdout_artifact: str,
+        stderr_artifact: str,
+    ) -> dict[str, Any]:
+        declaration, safety, missing = row
+        record = admission_common(stdout_artifact, stderr_artifact, 0)
+        for absent in (
+            "status",
+            "budget_steps",
+            "budget_depth",
+            "monotonic_start_us",
+            "monotonic_end_us",
+            "duration_us",
+            "timing_used_as_gate",
+            "process_exit",
+            "signal",
+            "first_divergence",
+            "cleanup_status",
+        ):
+            record.pop(absent, None)
+        record.update(
+            {
+                "schema": KERNEL_ADMISSION_SCHEMA,
+                "claim_id": "franken_lean-sgt-artifact-completeness",
+                "invariant_id": "FL-INV-07",
+                "scenario": "init-prelude-artifact-incomplete-census",
+                "phase": "artifact-incomplete-row",
+                "declaration": declaration,
+                "safety": safety,
+                "missing_references": list(missing),
+                "witness": KERNEL_ADMISSION_ARTIFACT_WITNESS,
+                "outcome": "inconclusive-artifact-incomplete",
+                "authority": "none",
+                "kernel_checked": False,
+                "cacheable": False,
+                "environment_admissible": False,
+                "evidence_grade": "verified",
+            }
+        )
         return record
 
     def admission_fault_record(
@@ -10120,6 +10345,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             )
         )
         clock += 10
+        for row in KERNEL_ADMISSION_ARTIFACT_ROWS:
+            records.append(
+                admission_artifact_record(row, stdout_artifact, stderr_artifact)
+            )
         for mutant in KERNEL_ADMISSION_MUTANTS:
             records.append(
                 admission_fault_record(
@@ -10172,9 +10401,11 @@ def cmd_self_test(args: argparse.Namespace) -> int:
 
     admission_stderr_bytes = (
         b"kernel_replay order: 1915 units over 2204 declarations\n"
-        b'kernel_replay census: checked=2198 accepted=2198 inconclusive=0 '
-        b'rejected={} unchecked={"nonsafe_with_unserialized_refs": 6} '
-        b"nested_partial_blocks=1\n"
+        b"kernel_replay census: checked=2198 accepted=2198 inconclusive=0 "
+        b"rejected={} unchecked={} artifact_incomplete=6 "
+        b"artifact_incomplete_witness="
+        + KERNEL_ADMISSION_ARTIFACT_WITNESS.encode("ascii")
+        + b" nested_partial_blocks=0 nested_full_blocks=1\n"
     )
 
     def admission_validate(
@@ -10278,6 +10509,10 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         admission_report["matrix_records"] == len(KERNEL_ADMISSION_THREADS) + 1
         and admission_report["fault_records"]
         == len(KERNEL_ADMISSION_MUTANTS) + len(KERNEL_ADMISSION_RESOURCE_PHASES)
+        and admission_report["artifact_incomplete_records"]
+        == len(KERNEL_ADMISSION_ARTIFACT_ROWS)
+        and admission_report["artifact_incomplete_witness"]
+        == KERNEL_ADMISSION_ARTIFACT_WITNESS
         and sorted(admission_report["mutants_killed"])
         == sorted(KERNEL_ADMISSION_MUTANTS),
         "valid kernel-admission evidence lost its records",
@@ -10328,6 +10563,71 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         "admission_missing_field",
         drop_field,
         expected_message="missing=['verdict_stream_digest']",
+    )
+
+    def artifact_rows_of(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            record
+            for record in records
+            if record.get("phase") == "artifact-incomplete-row"
+        ]
+
+    # Named artifact-completeness validator mutants (bead
+    # franken_lean-artifact-incomplete-private-refs-sgt): each leaves exactly
+    # one defect and must be rejected for the intended reason.
+
+    def mark_incomplete_as_checked(records: list[dict[str, Any]]) -> None:
+        for record in records:
+            if record.get("scenario") == "init-prelude-admission-thread-matrix":
+                record["checked"] += record["artifact_incomplete"]
+                record["accepted"] += record["artifact_incomplete"]
+                record["artifact_incomplete"] = 0
+
+    expect_admission_rejection(
+        "artifact-incomplete rows folded into the checked total",
+        "admission_mark_incomplete_as_checked",
+        mark_incomplete_as_checked,
+        expected_message="census checked",
+    )
+
+    def collapse_unsafe_with_validated(records: list[dict[str, Any]]) -> None:
+        artifact_rows_of(records)[0]["safety"] = "safe"
+
+    expect_admission_rejection(
+        "artifact-incomplete safety class collapsed into validated",
+        "admission_collapse_unsafe_with_validated",
+        collapse_unsafe_with_validated,
+        expected_message="safety collapsed",
+    )
+
+    def omit_a_missing_reference(records: list[dict[str, Any]]) -> None:
+        artifact_rows_of(records)[0]["missing_references"] = []
+
+    expect_admission_rejection(
+        "artifact-incomplete row omits its missing reference",
+        "admission_omit_missing_reference",
+        omit_a_missing_reference,
+        expected_message="missing references drifted",
+    )
+
+    def accept_stale_reconstruction(records: list[dict[str, Any]]) -> None:
+        artifact_rows_of(records)[1]["witness"] = "0" * 64
+
+    expect_admission_rejection(
+        "artifact-incomplete row accepts a stale reconstruction witness",
+        "admission_accept_stale_reconstruction",
+        accept_stale_reconstruction,
+        expected_message="witness drifted",
+    )
+
+    def cache_inconclusive(records: list[dict[str, Any]]) -> None:
+        artifact_rows_of(records)[0]["cacheable"] = True
+
+    expect_admission_rejection(
+        "artifact-incomplete row claims cacheability",
+        "admission_cache_inconclusive",
+        cache_inconclusive,
+        expected_message="must be false",
     )
 
     def diverge_digest(records: list[dict[str, Any]]) -> None:
