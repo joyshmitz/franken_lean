@@ -822,7 +822,16 @@ SEEDED="$SCRATCH_ROOT/seeded"
 copy_workspace "$SEEDED" copy_seeded_fixture
 printf '\n[[package]]\nname = "serde"\nversion = "1.0.219"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "5f0e2c6ed6606019b4e29e69dbaba95b11854410e5347d525002456dbbb786b6"\n' \
   >> "$SEEDED/Cargo.lock"
-guard_step seeded_registry_package "$SEEDED" 1 fail FLN-STRUCT-018@Cargo.lock
+# The planted registry package makes Cargo.lock disagree with the manifest,
+# so the FLN-STRUCT-025 expansion covenant (bead fln-lld) cannot cargo-expand
+# the boundary crates and fails closed — two typed findings per boundary
+# crate (lib and lib+test-cfg) are part of this fixture's exact contract.
+guard_step seeded_registry_package "$SEEDED" 1 fail \
+  FLN-STRUCT-018@Cargo.lock \
+  FLN-STRUCT-025@crates/fln-unsafe-abi/src \
+  FLN-STRUCT-025@crates/fln-unsafe-abi/src \
+  FLN-STRUCT-025@crates/fln-unsafe-region/src \
+  FLN-STRUCT-025@crates/fln-unsafe-region/src
 
 RECOVERED="$SCRATCH_ROOT/recovered"
 copy_workspace "$RECOVERED" copy_recovery_fixture

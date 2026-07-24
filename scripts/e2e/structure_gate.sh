@@ -1020,19 +1020,34 @@ SETUP_ERROR_ROOT="$SCRATCH_ROOT/setup-error"
 mkdir "$SETUP_ERROR_ROOT"
 guard_step robot_setup_failure "$SETUP_ERROR_ROOT" 2 setup_error
 
+# The seeded fln-core -> fln-kernel edge now also completes the prohibited
+# transitive path fln-unsafe-abi -> fln-bignum -> fln-core -> fln-kernel
+# (FLN-STRUCT-008, the D3 layering law), and the manifest/lock disagreement it
+# introduces makes the FLN-STRUCT-025 expansion covenant (bead fln-lld) fail
+# closed with two typed findings per boundary crate (lib, lib+test-cfg).
 UNACKNOWLEDGED="$SCRATCH_ROOT/unacknowledged"
 copy_fixture copy_unacknowledged "$UNACKNOWLEDGED"
 printf 'fln-kernel = { path = "../fln-kernel" }\n' >> "$UNACKNOWLEDGED/crates/fln-core/Cargo.toml"
 guard_step seeded_unacknowledged "$UNACKNOWLEDGED" 1 fail \
   FLN-STRUCT-005@crates/fln-core/Cargo.toml \
-  FLN-STRUCT-007@crates/fln-core/Cargo.toml
+  FLN-STRUCT-007@crates/fln-core/Cargo.toml \
+  FLN-STRUCT-008@crates/fln-unsafe-abi \
+  FLN-STRUCT-025@crates/fln-unsafe-abi/src \
+  FLN-STRUCT-025@crates/fln-unsafe-abi/src \
+  FLN-STRUCT-025@crates/fln-unsafe-region/src \
+  FLN-STRUCT-025@crates/fln-unsafe-region/src
 
 ACKNOWLEDGED="$SCRATCH_ROOT/acknowledged"
 copy_fixture copy_acknowledged "$ACKNOWLEDGED"
 printf 'fln-kernel = { path = "../fln-kernel" }\n' >> "$ACKNOWLEDGED/crates/fln-core/Cargo.toml"
 printf 'edge fln-core -> fln-kernel\n' >> "$ACKNOWLEDGED/ci/WORKSPACE_GRAPH.txt"
 guard_step seeded_acknowledged "$ACKNOWLEDGED" 1 fail \
-  FLN-STRUCT-007@crates/fln-core/Cargo.toml
+  FLN-STRUCT-007@crates/fln-core/Cargo.toml \
+  FLN-STRUCT-008@crates/fln-unsafe-abi \
+  FLN-STRUCT-025@crates/fln-unsafe-abi/src \
+  FLN-STRUCT-025@crates/fln-unsafe-abi/src \
+  FLN-STRUCT-025@crates/fln-unsafe-region/src \
+  FLN-STRUCT-025@crates/fln-unsafe-region/src
 
 RECOVERED="$SCRATCH_ROOT/recovered"
 copy_fixture copy_dependency_recovery "$RECOVERED"
